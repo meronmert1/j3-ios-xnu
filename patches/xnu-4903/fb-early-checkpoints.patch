@@ -1,42 +1,66 @@
-Draw progress bands on the framebuffer, now from inside arm_vm_init.
+Draw progress bands on the framebuffer, through every mapping the boot uses.
 
-On a board with no serial port nothing the kernel does before
-PE_create_console is visible, and that is a long way in. Until then a failure
-is a frozen screen and nothing else -- made worse by start_first_cpu setting
-VBAR_EL1 to LowExceptionVectorBase almost immediately, which catches an early
-fault in a spin loop, so the machine does not even reset to say that something
-went wrong.
+On a board with no serial port nothing the kernel does before PE_create_console
+is visible, and that is a long way in. Until then a failure is a frozen screen
+and nothing else -- made worse by start_first_cpu setting VBAR_EL1 to
+LowExceptionVectorBase almost immediately, which catches an early fault in a
+spin loop, so the machine does not even reset to say that something went wrong.
 
-arm_vm_init() is where it now stops, so the bands go inside it:
+The hard part is that the framebuffer has to be reached three different ways
+over the course of the boot, because arm_vm_init retires one mapping after
+another underneath it:
+
+  1. physically, while the V=P bootstrap mapping in TTBR0 is live -- up to
+     set_mmu_ttb(invalid_ttep);
+  2. through phystokv(), while TTBR1 still holds the bootstrap tables built by
+     start.s -- up to set_mmu_ttb_alternate(cpu_ttep);
+  3. through whatever ml_io_map() returns, once pmap_bootstrap() has set
+     virtual_space_start. This is the same call initialize_screen() makes for
+     the console proper, and the L3 tables it needs are the ones arm_vm_init
+     allocates for "2MB + FrameBuffer size + 10MB for each 256MB segment".
+
+So the address lives in j3_fb_addr and arm_vm_init moves it along at each of
+those points. Between (2) and (3) there is no mapping at all, and that gap --
+the table switch and pmap_bootstrap -- is the one stretch of the boot that
+cannot be marked.
+
+(2) also requires both bootstrap mappings in start.s to be widened, not just
+the V=P one. The framebuffer is a carveout immediately above the memory the
+kernel manages, so it falls outside a mapping that covers exactly memSize
+bytes; eight more L2 entries bring it back in. They are spare slots in table
+pages that are allocated anyway, and the whole set is abandoned at
+set_mmu_ttb_alternate.
+
+The bands are drawn in two groups so that neither grows long enough to be
+miscounted from a photograph -- which is how they are read on a board like
+this. The lower group runs while the kernel is still building its address
+space:
 
     0  green    first instruction of start_first_cpu
     1  white    about to call arm_vm_init()
-    2  red      both "Unsupported memory configuration" panics were cleared
-    3  blue     early_random() returned and the physmap is laid out
-    4  yellow   arm_replace_identity_map() returned
-    5  magenta  arm_vm_prot_init() returned
-    6  cyan     everything is built; about to retire the V=P mapping
+    2  red      the first "Unsupported memory configuration" panic was cleared
+    3  magenta  arm_vm_prot_init() returned
+    4  cyan     everything is built; about to retire the V=P mapping
 
-Every band is written to the framebuffer's physical address, which resolves
-only while the V=P bootstrap mapping in TTBR0 is live. arm_vm_init retires it
-at set_mmu_ttb(invalid_ttep), and slot 6 sits immediately before that line --
-deliberately the last one. A band placed after it would not merely fail to
-appear; it would fault and bring down a kernel that was otherwise fine, which
-is the worst way for an instrument to fail.
+and the upper group (row 700, clear of the booter banner) runs from there to the kernel's own console:
 
-That is also why this round does not use ml_io_map, as the previous one did
-for the bands after arm_vm_init. kernel_map does not exist yet -- the VM
-system is brought up much later, from kernel_bootstrap, long after arm_init
-returns -- so ml_io_map takes an early path that depends on machinery
-arm_vm_init is still in the middle of building. Asking it for a mapping there
-risks measuring the instrument instead of the kernel. Staying inside the
-window where plain physical addressing works avoids the question entirely.
+    0  green    arm_vm_physmap_init() returned
+    1  white    arm_vm_init() returned; framebuffer re-mapped via ml_io_map()
+    2  red      patch_low_glo, printf_init and panic_init are done
+    3  magenta  PE_consistent_debug_inherit and PE_init_kprintf returned
+    4  cyan     about to call PE_create_console()
 
-The framebuffer also has to be reachable at all: it is a carveout immediately
-above the memory the kernel manages, so it falls outside the V=P bootstrap
-mapping, which covers exactly memSize bytes. A few extra L2 entries bring it
-back in. And the pixels have to be flushed, because ARM_TTE_BOOT_BLOCK maps
-with CACHE_ATTRINDX_WRITEBACK and the band would otherwise sit in the cache.
+Upper cyan is the end of the instrument: PE_create_console() clears the screen
+and the kernel starts printing for itself, so a panel still showing bands means
+it did not get that far.
+
+Two bands from an earlier round are gone. They sat inside
+"#if defined(KERNEL_INTEGRITY_KTRR)", which this board does not define, so they
+were never compiled and only confused the numbering.
+
+The pixels have to be flushed by hand for (1) and (2), because those mappings
+are write-back; the flush is left in place for (3), where the mapping is device
+memory and it does nothing.
 
 x6 through x9 are the only registers the assembly macro touches, and x0, which
 holds the boot_args pointer at slot 0, is deliberately left alone. The macro
@@ -44,11 +68,10 @@ follows this file's own conventions -- .macro with positional $0/$1 and
 .endmacro -- rather than the GNU spellings, which the Apple assembler this is
 built with does not use.
 
-The helper lives in osfmk/arm/arm_init.c and is not static so that
-osfmk/arm64/arm_vm_init.c can use the same code and the same geometry.
-
-The geometry constants describe this board's display; another board needs
-those changed and nothing else.
+The helpers live in osfmk/arm/arm_init.c and are not static so that
+osfmk/arm64/arm_vm_init.c can use the same code and the same geometry. The
+geometry constants describe this board's display; another board needs those
+changed and nothing else.
 
 This is a debugging aid, not a fix. Drop it once the kernel reaches its own
 console.
@@ -113,22 +136,33 @@ console.
  	// Unlock the core for debugging
  	msr		OSLAR_EL1, xzr
  	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
-@@ -593,6 +637,12 @@
+@@ -593,11 +637,23 @@
  	 * x5 - total number of L2 entries to allocate
  	 */
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
 +	/*
-+	 * Bring-up: a few extra L2 entries so the V=P mapping reaches past the
-+	 * end of kernel-managed memory and still covers the framebuffer, which
-+	 * is a carveout just above it.
++	 * Bring-up: a few extra L2 entries so the mapping reaches past the end
++	 * of kernel-managed memory and still covers the framebuffer, which is a
++	 * carveout just above it. Both bootstrap mappings are widened, not just
++	 * this one: arm_vm_init draws its later checkpoints through TTBR1 after
++	 * it has retired the V=P mapping in TTBR0, so the KVA table below needs
++	 * the same reach. The entries are spare table slots in pages that are
++	 * allocated anyway, and the whole set is abandoned at
++	 * set_mmu_ttb_alternate.
 +	 */
 +	add		x5, x5, #8
  	/* create_bootstrap_mapping(vbase, pbase, num_ents, L1 table, freeptr) */
  	create_bootstrap_mapping x0,  x4,  x5, x1, x2, x6, x10, x11, x12, x13
  
+ 	/* Setup the KVA bootstrap mapping */
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
++	add		x5, x5, #8
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
+ 	/* Ensure TTEs are visible */
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -198,6 +198,45 @@
+@@ -198,6 +198,78 @@
  extern uint32_t __thread_starts_sect_start[] __asm("section$start$__TEXT$__thread_starts");
  extern uint32_t __thread_starts_sect_end[]   __asm("section$end$__TEXT$__thread_starts");
  
@@ -136,29 +170,50 @@ console.
 +/*
 + * Framebuffer progress bands -- bring-up only, see the patch header.
 + *
-+ * Physical addressing, so this only works while the V=P bootstrap mapping in
-+ * TTBR0 is still live, which is up to the set_mmu_ttb(invalid_ttep) inside
-+ * arm_vm_init. The mapping is write-back, so the pixels have to be pushed out
-+ * by hand or the band never reaches the panel.
++ * The framebuffer has to be reached three different ways over the course of
++ * the boot, so the address lives in j3_fb_addr and arm_vm_init moves it along
++ * as each mapping is retired:
 + *
-+ * Not static: osfmk/arm64/arm_vm_init.c marks its way through arm_vm_init()
-+ * with the same helper. Keep the geometry in step with the J3_MARK macro in
-+ * osfmk/arm64/start.s.
++ *   1. physical, while the V=P bootstrap mapping in TTBR0 is live -- up to
++ *      the set_mmu_ttb(invalid_ttep) inside arm_vm_init;
++ *   2. phystokv(), while TTBR1 still holds the bootstrap tables built by
++ *      start.s -- up to set_mmu_ttb_alternate(cpu_ttep);
++ *   3. whatever ml_io_map() hands back, once pmap_bootstrap() has run and
++ *      virtual_space_start exists.
++ *
++ * Between (2) and (3) there is no mapping at all, which is why no band can be
++ * placed over the table switch itself.
++ *
++ * Every mapping but the last is write-back, so the pixels have to be pushed
++ * out by hand or the band never reaches the panel. The flush is harmless on
++ * the device-memory mapping from ml_io_map().
++ *
++ * Two rows of bands, so that neither group grows long enough to be miscounted
++ * from a photograph: j3_mark() draws near the bottom of the panel and
++ * j3_mark2() near the top. Nothing is static: osfmk/arm64/arm_vm_init.c marks
++ * its way through arm_vm_init() with the same helpers. Keep the geometry in
++ * step with the J3_MARK macro in osfmk/arm64/start.s.
 + */
 +#define J3_FB_BASE      0x67000000UL
 +#define J3_FB_STRIDE    2880UL
++#define J3_FB_HEIGHT    1280UL
++#define J3_FB_SIZE      (J3_FB_STRIDE * J3_FB_HEIGHT)
 +#define J3_MARK_ROW0    950UL
++#define J3_MARK2_ROW0   700UL
 +#define J3_MARK_PITCH   24UL
 +#define J3_MARK_HEIGHT  16U
 +#define J3_MARK_WIDTH   720U
 +
-+void j3_mark(unsigned slot, uint32_t colour);
++uintptr_t j3_fb_addr = (uintptr_t)J3_FB_BASE;
 +
-+void
-+j3_mark(unsigned slot, uint32_t colour)
++void j3_mark(unsigned slot, uint32_t colour);
++void j3_mark2(unsigned slot, uint32_t colour);
++
++static void
++j3_band(unsigned long row0, unsigned slot, uint32_t colour)
 +{
-+	volatile uint32_t *band = (volatile uint32_t *)(uintptr_t)
-+	    (J3_FB_BASE + (J3_MARK_ROW0 + slot * J3_MARK_PITCH) * J3_FB_STRIDE);
++	volatile uint32_t *band = (volatile uint32_t *)
++	    (j3_fb_addr + (row0 + slot * J3_MARK_PITCH) * J3_FB_STRIDE);
 +	const unsigned npx = J3_MARK_WIDTH * J3_MARK_HEIGHT;
 +
 +	for (unsigned i = 0; i < npx; i++) {
@@ -171,10 +226,22 @@ console.
 +	__asm__ volatile ("dsb sy");
 +}
 +
++void
++j3_mark(unsigned slot, uint32_t colour)
++{
++	j3_band(J3_MARK_ROW0, slot, colour);
++}
++
++void
++j3_mark2(unsigned slot, uint32_t colour)
++{
++	j3_band(J3_MARK2_ROW0, slot, colour);
++}
++
  void
  arm_init(
  	boot_args       *args)
-@@ -381,6 +420,9 @@
+@@ -381,6 +453,9 @@
  	__builtin_arm_wsr("pan", 1);
  #endif  /* __ARM_PAN_AVAILABLE__ */
  
@@ -184,19 +251,67 @@ console.
  	arm_vm_init(xmaxmem, args);
  
  	uint32_t debugmode;
+@@ -391,6 +466,10 @@
+ 
+ 	printf_init();
+ 	panic_init();
++
++	/* Bring-up: arm_vm_init returned, patch_low_glo/printf_init/panic_init done. */
++	j3_mark2(2, 0x00FF0000u);       /* red */
++
+ #if __arm64__
+ 	/* Enable asynchronous exceptions */
+ 	__builtin_arm_wsr("DAIFClr", DAIFSC_ASYNCF);
+@@ -404,6 +483,14 @@
+ 	/* setup debugging output if one has been chosen */
+ 	PE_init_kprintf(FALSE);
+ 
++	/*
++	 * Bring-up: PE_consistent_debug_inherit and PE_init_kprintf returned.
++	 * serial_init() runs inside the latter, and on this board it has no
++	 * UART to find, so reaching here says it declined cleanly rather than
++	 * writing to whatever sits at the Pi 3's register addresses.
++	 */
++	j3_mark2(3, 0x00FF00FFu);       /* magenta */
++
+ 	kprintf("kprintf initialized\n");
+ 
+ 	serialmode = 0;                                                      /* Assume normal keyboard and console */
+@@ -430,6 +517,14 @@
+ 		(void)switch_to_serial_console(); /* Switch into serial mode */
+ 		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
+ 	}
++	/*
++	 * Bring-up: the last band. PE_create_console() reads the saved panic
++	 * log and then brings up the framebuffer console, which clears the
++	 * screen -- so from here on the kernel speaks for itself, and a panel
++	 * still showing these bands means it did not get through.
++	 */
++	j3_mark2(4, 0x0000FFFFu);       /* cyan */
++
+ 	PE_create_console();
+ 
+ 	/* setup console output */
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1314,6 +1314,9 @@
+@@ -1314,6 +1314,16 @@
  #define ARM64_PHYSMAP_SLIDE_RANGE (1ULL << 30) // 1 GB
  #define ARM64_PHYSMAP_SLIDE_MASK  (ARM64_PHYSMAP_SLIDE_RANGE - 1)
  
 +/* Bring-up: see the fb-early-checkpoints patch. Defined in osfmk/arm/arm_init.c. */
 +extern void j3_mark(unsigned slot, uint32_t colour);
++extern void j3_mark2(unsigned slot, uint32_t colour);
++extern uintptr_t j3_fb_addr;
++/* Declared here rather than relying on <arm/machine_routines.h> reaching this
++ * file; a second identical declaration costs nothing if it does. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++#define J3_FB_PA        0x67000000UL
++#define J3_FB_BYTES     (2880UL * 1280UL)
 +
  void
  arm_vm_init(uint64_t memory_size, boot_args * args)
  {
-@@ -1352,6 +1355,9 @@
+@@ -1352,6 +1362,9 @@
  	if (mem_size >= ((VM_MAX_KERNEL_ADDRESS - VM_MIN_KERNEL_ADDRESS) / 4))
  		panic("Unsupported memory configuration %lx\n", mem_size);
  
@@ -206,41 +321,62 @@ console.
  	physmap_base = phystokv(args->topOfKernelData) + BOOTSTRAP_TABLE_SIZE;
  
  	// Slide the physical aperture to a random page-aligned location within the slide range
-@@ -1392,7 +1398,13 @@
- 	avail_start = boot_ttep + BOOTSTRAP_TABLE_SIZE;
- 
- #if defined(KERNEL_INTEGRITY_KTRR)
-+	/* Bring-up: early_random() returned and the physmap is laid out. */
-+	j3_mark(3, 0x000080FFu);        /* blue */
-+
- 	arm_replace_identity_map(args);
-+
-+	/* Bring-up: arm_replace_identity_map returned. */
-+	j3_mark(4, 0x00FFFF00u);        /* yellow */
- #endif
- 
- 	/* Initialize invalid tte page */
-@@ -1513,6 +1525,9 @@
+@@ -1513,6 +1526,9 @@
  
  	arm_vm_prot_init(args);
  
 +	/* Bring-up: arm_vm_prot_init returned. */
-+	j3_mark(5, 0x00FF00FFu);        /* magenta */
++	j3_mark(3, 0x00FF00FFu);        /* magenta */
 +
  
  	/*
  	 * Initialize the page tables for the low globals:
-@@ -1566,6 +1581,13 @@
+@@ -1566,10 +1582,29 @@
  	kasan_init();
  #endif
  
 +	/*
-+	 * Bring-up: the last band possible. set_mmu_ttb below retires the V=P
-+	 * mapping every band is written through, and a band placed after it
-+	 * would fault and take down a kernel that was otherwise fine.
++	 * Bring-up: the last band of the lower group. set_mmu_ttb below retires
++	 * the V=P mapping these are written through, so the framebuffer has to
++	 * be reached through TTBR1 from here on -- which still holds the
++	 * bootstrap tables from start.s, and those cover the framebuffer only
++	 * because this patch widens both bootstrap mappings past memSize.
 +	 */
-+	j3_mark(6, 0x0000FFFFu);        /* cyan */
++	j3_mark(4, 0x0000FFFFu);        /* cyan */
 +
  	set_tbi();
  	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
++	j3_fb_addr = phystokv(J3_FB_PA);
+ 
+ 	arm_vm_physmap_init(args, physmap_base, dynamic_memory_begin);
++
++	/*
++	 * Bring-up: the physical aperture is built. This is the last band
++	 * before the kernel starts using its own page tables; the next one
++	 * cannot be drawn until ml_io_map() can hand back an address, which
++	 * needs pmap_bootstrap(). Nothing can be marked in between.
++	 */
++	j3_mark2(0, 0x0000FF00u);       /* green */
++
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
+ 	flush_mmu_tlb();
+ 	kva_active = TRUE;
+@@ -1733,5 +1768,18 @@
+ 	first_avail = avail_start;
+ 	patch_low_glo_static_region(args->topOfKernelData, avail_start - args->topOfKernelData);
+ 	enable_preemption();
++
++	/*
++	 * Bring-up: the kernel's own page tables are in charge now, so the
++	 * framebuffer needs a mapping of its own. ml_io_map() is the right way
++	 * to ask for one: pmap_bootstrap() above has set virtual_space_start,
++	 * the L3 tables for that range were allocated a few loops up -- the
++	 * ones the comment there sizes as "2MB + FrameBuffer size + ..." -- and
++	 * this is the same call initialize_screen() will make for the console
++	 * later. The mapping is device memory, so no flush is needed, but
++	 * j3_band() keeps flushing anyway and that is harmless.
++	 */
++	j3_fb_addr = (uintptr_t)ml_io_map((vm_offset_t)J3_FB_PA, (vm_size_t)J3_FB_BYTES);
++	j3_mark2(1, 0x00FFFFFFu);       /* white */
+ }
  
