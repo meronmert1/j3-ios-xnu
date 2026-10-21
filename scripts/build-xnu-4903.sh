@@ -232,8 +232,22 @@ build_deps() {
     sed -i '' -e '/DEVELOPER_DIR.*\.xcconfig/d' \
         -e 's/^SDKROOT = macosx\.internal/SDKROOT = macosx/' \
         "$d"/xcodeconfig/libdispatch.xcconfig
+    # Its xcconfig expects xnu's kernel headers inside the SDK. Some of them
+    # (machine/cpu_number.h for one) are only ever exported into xnu's own
+    # build tree, so point the search path at that tree and at our fakeroot.
+    # -nostdinc is in effect, so every include has to be reachable from here.
+    local sdkp; sdkp="$(xcrun --sdk macosx --show-sdk-path)"
+    local hsp="$d"
+    hsp="$hsp $FAKEROOT/System/Library/Frameworks/Kernel.framework/PrivateHeaders"
+    hsp="$hsp $FAKEROOT/System/Library/Frameworks/Kernel.framework/Headers"
+    hsp="$hsp $FAKEROOT/usr/local/include/os $FAKEROOT/usr/local/include/firehose"
+    hsp="$hsp $WORK_DIR/hdr-obj/EXPORT_HDRS/osfmk"
+    hsp="$hsp $WORK_DIR/hdr-obj/EXPORT_HDRS/bsd"
+    hsp="$hsp $WORK_DIR/hdr-obj/EXPORT_HDRS/libkern"
+    hsp="$hsp $sdkp/System/Library/Frameworks/Kernel.framework/PrivateHeaders"
+    hsp="$hsp $sdkp/System/Library/Frameworks/Kernel.framework/Headers"
     (cd "$d" && xcodebuild install -sdk macosx -target libfirehose_kernel \
-        PRODUCT_NAME=firehose_kernel \
+        PRODUCT_NAME=firehose_kernel HEADER_SEARCH_PATHS="$hsp" \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
         DSTROOT="$FAKEROOT" \
         >>"$LOG_DIR/deps.log" 2>&1) \
