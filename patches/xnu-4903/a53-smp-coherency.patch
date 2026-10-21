@@ -1,0 +1,77 @@
+Cortex-A53: set CPUECTLR_EL1.SMPEN so exclusive accesses can succeed.
+
+The kernel hangs, with no fault and no reset, inside lck_mtx_init_ext() at the
+end of lck_mod_init() -- before any console exists, so the only symptom is a
+screen that stops updating. lck_mod_init() is pure software, which is what
+makes it confusing: a queue, a bzero, a strncpy, two attribute defaults and a
+mutex initialiser, none of which should care what board they run on.
+
+What they do contain is the first atomic read-modify-write in the kernel's
+life. lck_mtx_init_ext() ends with
+
+    lck_grp_reference(grp);
+    lck_grp_lckcnt_incr(grp, LCK_TYPE_MTX);
+
+and both reduce to hw_atomic_add, which on arm64 is an ldxr/stxr pair that
+retries until the store-exclusive reports success.
+
+On a Cortex-A53 that store never succeeds while CPUECTLR_EL1.SMPEN is clear.
+The TRM states that the core does not support the coherency or exclusive
+monitor features with the bit at 0, and the kernel maps its own memory with
+ARM_TTE_BOOT_BLOCK, which carries SH_OUTER_MEMORY -- Normal, shareable. An
+exclusive access to shareable memory from a core outside the coherency domain
+fails every time, so the retry loop never terminates. Nothing faults, which is
+exactly why this is hard to see.
+
+Apple's cores have no such register, so xnu never writes it, and on this board
+nothing else does either.
+
+The TRM also requires the bit to be set before the caches and the MMU are
+enabled, and before any cache or TLB maintenance is performed. That rules out
+common_start, which invalidates the bootstrap tables and issues tlbi, so this
+goes in start_first_cpu immediately after the boot-args pointer has been saved
+to x20 -- the earliest point where a scratch register is free. x6 is used
+because start.s only ever touches it inside create_bootstrap_mapping, much
+later; x0 still holds boot_args here and is left alone.
+
+Writing the bit is idempotent, so this is harmless on firmware that has
+already set it. It is guarded on BCM2837 because CPUECTLR_EL1 does not exist
+on the Apple targets this file is otherwise built for.
+
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -455,6 +455,34 @@
+ 	mov		x20, x0
+ 	mov		x21, #0
+ 
++#ifdef BCM2837
++	/*
++	 * Cortex-A53: join the coherency domain before anything depends on it.
++	 *
++	 * CPUECTLR_EL1.SMPEN (S3_1_C15_C2_1, bit 6) enables coherency and, with
++	 * it, the exclusive monitor. The TRM is explicit that the core does not
++	 * support either while the bit is clear, and that it has to be set
++	 * before the caches and the MMU are enabled or any cache or TLB
++	 * maintenance is performed -- which is why it is done here and not in
++	 * common_start.
++	 *
++	 * With SMPEN clear, ldxr/stxr against Normal shareable memory never
++	 * succeeds. Nothing faults: the first atomic read-modify-write in the
++	 * kernel's life simply retries forever. That is lck_mtx_init_ext()
++	 * incrementing a lock group's refcount at the end of lck_mod_init(),
++	 * long before any console exists, so the symptom is a frozen screen
++	 * with nothing to say why.
++	 *
++	 * Apple cores have no such register and xnu therefore never touches it.
++	 * Writing it is idempotent, so this is safe on firmware that already
++	 * set the bit.
++	 */
++	mrs		x6, S3_1_C15_C2_1				// CPUECTLR_EL1
++	orr		x6, x6, #(1 << 6)				// SMPEN
++	msr		S3_1_C15_C2_1, x6
++	isb		sy
++#endif /* BCM2837 */
++
+ 	// Set low reset vector before attempting any loads
+ 	adrp	x0, EXT(LowExceptionVectorBase)@page
+ 	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
