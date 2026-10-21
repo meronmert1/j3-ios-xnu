@@ -36,6 +36,7 @@ set -uo pipefail
 
 # ---------------------------------------------------------------- configuration
 
+PWD_AT_START="$PWD"
 WORK_DIR="${WORK_DIR:-$PWD/.xnu-build}"
 XNU_VERSION="${XNU_VERSION:-4903.270.47}"
 KERNEL_CONFIG="${KERNEL_CONFIG:-DEVELOPMENT}"
@@ -225,38 +226,18 @@ build_deps() {
         >>"$LOG_DIR/deps.log" 2>&1) \
         || die "xnu installhdrs failed (see $LOG_DIR/deps.log)"
 
-    say "libfirehose_kernel (libdispatch)"
-    d="$(fetch_oss libdispatch "$LIBDISPATCH_REF")" || exit 1
-    # Its xcconfig pulls in Apple-internal config files that no public Xcode
-    # has, and asks for the internal SDK. Both only set defaults we already
-    # pass on the command line.
-    sed -i '' -e '/DEVELOPER_DIR.*\.xcconfig/d' \
-        -e 's/^SDKROOT = macosx\.internal/SDKROOT = macosx/' \
-        "$d"/xcodeconfig/libdispatch.xcconfig
-    # Its xcconfig expects xnu's kernel headers inside the SDK. Some of them
-    # (machine/cpu_number.h for one) are only ever exported into xnu's own
-    # build tree, so point the search path at that tree and at our fakeroot.
-    # -nostdinc is in effect, so every include has to be reachable from here.
-    local sdkp; sdkp="$(xcrun --sdk macosx --show-sdk-path)"
-    local hsp="$d"
-    hsp="$hsp $FAKEROOT/System/Library/Frameworks/Kernel.framework/PrivateHeaders"
-    hsp="$hsp $FAKEROOT/System/Library/Frameworks/Kernel.framework/Headers"
-    hsp="$hsp $FAKEROOT/usr/local/include/os $FAKEROOT/usr/local/include/firehose"
-    hsp="$hsp $WORK_DIR/hdr-obj/EXPORT_HDRS/osfmk"
-    hsp="$hsp $WORK_DIR/hdr-obj/EXPORT_HDRS/bsd"
-    hsp="$hsp $WORK_DIR/hdr-obj/EXPORT_HDRS/libkern"
-    hsp="$hsp $sdkp/usr/local/include/os $sdkp/usr/local/include/firehose"
-    hsp="$hsp $sdkp/usr/local/include"
-    hsp="$hsp $sdkp/System/Library/Frameworks/Kernel.framework/PrivateHeaders"
-    hsp="$hsp $sdkp/System/Library/Frameworks/Kernel.framework/Headers"
-    local lp; lp="$(fetch_oss libplatform "$LIBPLATFORM_REF")" || exit 1
-    hsp="$hsp $lp/private/os $lp/private $lp/include"
-    (cd "$d" && xcodebuild install -sdk macosx -target libfirehose_kernel \
-        PRODUCT_NAME=firehose_kernel HEADER_SEARCH_PATHS="$hsp" \
-        CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-        DSTROOT="$FAKEROOT" \
-        >>"$LOG_DIR/deps.log" 2>&1) \
-        || die "libfirehose_kernel build failed (see $LOG_DIR/deps.log)"
+    say "libfirehose_kernel (stub)"
+    # The real firehose needs private headers that only exist in the current
+    # SDK, written for a much newer libdispatch; mixing the two leaves every
+    # inline entry point undeclared. os_log is not how we read this kernel,
+    # so link against a stub instead. See scripts/firehose-stub.c.
+    mkdir -p "$FAKEROOT/usr/local/lib/kernel"
+    (cd "$WORK_DIR" && xcrun clang -arch arm64 -mkernel -ffreestanding \
+        -fno-builtin -Wall -c "$PWD_AT_START/scripts/firehose-stub.c" \
+        -o firehose-stub.o >>"$LOG_DIR/deps.log" 2>&1 \
+     && xcrun ar rcs "$FAKEROOT/usr/local/lib/kernel/libfirehose_kernel.a" \
+        firehose-stub.o >>"$LOG_DIR/deps.log" 2>&1) \
+        || die "firehose stub build failed (see $LOG_DIR/deps.log)"
 }
 
 # ----------------------------------------------------------------------- kernel
