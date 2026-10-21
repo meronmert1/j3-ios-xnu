@@ -205,7 +205,11 @@ build_deps() {
     fi
 
     say "xnu headers -> fakeroot"
+    # ARM builds ask Apple's internal embedded_device_map for the Mach-O arch
+    # name. That tool is not in the public SDK, so the variable comes back
+    # empty and every -arch flag loses its value. Supply it directly.
     (cd "$XNU_SRC" && make installhdrs SDKROOT=macosx ARCH_CONFIGS="$ARCH_CONFIG" \
+        ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 \
         SRCROOT="$XNU_SRC" OBJROOT="$WORK_DIR/hdr-obj" DSTROOT="$FAKEROOT" \
         >>"$LOG_DIR/deps.log" 2>&1) \
         || die "xnu installhdrs failed (see $LOG_DIR/deps.log)"
@@ -230,6 +234,7 @@ build_kernel() { # $1 = extra make flags
         ARCH_CONFIGS="$ARCH_CONFIG" \
         KERNEL_CONFIGS="$KERNEL_CONFIG" \
         MACHINE_CONFIGS="$MACHINE_CONFIG" \
+        ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 \
         SRCROOT="$XNU_SRC" \
         OBJROOT="$WORK_DIR/obj" \
         SYMROOT="$WORK_DIR/sym" \
