@@ -1,0 +1,69 @@
+Turn on the graphics console as soon as the kernel asks for text mode.
+
+On a board with a serial port none of this matters: kprintf goes out of the
+UART from PE_init_kprintf() onwards and the framebuffer console is a luxury
+that can wait for the VM system. With no serial port the framebuffer console
+is the only console, and xnu does not light it up until kPEAcquireScreen,
+which vcattach() issues from PE_init_printf(TRUE) -- after vm_init, deep
+inside kernel_bootstrap_thread.
+
+Everything printed between PE_create_console() and that point therefore goes
+only into the message buffer, to be replayed later. If the kernel dies before
+the replay, the screen still holds whatever the booter drew and the log is
+sitting in memory with no way out. That is the entire early bring-up window,
+and it is the window that fails.
+
+The fix is one call: in text mode, enable the console at once rather than
+waiting to be acquired.
+
+It is safe this early:
+
+  - gc_initialize(), a few lines above in the same function, has already run
+    VCPUTC_LOCK_INIT(), so the console lock exists.
+  - the only part of gc_enable() that touches the allocator -- the scrollback
+    buffers -- is already behind an "if (vm_initialized)", which is false
+    here, so nothing is allocated.
+  - vc_render_font() returns immediately while vm_initialized is false, so
+    the font cache stays empty, and vc_paint_char_32() already handles that
+    by rendering each glyph into a static buffer instead.
+  - gc_acquired is left alone, so vcattach() still does its own acquire,
+    reallocates the buffers properly and replays the message buffer.
+
+Graphics mode is untouched: a device that boots to a boot logo still does.
+This only changes the path taken when the booter asks for text, which on this
+port is what boot_args.Video.v_display = 0 selects.
+
+The visible effect is that the screen clears and fills with the kernel log
+from PE_create_console() onwards, which is also a useful signal in itself:
+if the booter's own output is still on the panel, the kernel did not get
+that far.
+--- a/osfmk/console/video_console.c	2026-10-21 19:56:53.626448445 +0300
++++ b/osfmk/console/video_console.c	2026-10-21 19:57:01.986247753 +0300
+@@ -2936,6 +2936,27 @@
+ 
+ 		case kPETextMode:
+ 			gc_graphics_boot = FALSE;
++			/*
++			 * Bring-up on a board with no serial port: the graphics
++			 * console is the only console there is, and nothing is
++			 * drawn on it until kPEAcquireScreen, which vcattach()
++			 * issues only once the VM system is up. Everything the
++			 * kernel prints between PE_create_console() and there is
++			 * lost -- and on a new port that stretch is precisely the
++			 * one that fails, so the screen stays frozen on whatever
++			 * the booter left and says nothing about why.
++			 *
++			 * Enabling the console here is safe this early. The lock
++			 * was initialized by the gc_initialize() above, every part
++			 * of gc_enable() that needs the allocator is already
++			 * guarded by vm_initialized, and vc_paint_char_32() renders
++			 * into a static buffer while the font cache is empty.
++			 * vcattach() still performs its own acquire afterwards and
++			 * replays the message buffer, so nothing is lost twice.
++			 */
++			if (!gc_acquired) {
++				gc_enable(TRUE);
++			}
+ 			break;
+ 
+ 		case kPEAcquireScreen:
