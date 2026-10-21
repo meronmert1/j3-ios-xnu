@@ -53,6 +53,7 @@ DTRACE_REF="${DTRACE_REF:-}"             # empty = newest tag
 BOOTSTRAP_CMDS_REF="${BOOTSTRAP_CMDS_REF:-}"
 AVAILABILITY_REF="${AVAILABILITY_REF:-}"
 LIBDISPATCH_REF="${LIBDISPATCH_REF:-libdispatch-1008}"   # prefix match, 10.14 train
+LIBPLATFORM_REF="${LIBPLATFORM_REF:-libplatform-177}"
 
 SRC_DIR="$WORK_DIR/src"
 DEPS_DIR="$WORK_DIR/deps"
@@ -248,6 +249,8 @@ build_deps() {
     hsp="$hsp $sdkp/usr/local/include"
     hsp="$hsp $sdkp/System/Library/Frameworks/Kernel.framework/PrivateHeaders"
     hsp="$hsp $sdkp/System/Library/Frameworks/Kernel.framework/Headers"
+    local lp; lp="$(fetch_oss libplatform "$LIBPLATFORM_REF")" || exit 1
+    hsp="$hsp $lp/private/os $lp/private $lp/include"
     (cd "$d" && xcodebuild install -sdk macosx -target libfirehose_kernel \
         PRODUCT_NAME=firehose_kernel HEADER_SEARCH_PATHS="$hsp" \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \

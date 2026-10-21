@@ -1,1 +1,3 @@
 .xnu-build/
+logs-*/
+kernel-*/
