@@ -1,0 +1,48 @@
+The BCM2837 target cannot link: the Blocks runtime is never built.
+
+xnu uses blocks (^{ }) in IOKit, libkern and the scheduler -- OSSerializer::
+withBlock, IOService::registerInterest, IOMemoryDescriptor::makeMapping,
+turnstile.c, waitq.c -- so the kernel needs the runtime that backs them. In
+xnu that runtime is libkern/libclosure, and libkern/conf/files builds it only
+when the config option is set:
+
+    libkern/libclosure/runtime.cpp      optional config_blocks
+    libkern/libclosure/libclosuredata.c optional config_blocks
+
+config/MASTER.arm64.bcm2837 does not set it. Both files are skipped and the
+link ends with:
+
+    "__Block_object_assign", referenced from: ...
+    "__Block_object_dispose", referenced from: ...
+    "__Block_release", referenced from: ...
+    "__NSConcreteGlobalBlock", referenced from: ...
+    "__NSConcreteStackBlock", referenced from: ...
+    ld: symbol(s) not found for architecture arm64
+
+This is an omission, not a decision. MASTER.arm64, MASTER.arm and
+MASTER.x86_64 all carry config_blocks in LIBKERN_BASE; the BCM2837 file was
+last touched in 2016 and never picked it up, along with several other
+options the 2018 configs gained. Apple shipped this config for the public
+source release and never linked it, so the gap went unnoticed.
+
+Add the option. Nothing else is needed: runtime.cpp defines _Block_copy,
+_Block_release, _Block_object_assign and _Block_object_dispose, and
+libclosuredata.c defines the _NSConcrete*Block class placeholders -- the
+whole set the linker is asking for.
+
+Deliberately not added here: config_img4 (the other LIBKERN_BASE entry this
+file is missing). Image4 is Apple's signed-boot-manifest validation; a
+non-Apple board has no use for it and config_enforce_signed_code is off on
+this target too.
+
+--- a/config/MASTER.arm64.bcm2837
++++ b/config/MASTER.arm64.bcm2837
+@@ -40,7 +40,7 @@
+ #  IOKIT_RELEASE =  [ IOKIT_BASE ]
+ #  IOKIT_DEV =      [ IOKIT_BASE iokitstats iotracking ]
+ #  IOKIT_DEBUG =    [ IOKIT_BASE iokitstats iotracking]
+-#  LIBKERN_BASE =   [ libkerncpp config_kec_fips zlib crypto_sha2 ]
++#  LIBKERN_BASE =   [ libkerncpp config_blocks config_kec_fips zlib crypto_sha2 ]
+ #  LIBKERN_RELEASE =[ LIBKERN_BASE ]
+ #  LIBKERN_DEV =    [ LIBKERN_BASE iotracking ]
+ #  LIBKERN_DEBUG =  [ LIBKERN_BASE iotracking ]
