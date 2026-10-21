@@ -1,0 +1,30 @@
+osfmk/arm64/monotonic.h defines the core counter layout (MT_NDEVS,
+MT_CORE_CYCLES, MT_CORE_INSTRS, MT_CORE_NFIXED) inside #if KERNEL_PRIVATE.
+The exported copy of machine/monotonic.h is run through unifdef, which drops
+that section while leaving the code that reads the constants, so every
+consumer fails with "use of undeclared identifier 'MT_CORE_NFIXED'".
+
+Publish the four constants before the guard. They describe the hardware, not
+a privilege level, and C permits the identical repeat definitions that follow.
+
+--- a/osfmk/arm64/monotonic.h
++++ b/osfmk/arm64/monotonic.h
+@@ -34,6 +34,18 @@
+ 
+ #include <pexpert/arm64/board_config.h>
+ 
++/*
++ * How many counters this core has is a property of the hardware, not of
++ * who is including the header. The exported copy of machine/monotonic.h
++ * loses the KERNEL_PRIVATE section to unifdef but keeps the code that
++ * reads these, so publish them unconditionally. The definitions below
++ * repeat these verbatim, which C allows.
++ */
++#define MT_NDEVS 1
++#define MT_CORE_CYCLES 0
++#define MT_CORE_INSTRS 1
++#define MT_CORE_NFIXED 2
++
+ #if KERNEL_PRIVATE
+ 
+ __BEGIN_DECLS

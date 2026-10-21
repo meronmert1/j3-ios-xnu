@@ -237,6 +237,10 @@ build_deps() {
     local ldd; ldd="$(fetch_oss libdispatch "$LIBDISPATCH_REF")" || exit 1
     mkdir -p "$FAKEROOT/usr/local/include/kernel/os"
     cp "$ldd"/os/*.h "$FAKEROOT/usr/local/include/kernel/os/" 2>/dev/null
+    # libdispatch wraps the whole header in #if OS_FIREHOSE_SPI; xnu includes
+    # it without ever defining that, so the file arrives empty.
+    sed -i '' -e 's/^#if OS_FIREHOSE_SPI$/#if 1 \/* OS_FIREHOSE_SPI, which xnu never defines *\//' \
+        "$FAKEROOT/usr/local/include/kernel/os/firehose_buffer_private.h"
     (cd "$WORK_DIR" && xcrun clang -arch arm64 -mkernel -ffreestanding \
         -fno-builtin -Wall -c "$PWD_AT_START/scripts/firehose-stub.c" \
         -o firehose-stub.o >>"$LOG_DIR/deps.log" 2>&1 \
