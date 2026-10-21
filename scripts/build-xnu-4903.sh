@@ -271,6 +271,8 @@ build_kernel() { # $1 = extra make flags
         DSTROOT="$WORK_DIR/dst" \
         FAKEROOT_DIR="$FAKEROOT" \
         BUILD_WERROR=0 BUILD_LTO=0 \
+        LDFLAGS_KERNEL_SDK="-L$FAKEROOT/usr/local/lib/kernel" \
+        INCFLAGS_SDK="-I$FAKEROOT/usr/local/include/kernel -I$FAKEROOT/usr/local/include" \
     ) > >(tee "$BUILD_LOG") 2>&1
     local rc=${PIPESTATUS[0]}
 
