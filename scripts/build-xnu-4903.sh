@@ -226,6 +226,12 @@ build_deps() {
 
     say "libfirehose_kernel (libdispatch)"
     d="$(fetch_oss libdispatch "$LIBDISPATCH_REF")" || exit 1
+    # Its xcconfig pulls in Apple-internal config files that no public Xcode
+    # has, and asks for the internal SDK. Both only set defaults we already
+    # pass on the command line.
+    sed -i '' -e '/DEVELOPER_DIR.*\.xcconfig/d' \
+        -e 's/^SDKROOT = macosx\.internal/SDKROOT = macosx/' \
+        "$d"/xcodeconfig/libdispatch.xcconfig
     (cd "$d" && xcodebuild install -sdk macosx -target libfirehose_kernel \
         PRODUCT_NAME=firehose_kernel \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
