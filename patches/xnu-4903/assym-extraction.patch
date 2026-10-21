@@ -1,54 +1,97 @@
 The assym.s constants (SS64_X0, CPU_ISTACKPTR, T_DATA_ABT and the rest) are
 extracted from compiled assembly with a sed expression written for the 2018
-compiler's output layout. A current clang lays the same inline-asm labels out
+compiler's output layout. A current clang lays the same inline-asm blocks out
 differently, so the expression stops matching: assym.s ends up holding the raw
 DEFINITION__define__ labels instead of #defines. Everything downstream breaks
 at once -- "symbol is already defined" for every label, then "invalid operand
 for instruction" and "index must be an integer in range [-256, 255]" wherever
 a .s file uses one of the missing constants. On a BCM2837 DEVELOPMENT build
-that is 169 of the 241 errors.
+that was 169 of 241 errors.
 
-Replace the sed with an awk script that looks for the name and then the first
-quoted value after it, whatever the surrounding layout, and that ignores
-repeats. Tested against the label and value on one line, on two lines, with
-and without $ or # decoration on the value, and with negative values.
+Two layout differences matter. The value now sits on the line after the
+label, and a one-character value is written as its character code:
+
+    DEFINITION__define__TH_RECOVER:          DEFINITION__define__T_PREFETCH_ABT:
+        .ascii  "856"                            .byte   51
+
+Replace the sed with an awk script that finds the name, reads forward to the
+first .ascii or .byte of that inline asm block, and decodes either form.
+Tested against both layouts, values on the label's own line, $ and #
+decoration, negative values and multi-byte .byte lists.
 
 --- /dev/null
 +++ b/osfmk/conf/gen-assym.awk
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,71 @@
 +# gen-assym.awk -- turn the genassym assembly into the #defines assym.s needs.
 +#
-+# genassym.c emits, for every constant, an inline-asm label followed by an
-+# .ascii holding the value:
++# genassym.c emits, for every constant, an inline-asm label whose value is the
++# constant rendered as text:
 +#
-+#     DEFINITION__define__T_DATA_ABT: .ascii "4"
++#     DEFINITION__define__TH_RECOVER:
++#         .ascii  "856"
++#         ; InlineAsm End
 +#
-+# The exact shape moves between compiler versions: the label and the .ascii
-+# may share a line or sit on consecutive ones, the value may carry a $ or #
-+# decoration, and the label may be indented or prefixed. Rather than matching
-+# one layout, find the name, then take the first quoted string that follows.
++# A current clang writes a one-character value as its character code instead:
++#
++#     DEFINITION__define__T_PREFETCH_ABT:
++#         .byte   51                      ; '3'
++#
++# so both forms have to be decoded. The label and the value may also share a
++# line, and the value may carry a $ or # immediate decoration. Rather than
++# matching one layout, find the name, then read forward to the first .ascii
++# or .byte before the inline asm ends.
 +
-+/DEFINITION__define__/ {
-+    line = $0
-+    if (line !~ /ascii/ && (getline nxt) > 0)
-+        line = line " " nxt
-+
-+    if (!match(line, /DEFINITION__define__[A-Za-z_][A-Za-z0-9_]*/))
-+        next
-+    name = substr(line, RSTART + 20, RLENGTH - 20)
-+
-+    rest = substr(line, RSTART + RLENGTH)
-+    if (!match(rest, /"[^"]*"/))
-+        next
-+    val = substr(rest, RSTART + 1, RLENGTH - 2)
-+
-+    gsub(/[$#]/, "", val)          # drop immediate decoration
++function emit(name, val) {
++    gsub(/[$#]/, "", val)
 +    gsub(/^[ \t]+|[ \t]+$/, "", val)
-+    if (val == "" || seen[name]++)
-+        next
-+
++    if (name == "" || val == "" || seen[name]++)
++        return
 +    print "#define " name " " val
 +    print "#define " name "_NUM " val
++}
++
++# .ascii "856" / .asciz "856"  ->  856
++function from_quoted(line,   s) {
++    if (!match(line, /"[^"]*"/))
++        return ""
++    return substr(line, RSTART + 1, RLENGTH - 2)
++}
++
++# .byte 51 [, 54 ...]  ->  the characters those codes stand for
++function from_bytes(line,   n, i, parts, out) {
++    if (!match(line, /\.byte[ \t]+[0-9]+([ \t]*,[ \t]*[0-9]+)*/))
++        return ""
++    n = split(substr(line, RSTART + 5), parts, /[ \t,]+/)
++    out = ""
++    for (i = 1; i <= n; i++)
++        if (parts[i] ~ /^[0-9]+$/)
++            out = out sprintf("%c", parts[i] + 0)
++    return out
++}
++
++/DEFINITION__define__/ {
++    if (!match($0, /DEFINITION__define__[A-Za-z_][A-Za-z0-9_]*/))
++        next
++    name = substr($0, RSTART + 20, RLENGTH - 20)
++
++    rest = substr($0, RSTART + RLENGTH)
++    val = from_quoted(rest)
++    if (val == "")
++        val = from_bytes(rest)
++
++    # Not on the label's line: read forward until the value or the end of
++    # this inline asm block, whichever comes first.
++    for (i = 0; val == "" && i < 8; i++) {
++        if ((getline line) <= 0)
++            break
++        if (line ~ /InlineAsm End/ || line ~ /DEFINITION__define__/)
++            break
++        val = from_quoted(line)
++        if (val == "")
++            val = from_bytes(line)
++    }
++
++    emit(name, val)
 +}
 --- a/osfmk/conf/Makefile.template
 +++ b/osfmk/conf/Makefile.template
