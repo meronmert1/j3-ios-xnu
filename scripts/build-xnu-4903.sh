@@ -182,8 +182,11 @@ build_deps() {
 
     say "dtrace (ctfconvert / ctfmerge / ctfdump)"
     d="$(fetch_oss dtrace "$DTRACE_REF")" || exit 1
+    # Command-line tool targets want a signing identity; CI has none, and
+    # these only ever run locally during the build.
     (cd "$d" && xcodebuild install -sdk macosx -target ctfconvert -target ctfdump \
         -target ctfmerge ARCHS="arm64 x86_64" VALID_ARCHS="arm64 x86_64" \
+        CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
         DSTROOT="$TOOLCHAIN_DST" >>"$LOG_DIR/deps.log" 2>&1) \
         || die "dtrace build failed (see $LOG_DIR/deps.log)"
 
@@ -210,7 +213,9 @@ build_deps() {
     say "libfirehose_kernel (libdispatch)"
     d="$(fetch_oss libdispatch "$LIBDISPATCH_REF")" || exit 1
     (cd "$d" && xcodebuild install -sdk macosx -target libfirehose_kernel \
-        PRODUCT_NAME=firehose_kernel DSTROOT="$FAKEROOT" \
+        PRODUCT_NAME=firehose_kernel \
+        CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+        DSTROOT="$FAKEROOT" \
         >>"$LOG_DIR/deps.log" 2>&1) \
         || die "libfirehose_kernel build failed (see $LOG_DIR/deps.log)"
 }
