@@ -46,10 +46,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
-            xcode: '15.2'
+          - runner: macos-15
+            xcode: '16.4'
 
     steps:
+      - name: Runner alive
+        run: |
+          echo "runner: $RUNNER_OS $(sw_vers -productVersion) $(uname -m)"
+          ls -d /Applications/Xcode*.app
+
       - uses: actions/checkout@v4
 
       - name: Select Xcode
