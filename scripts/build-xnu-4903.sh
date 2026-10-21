@@ -267,6 +267,14 @@ build_kernel() { # $1 = extra make flags
     ) > >(tee "$BUILD_LOG") 2>&1
     local rc=${PIPESTATUS[0]}
 
+    # Keep the assym inputs and outputs: when the extraction misparses, the
+    # errors it causes name constants, never the file that should define them.
+    find "$WORK_DIR/obj" -name 'genassym.o' -exec sh -c \
+        'head -c 20000 "$1" > "$2/genassym-head.txt"' _ {} "$LOG_DIR" \; 2>/dev/null
+    find "$WORK_DIR/obj" -name 'assym.s' -exec cp {} "$LOG_DIR/" \; 2>/dev/null
+    grep -h 'DEFINITION__define__' "$LOG_DIR/genassym-head.txt" 2>/dev/null \
+        | head -20 > "$LOG_DIR/genassym-lines.txt"
+
     local out
     out="$(find "$WORK_DIR/obj" -maxdepth 3 -name 'kernel.*' -type f 2>/dev/null | head -5)"
     if [ -n "$out" ]; then
