@@ -7,28 +7,26 @@ VBAR_EL1 to LowExceptionVectorBase almost immediately, which catches an early
 fault in a spin loop, so the machine does not even reset to say that something
 went wrong.
 
-This writes a thick coloured band straight to the framebuffer at seven points,
-low on the screen where the bootloader's own output does not reach:
+This writes a thick coloured band straight to the framebuffer at seven points.
+The previous round put the failure inside kernel_early_bootstrap(), so the
+checkpoints now sit between that function's own three steps:
 
     0  green    first instruction of start_first_cpu
     1  white    first statement of arm_init(), running as C from KVA
     2  red      rtclock_early_init() returned
-    3  blue     kernel_early_bootstrap() returned
-    4  yellow   cpu_init() returned
-    5  magenta  processor_bootstrap() returned
-    6  cyan     arm_vm_init() returned
+    3  blue     the boot-args string was parsed
+    4  yellow   lck_mod_init() returned
+    5  magenta  timer_call_init() returned
+    6  cyan     kernel_early_bootstrap() returned
 
 Seven, not more, and in six clearly different colours: the count is read off a
 photograph of a phone screen, and a dozen similar bands is a measurement that
-cannot be trusted. Slots 0 and 1 are known-good anchors that confirm the
-handoff and the MMU still work; the rest bracket the calls actually under
-suspicion.
+cannot be trusted. Slots 0 to 2 are known-good anchors that confirm the
+handoff, the MMU and the timebase still work.
 
-Slot 6 is the last one that can be trusted to mean what it says. Every band
-reaches the framebuffer through the V=P bootstrap mapping in TTBR0, and
-arm_vm_init replaces that mapping with the real page tables; a missing cyan
-band may mean arm_vm_init did not return or merely that the address is no
-longer mapped. Anything past that point needs a mapping of its own.
+The helper lives in osfmk/arm/arm_init.c and is deliberately not static, so
+osfmk/kern/startup.c can mark its way through kernel_early_bootstrap() with
+the same code and the same geometry.
 
 Two things are needed to make any band after the MMU is enabled work, and both
 are easy to miss. The framebuffer has to stay reachable once translation is
@@ -41,6 +39,10 @@ code ran, which is precisely the wrong answer to get from a test like this.
 Before the MMU is enabled the access is Device and the maintenance is a no-op,
 so the same code is correct either side.
 
+Every band reaches the framebuffer through that V=P bootstrap mapping, so all
+of this has to stay ahead of arm_vm_init, which replaces it. Checkpoints past
+that point need a mapping of their own.
+
 x6 through x9 are the only registers the assembly macro touches, and x0, which
 holds the boot_args pointer at slot 0, is deliberately left alone. The macro
 follows this file's own conventions -- .macro with positional $0/$1 and
@@ -48,7 +50,7 @@ follows this file's own conventions -- .macro with positional $0/$1 and
 built with does not use.
 
 The geometry constants describe this board's display and are repeated in both
-files; another board needs those changed and nothing else.
+C files; another board needs those changed and nothing else.
 
 This is a debugging aid, not a fix. Drop it once the kernel reaches its own
 console.
@@ -119,15 +121,14 @@ console.
  	// Unlock the core for debugging
  	msr		OSLAR_EL1, xzr
  	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
-@@ -593,6 +643,13 @@
+@@ -593,6 +643,12 @@
  	 * x5 - total number of L2 entries to allocate
  	 */
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
 +	/*
 +	 * Bring-up: a few extra L2 entries so the V=P mapping reaches past the
 +	 * end of kernel-managed memory and still covers the framebuffer, which
-+	 * is a carveout just above it. Without this the bands cannot be drawn
-+	 * once the MMU is on. arm_vm_init replaces this mapping later.
++	 * is a carveout just above it. arm_vm_init replaces this mapping later.
 +	 */
 +	add		x5, x5, #8
  	/* create_bootstrap_mapping(vbase, pbase, num_ents, L1 table, freeptr) */
@@ -135,7 +136,7 @@ console.
  
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -198,6 +198,41 @@
+@@ -198,6 +198,45 @@
  extern uint32_t __thread_starts_sect_start[] __asm("section$start$__TEXT$__thread_starts");
  extern uint32_t __thread_starts_sect_end[]   __asm("section$end$__TEXT$__thread_starts");
  
@@ -148,7 +149,9 @@ console.
 + * mapping is write-back, so the pixels have to be pushed out by hand or the
 + * band never reaches the panel.
 + *
-+ * Keep the geometry in step with the J3_MARK macro in osfmk/arm64/start.s.
++ * Not static: osfmk/kern/startup.c marks its way through
++ * kernel_early_bootstrap() with the same helper. Keep the geometry in step
++ * with the J3_MARK macro in osfmk/arm64/start.s.
 + */
 +#define J3_FB_BASE      0x67000000UL
 +#define J3_FB_STRIDE    2880UL
@@ -157,7 +160,9 @@ console.
 +#define J3_MARK_HEIGHT  16U
 +#define J3_MARK_WIDTH   720U
 +
-+static void
++void j3_mark(unsigned slot, uint32_t colour);
++
++void
 +j3_mark(unsigned slot, uint32_t colour)
 +{
 +	volatile uint32_t *band = (volatile uint32_t *)(uintptr_t)
@@ -177,7 +182,7 @@ console.
  void
  arm_init(
  	boot_args       *args)
-@@ -208,6 +243,9 @@
+@@ -208,6 +247,9 @@
  	thread_t        thread;
  	processor_t     my_master_proc;
  
@@ -187,39 +192,53 @@ console.
  	// rebase and sign jops
  	if (&__thread_starts_sect_end[0] != &__thread_starts_sect_start[0]) {
  		uintptr_t mh    = (uintptr_t) &_mh_execute_header;
-@@ -339,13 +377,25 @@
+@@ -339,8 +381,14 @@
  
  	rtclock_early_init();
  
-+	/* Bring-up: rtclock_early_init() returned. */
++	/* Bring-up: rtclock_early_init returned. */
 +	j3_mark(2, 0x00FF0000u);        /* red */
 +
  	kernel_early_bootstrap();
  
-+	/* Bring-up: kernel_early_bootstrap() returned. */
-+	j3_mark(3, 0x000080FFu);        /* blue */
++	/* Bring-up: kernel_early_bootstrap returned. */
++	j3_mark(6, 0x0000FFFFu);        /* cyan */
 +
  	cpu_init();
  
-+	/* Bring-up: cpu_init() returned. */
+ 	EntropyData.index_ptr = EntropyData.buffer;
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -242,6 +242,9 @@
+ 	kernel_debug_string_early(message);
+ }
+ 
++/* Bring-up: see the fb-early-checkpoints patch. Defined in osfmk/arm/arm_init.c. */
++extern void j3_mark(unsigned slot, uint32_t colour);
++
+ void
+ kernel_early_bootstrap(void)
+ {
+@@ -250,13 +253,22 @@
+ 		serverperfmode = 1;
+ 	}
+ 
++	/* Bring-up: the boot-args string was parsed. */
++	j3_mark(3, 0x000080FFu);        /* blue */
++
+ 	lck_mod_init();
+ 
++	/* Bring-up: lck_mod_init returned. */
 +	j3_mark(4, 0x00FFFF00u);        /* yellow */
 +
- 	EntropyData.index_ptr = EntropyData.buffer;
+ 	/*
+ 	 * Initialize the timer callout world
+ 	 */
+ 	timer_call_init();
  
- 	processor_bootstrap();
-+
-+	/* Bring-up: processor_bootstrap() returned. */
++	/* Bring-up: timer_call_init returned. */
 +	j3_mark(5, 0x00FF00FFu);        /* magenta */
- 	my_master_proc = master_processor;
- 
- 	(void)PE_parse_boot_argn("diag", &arm_diag, sizeof(arm_diag));
-@@ -383,6 +433,9 @@
- 
- 	arm_vm_init(xmaxmem, args);
- 
-+	/* Bring-up: arm_vm_init(xmaxmem, args) returned. */
-+	j3_mark(6, 0x0000FFFFu);        /* cyan */
 +
- 	uint32_t debugmode;
- 	if (PE_parse_boot_argn("debug", &debugmode, sizeof(debugmode)) &&
- 	    debugmode) {
+ #if CONFIG_SCHED_SFI
+ 	/*
+ 	 * Configure SFI classes
