@@ -244,6 +244,8 @@ build_deps() {
     hsp="$hsp $WORK_DIR/hdr-obj/EXPORT_HDRS/osfmk"
     hsp="$hsp $WORK_DIR/hdr-obj/EXPORT_HDRS/bsd"
     hsp="$hsp $WORK_DIR/hdr-obj/EXPORT_HDRS/libkern"
+    hsp="$hsp $sdkp/usr/local/include/os $sdkp/usr/local/include/firehose"
+    hsp="$hsp $sdkp/usr/local/include"
     hsp="$hsp $sdkp/System/Library/Frameworks/Kernel.framework/PrivateHeaders"
     hsp="$hsp $sdkp/System/Library/Frameworks/Kernel.framework/Headers"
     (cd "$d" && xcodebuild install -sdk macosx -target libfirehose_kernel \
