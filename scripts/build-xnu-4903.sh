@@ -106,15 +106,17 @@ fetch_xnu() {
 
     say "Fetching xnu-$XNU_VERSION"
     mkdir -p "$SRC_DIR"
-    local tarball="$SRC_DIR/xnu-$XNU_VERSION.tar.gz"
-    # The old release trains are not all in the git repo; the tarball always is.
-    if [ ! -f "$tarball" ]; then
-        curl -fL --retry 3 -o "$tarball" \
-            "https://opensource.apple.com/tarballs/xnu/xnu-$XNU_VERSION.tar.gz" \
-            || die "could not download xnu-$XNU_VERSION tarball"
-    fi
-    tar -C "$SRC_DIR" -xzf "$tarball" || die "tar failed"
-    [ -d "$XNU_SRC" ] || die "unexpected tarball layout under $SRC_DIR"
+    # Apple retired the tarball site; the GitHub mirrors still carry the tags.
+    local tag="xnu-$XNU_VERSION"
+    for repo in "https://github.com/apple/darwin-xnu" \
+                "https://github.com/apple-oss-distributions/xnu"; do
+        info "trying $repo @ $tag"
+        if git clone --quiet --depth 1 --branch "$tag" "$repo" "$XNU_SRC"; then
+            return
+        fi
+        rm -rf "$XNU_SRC"
+    done
+    die "could not fetch $tag from any mirror"
 }
 
 apply_patches() {
