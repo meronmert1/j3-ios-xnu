@@ -1,0 +1,53 @@
+BCM2837: tell the compiler the CPU is a Cortex-A53.
+
+The kernel hangs inside lck_mtx_init_ext(), at the end of lck_mod_init(),
+before any console exists. The function is pure software and the only thing in
+it that reaches the hardware is a pair of atomic increments:
+
+    lck_grp_reference(grp);
+    lck_grp_lckcnt_incr(grp, LCK_TYPE_MTX);
+
+Both land in hw_atomic_add, which xnu writes as __c11_atomic_fetch_add and
+leaves entirely to the compiler. For an ARMv8.0 target that is an ldxr/stxr
+retry loop. From ARMv8.1 it is a single LSE instruction -- ldadd, swp, cas --
+and Cortex-A53 implements none of them. The first atomic the kernel executes
+takes an undefined-instruction exception, which this early means a frozen
+screen and nothing else.
+
+Every other board here names its CPU:
+
+    MACHINE_FLAGS_ARM64_T8010 = -DARM64_BOARD_CONFIG_T8010 -mcpu=hurricane
+    MACHINE_FLAGS_ARM64_T8011 = -DARM64_BOARD_CONFIG_T8011 -mcpu=hurricane
+
+BCM2837 did not, and in 2018 that cost nothing, because the toolchain of the
+day defaulted to ARMv8.0 anyway. A current clang does not: with no -mcpu it
+picks a far newer baseline and uses LSE throughout. The same source, the same
+makefile, a different compiler, and a kernel full of instructions this chip
+cannot execute. Reproduced directly:
+
+    clang --target=arm64-apple-darwin -O2 ...
+        ldadd   w8, w0, [x0]
+    clang --target=arm64-apple-darwin -mcpu=cortex-a53 -O2 ...
+        ldxr    w8, [x0]
+        stxr    w10, w9, [x0]
+
+A scan of the built kernel found hundreds of LSE encodings in __TEXT_EXEC
+against only 59 ldxr/stxr, so this was not a stray instruction or two; the
+whole kernel was built for a CPU that does not exist here.
+
+cortex-a53 is not a workaround but the fact of the matter: BCM2837 is a
+quad-core Cortex-A53, and so is the Exynos 7570 this is being brought up on.
+Naming it fixes the atomics and anything else the compiler would otherwise
+assume about a newer core.
+
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -60,7 +60,7 @@
+ MACHINE_FLAGS_ARM_T8004 = -DARM_BOARD_CONFIG_T8004
+ MACHINE_FLAGS_ARM64_T8010 = -DARM64_BOARD_CONFIG_T8010 -mcpu=hurricane
+ MACHINE_FLAGS_ARM64_T8011 = -DARM64_BOARD_CONFIG_T8011 -mcpu=hurricane
+-MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
++MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837 -mcpu=cortex-a53
+ 
+ 
+ #
