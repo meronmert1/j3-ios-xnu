@@ -167,6 +167,16 @@ build_deps() {
     (cd "$d" && make install DSTROOT="$TOOLCHAIN_DST" >>"$LOG_DIR/deps.log" 2>&1) \
         || die "AvailabilityVersions build failed (see $LOG_DIR/deps.log)"
 
+    # bsd/sys/make_symbol_aliasing.sh looks for availability.pl inside the SDK
+    # rather than the toolchain, and the public SDK does not ship it.
+    local sdk; sdk="$(xcrun --sdk macosx --show-sdk-path)"
+    [ -n "$sdk" ] || die "cannot locate the macOS SDK"
+    sudo ditto "$TOOLCHAIN_DST/usr/local/libexec" "$sdk/usr/local/libexec" \
+        || die "could not stage availability.pl into the SDK"
+    [ -x "$sdk/usr/local/libexec/availability.pl" ] \
+        || die "availability.pl not executable in the SDK"
+    info "availability.pl -> $sdk/usr/local/libexec"
+
     say "bootstrap_cmds (mig)"
     d="$(fetch_oss bootstrap_cmds "$BOOTSTRAP_CMDS_REF")" || exit 1
     # The project file gets renamed across releases -- bootstrap_cmds-138
