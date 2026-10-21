@@ -1,0 +1,125 @@
+# .github/workflows/xnu-4903-bcm2837.yml
+#
+# Probe build: does xnu-4903.270.47 (iOS 12 era) still compile for ARM64/BCM2837
+# with the Xcode versions available on hosted macOS runners?
+#
+# Each matrix cell is allowed to fail. What matters is the error summary in the
+# run summary page and the full log in the artifacts, so the failures can be
+# turned into patches under patches/xnu-4903/.
+#
+# Runner notes (October 2026):
+#   - macos-14 carries the oldest Xcode still available (15.x) and is the most
+#     likely to build 2018 sources, but it is deprecated and unsupported after
+#     2026-11-02. Drop that row when it disappears.
+#   - macos-15 is the current default; macos-26 only ships Xcode 26.x.
+
+name: xnu-4903 BCM2837 build probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: "RELEASE or DEVELOPMENT"
+        default: DEVELOPMENT
+        type: choice
+        options: [DEVELOPMENT, RELEASE]
+      keep_going:
+        description: "make -k: collect as many errors as possible"
+        default: true
+        type: boolean
+  push:
+    paths:
+      - 'scripts/build-xnu-4903.sh'
+      - 'patches/xnu-4903/**'
+      - '.github/workflows/xnu-4903-bcm2837.yml'
+
+concurrency:
+  group: xnu-4903-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.runner }} / Xcode ${{ matrix.xcode }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            xcode: '15.2'
+          - runner: macos-14
+            xcode: '16.2'
+          - runner: macos-15
+            xcode: '16.4'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          set -eu
+          app="/Applications/Xcode_${{ matrix.xcode }}.app"
+          if [ ! -d "$app" ]; then
+            echo "::warning::$app not installed on this image; falling back"
+            ls -d /Applications/Xcode*.app || true
+            app="$(ls -d /Applications/Xcode*.app | sort -V | head -1)"
+          fi
+          sudo xcode-select -s "$app/Contents/Developer"
+          xcodebuild -version
+          clang --version | head -1
+
+      - name: Cache dependency checkouts
+        uses: actions/cache@v4
+        with:
+          path: .xnu-build/deps
+          key: xnu-deps-${{ matrix.runner }}-${{ matrix.xcode }}-v1
+
+      - name: Build xnu
+        id: build
+        continue-on-error: true
+        env:
+          KERNEL_CONFIG: ${{ github.event.inputs.kernel_config || 'DEVELOPMENT' }}
+          ARCH_CONFIG: ARM64
+          MACHINE_CONFIG: BCM2837
+        run: |
+          chmod +x scripts/build-xnu-4903.sh
+          if [ "${{ github.event.inputs.keep_going || 'true' }}" = "true" ]; then
+            ./scripts/build-xnu-4903.sh --keep-going
+          else
+            ./scripts/build-xnu-4903.sh
+          fi
+
+      - name: Error summary
+        if: always()
+        run: |
+          echo "## ${{ matrix.runner }} / Xcode ${{ matrix.xcode }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f .xnu-build/logs/kernel-build.log ]; then
+            ./scripts/build-xnu-4903.sh --summary >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No kernel build log: the build failed before compiling. See deps.log._" \
+              >> "$GITHUB_STEP_SUMMARY"
+            if [ -f .xnu-build/logs/deps.log ]; then
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              tail -60 .xnu-build/logs/deps.log >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.runner }}-xcode${{ matrix.xcode }}
+          path: .xnu-build/logs/
+          if-no-files-found: warn
+
+      - name: Upload kernel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.runner }}-xcode${{ matrix.xcode }}
+          path: |
+            .xnu-build/obj/**/kernel.*
+            .xnu-build/dst/**/kernel*
+          if-no-files-found: ignore
