@@ -7,26 +7,31 @@ VBAR_EL1 to LowExceptionVectorBase almost immediately, which catches an early
 fault in a spin loop, so the machine does not even reset to say that something
 went wrong.
 
-This writes a thick coloured band straight to the framebuffer at seven points.
-The previous round put the failure inside kernel_early_bootstrap(), so the
-checkpoints now sit between that function's own three steps:
+Successive rounds have walked the failure down from "somewhere in the kernel"
+to inside lck_mod_init(), so the bands now sit between that function's own
+steps:
 
     0  green    first instruction of start_first_cpu
-    1  white    first statement of arm_init(), running as C from KVA
-    2  red      rtclock_early_init() returned
-    3  blue     the boot-args string was parsed
-    4  yellow   lck_mod_init() returned
-    5  magenta  timer_call_init() returned
-    6  cyan     kernel_early_bootstrap() returned
+    1  white    lck_mod_init() was entered
+    2  red      the boot-arg was read and the group queue initialised
+    3  blue     the compat group was zeroed, named and given its attributes
+    4  yellow   the group is on the queue
+    5  magenta  both attribute defaults are set
+    6  cyan     lck_mtx_init_ext() returned; lck_mod_init() is complete
 
 Seven, not more, and in six clearly different colours: the count is read off a
 photograph of a phone screen, and a dozen similar bands is a measurement that
-cannot be trusted. Slots 0 to 2 are known-good anchors that confirm the
-handoff, the MMU and the timebase still work.
+cannot be trusted. Slot 0 is a known-good anchor confirming the handoff and
+the MMU still work.
+
+What makes this worth instrumenting at all is that lck_mod_init() is pure
+software -- queue manipulation, a bzero, a strncpy, two attribute defaults and
+a mutex initialiser -- with nothing in it that should care what board it is
+running on. Something in there does, and narrowing it to one statement is
+cheaper than reasoning about which.
 
 The helper lives in osfmk/arm/arm_init.c and is deliberately not static, so
-osfmk/kern/startup.c can mark its way through kernel_early_bootstrap() with
-the same code and the same geometry.
+osfmk/kern/locks.c can use the same code and the same geometry.
 
 Two things are needed to make any band after the MMU is enabled work, and both
 are easy to miss. The framebuffer has to stay reachable once translation is
@@ -49,8 +54,8 @@ follows this file's own conventions -- .macro with positional $0/$1 and
 .endmacro -- rather than the GNU spellings, which the Apple assembler this is
 built with does not use.
 
-The geometry constants describe this board's display and are repeated in both
-C files; another board needs those changed and nothing else.
+The geometry constants describe this board's display; another board needs
+those changed and nothing else.
 
 This is a debugging aid, not a fix. Drop it once the kernel reaches its own
 console.
@@ -149,9 +154,9 @@ console.
 + * mapping is write-back, so the pixels have to be pushed out by hand or the
 + * band never reaches the panel.
 + *
-+ * Not static: osfmk/kern/startup.c marks its way through
-+ * kernel_early_bootstrap() with the same helper. Keep the geometry in step
-+ * with the J3_MARK macro in osfmk/arm64/start.s.
++ * Not static: osfmk/kern/locks.c marks its way through lck_mod_init() with
++ * the same helper. Keep the geometry in step with the J3_MARK macro in
++ * osfmk/arm64/start.s.
 + */
 +#define J3_FB_BASE      0x67000000UL
 +#define J3_FB_STRIDE    2880UL
@@ -182,63 +187,60 @@ console.
  void
  arm_init(
  	boot_args       *args)
-@@ -208,6 +247,9 @@
- 	thread_t        thread;
- 	processor_t     my_master_proc;
- 
-+	/* Bring-up: C code is running, from the KVA mapping. */
-+	j3_mark(1, 0x00FFFFFFu);        /* white */
-+
- 	// rebase and sign jops
- 	if (&__thread_starts_sect_end[0] != &__thread_starts_sect_start[0]) {
- 		uintptr_t mh    = (uintptr_t) &_mh_execute_header;
-@@ -339,8 +381,14 @@
- 
- 	rtclock_early_init();
- 
-+	/* Bring-up: rtclock_early_init returned. */
-+	j3_mark(2, 0x00FF0000u);        /* red */
-+
- 	kernel_early_bootstrap();
- 
-+	/* Bring-up: kernel_early_bootstrap returned. */
-+	j3_mark(6, 0x0000FFFFu);        /* cyan */
-+
- 	cpu_init();
- 
- 	EntropyData.index_ptr = EntropyData.buffer;
---- a/osfmk/kern/startup.c
-+++ b/osfmk/kern/startup.c
-@@ -242,6 +242,9 @@
- 	kernel_debug_string_early(message);
- }
+--- a/osfmk/kern/locks.c
++++ b/osfmk/kern/locks.c
+@@ -139,10 +139,16 @@
+  * Routine:	lck_mod_init
+  */
  
 +/* Bring-up: see the fb-early-checkpoints patch. Defined in osfmk/arm/arm_init.c. */
 +extern void j3_mark(unsigned slot, uint32_t colour);
 +
  void
- kernel_early_bootstrap(void)
+ lck_mod_init(
+ 	void)
  {
-@@ -250,13 +253,22 @@
- 		serverperfmode = 1;
++	/* Bring-up: lck_mod_init was entered. */
++	j3_mark(1, 0x00FFFFFFu);        /* white */
++
+ 	/*
+ 	 * Obtain "lcks" options:this currently controls lock statistics
+ 	 */
+@@ -159,6 +165,9 @@
+ 
+ 	queue_init(&lck_grp_queue);
+ 
++	/* Bring-up: boot-arg read and the group queue is initialised. */
++	j3_mark(2, 0x00FF0000u);        /* red */
++
+ 	/*
+ 	 * Need to bootstrap the LockCompatGroup instead of calling lck_grp_init() here. This avoids
+ 	 * grabbing the lck_grp_lock before it is initialized.
+@@ -175,15 +184,27 @@
+ 		LockCompatGroup.lck_grp_attr |= LCK_GRP_ATTR_TIME_STAT;
  	}
  
-+	/* Bring-up: the boot-args string was parsed. */
++	/* Bring-up: the compat group was zeroed, named and given its attrs. */
 +	j3_mark(3, 0x000080FFu);        /* blue */
 +
- 	lck_mod_init();
+ 	LockCompatGroup.lck_grp_refcnt = 1;
  
-+	/* Bring-up: lck_mod_init returned. */
+ 	enqueue_tail(&lck_grp_queue, (queue_entry_t)&LockCompatGroup);
+ 	lck_grp_cnt = 1;
+ 
++	/* Bring-up: the group is on the queue. */
 +	j3_mark(4, 0x00FFFF00u);        /* yellow */
 +
- 	/*
- 	 * Initialize the timer callout world
- 	 */
- 	timer_call_init();
+ 	lck_grp_attr_setdefault(&LockDefaultGroupAttr);
+ 	lck_attr_setdefault(&LockDefaultLckAttr);
  
-+	/* Bring-up: timer_call_init returned. */
++	/* Bring-up: both attribute defaults are set. */
 +	j3_mark(5, 0x00FF00FFu);        /* magenta */
 +
- #if CONFIG_SCHED_SFI
- 	/*
- 	 * Configure SFI classes
+ 	lck_mtx_init_ext(&lck_grp_lock, &lck_grp_lock_ext, &LockCompatGroup, &LockDefaultLckAttr);
++
++	/* Bring-up: lck_mod_init is complete. */
++	j3_mark(6, 0x0000FFFFu);        /* cyan */
+ }
+ 
+ /*
