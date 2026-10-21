@@ -1,4 +1,4 @@
-Draw progress bands on the framebuffer through early arm64 boot.
+Draw progress bands on the framebuffer, through to the kernel's own console.
 
 On a board with no serial port nothing the kernel does before
 PE_create_console is visible, and that is a long way in. Until then a failure
@@ -7,44 +7,47 @@ VBAR_EL1 to LowExceptionVectorBase almost immediately, which catches an early
 fault in a spin loop, so the machine does not even reset to say that something
 went wrong.
 
-The bands now span what is left of arm_init, up to the point where this
-technique stops working:
+The bands now reach PE_create_console itself, which is as far as this
+technique needs to go:
 
     0  green    first instruction of start_first_cpu
-    1  white    first statement of arm_init(), running as C from KVA
-    2  red      kernel_early_bootstrap() returned
-    3  blue     cpu_init() returned
-    4  yellow   processor_bootstrap() returned
-    5  magenta  about to call arm_vm_init()
-    6  cyan     arm_vm_init() returned and the old mapping survived it
+    1  white    about to call arm_vm_init()
+    2  red      arm_vm_init() returned; the real page tables are live
+    3  blue     printf_init() and panic_init() returned
+    4  yellow   PE_init_kprintf() returned
+    5  magenta  about to call PE_create_console()
+    6  cyan     PE_create_console() returned
 
-Seven, not more, and in six clearly different colours: the count is read off a
-photograph of a phone screen, and a dozen similar bands is a measurement that
-cannot be trusted.
+Seven, in six clearly different colours: the count is read off a photograph of
+a phone screen, so a dozen similar bands is a measurement that cannot be
+trusted. Slots 0 and 1 are anchors over ground already known to work.
 
-Slot 5 is the last band that can be trusted to mean what it says. Every band
-is written through the V=P bootstrap mapping in TTBR0, and arm_vm_init
-replaces it with the real page tables, so a missing cyan says either that
-arm_vm_init did not return or merely that the framebuffer is no longer at that
-address. Past that point the kernel's own console is the next thing that can
-speak, and seeing it appear is the answer.
+The important change is that a band is now written two different ways. Before
+arm_vm_init the framebuffer's physical address still resolves through the V=P
+bootstrap mapping in TTBR0, and that mapping is write-back, so the pixels have
+to be flushed by hand or the band never reaches the panel. arm_vm_init
+replaces that mapping, and a band written to the physical address afterwards
+does not merely fail to appear -- it faults, and takes down a kernel that was
+otherwise fine. That is a worse outcome than seeing nothing, because the
+instrument becomes the fault. Everything after arm_vm_init therefore asks
+ml_io_map for a real mapping, which hands back device memory and needs no
+flushing.
 
-Two things are needed to make any band after the MMU is enabled work, and both
-are easy to miss. The framebuffer has to stay reachable once translation is
-on: it is a carveout immediately above the memory the kernel manages, so it
-falls outside the V=P bootstrap mapping, which covers exactly memSize bytes,
-and a few extra L2 entries bring it back in. And the pixels have to be flushed
--- ARM_TTE_BOOT_BLOCK maps with CACHE_ATTRINDX_WRITEBACK, so the band would
-otherwise sit in the cache and never reach the panel, missing even though the
-code ran, which is precisely the wrong answer to get from a test like this.
-Before the MMU is enabled the access is Device and the maintenance is a no-op,
-so the same code is correct either side.
+The framebuffer also has to be reachable at all before arm_vm_init: it is a
+carveout immediately above the memory the kernel manages, so it falls outside
+the V=P bootstrap mapping, which covers exactly memSize bytes. A few extra L2
+entries bring it back in.
 
 x6 through x9 are the only registers the assembly macro touches, and x0, which
 holds the boot_args pointer at slot 0, is deliberately left alone. The macro
 follows this file's own conventions -- .macro with positional $0/$1 and
 .endmacro -- rather than the GNU spellings, which the Apple assembler this is
 built with does not use.
+
+Reaching slot 6 is the end of the exercise: from there the kernel can write to
+the screen itself, and the bands have nothing left to say. Note that
+PE_create_console may well clear the framebuffer, so the bands disappearing is
+a success, not a failure.
 
 The geometry constants describe this board's display; another board needs
 those changed and nothing else.
@@ -54,7 +57,7 @@ console.
 
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -85,6 +85,53 @@
+@@ -85,6 +85,47 @@
  .endmacro
  
  /*
@@ -64,7 +67,7 @@ console.
 + */
 +#define J3_FB_BASE	0x67000000
 +#define J3_FB_STRIDE	2880
-+#define J3_MARK_ROW0	1100
++#define J3_MARK_ROW0	950
 +#define J3_MARK_PITCH	24
 +#define J3_MARK_HEIGHT	16
 +#define J3_MARK_WIDTH	720
@@ -86,12 +89,6 @@ console.
 +	str		w7, [x6], #4
 +	subs	x8, x8, #1
 +	b.ne	9991b
-+	/*
-+	 * Once the MMU is on this address is reached through a bootstrap block
-+	 * entry, and ARM_TTE_BOOT_BLOCK is CACHE_ATTRINDX_WRITEBACK, so the
-+	 * pixels would sit in the cache and never reach the panel. Push them
-+	 * out. Harmless before the MMU is enabled, where the access is Device.
-+	 */
 +	dsb		sy
 +	mov		x8, #(J3_MARK_BYTES / 64)
 +9992:
@@ -108,7 +105,7 @@ console.
   * Checks the reset handler for global and CPU-specific reset-assist functions,
   * then jumps to the reset handler with boot args and cpu data. This is copied
   * to the first physical page during CPU bootstrap (see cpu.c).
-@@ -449,6 +496,9 @@
+@@ -449,6 +490,9 @@
  	.globl EXT(start_first_cpu)
  LEXT(start_first_cpu)
  
@@ -118,14 +115,15 @@ console.
  	// Unlock the core for debugging
  	msr		OSLAR_EL1, xzr
  	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
-@@ -593,6 +643,12 @@
+@@ -593,6 +637,13 @@
  	 * x5 - total number of L2 entries to allocate
  	 */
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
 +	/*
 +	 * Bring-up: a few extra L2 entries so the V=P mapping reaches past the
 +	 * end of kernel-managed memory and still covers the framebuffer, which
-+	 * is a carveout just above it. arm_vm_init replaces this mapping later.
++	 * is a carveout just above it. arm_vm_init replaces this mapping later,
++	 * which is why the later bands go through ml_io_map instead.
 +	 */
 +	add		x5, x5, #8
  	/* create_bootstrap_mapping(vbase, pbase, num_ents, L1 table, freeptr) */
@@ -133,7 +131,7 @@ console.
  
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -198,6 +198,39 @@
+@@ -198,6 +198,71 @@
  extern uint32_t __thread_starts_sect_start[] __asm("section$start$__TEXT$__thread_starts");
  extern uint32_t __thread_starts_sect_end[]   __asm("section$end$__TEXT$__thread_starts");
  
@@ -141,18 +139,23 @@ console.
 +/*
 + * Framebuffer progress bands -- bring-up only, see the patch header.
 + *
-+ * The framebuffer is reachable at its physical address through the V=P
-+ * bootstrap table in TTBR0, and that mapping is write-back, so the pixels
-+ * have to be pushed out by hand or the band never reaches the panel. Keep the
-+ * geometry in step with the J3_MARK macro in osfmk/arm64/start.s.
++ * Two versions, because the framebuffer is reached two different ways either
++ * side of arm_vm_init. Keep the geometry in step with the J3_MARK macro in
++ * osfmk/arm64/start.s.
 + */
 +#define J3_FB_BASE      0x67000000UL
 +#define J3_FB_STRIDE    2880UL
-+#define J3_MARK_ROW0    1100UL
++#define J3_MARK_ROW0    950UL
 +#define J3_MARK_PITCH   24UL
 +#define J3_MARK_HEIGHT  16U
 +#define J3_MARK_WIDTH   720U
++#define J3_FB_SPAN      (1280UL * J3_FB_STRIDE)
 +
++/*
++ * Before arm_vm_init: the physical address still resolves through the V=P
++ * bootstrap table in TTBR0, and that mapping is write-back, so the pixels
++ * have to be pushed out by hand or the band never reaches the panel.
++ */
 +static void
 +j3_mark(unsigned slot, uint32_t colour)
 +{
@@ -170,57 +173,83 @@ console.
 +	__asm__ volatile ("dsb sy");
 +}
 +
++/*
++ * After arm_vm_init: the V=P mapping is gone, so writing the physical address
++ * would fault -- and a band placed there would take down a kernel that was
++ * otherwise fine, which is worse than seeing nothing. Ask for a real mapping
++ * instead. ml_io_map hands back device memory, so no flushing is needed.
++ */
++static volatile uint32_t *j3_io_fb;
++
++static void
++j3_mark_io(unsigned slot, uint32_t colour)
++{
++	if (j3_io_fb == NULL) {
++		j3_io_fb = (volatile uint32_t *)ml_io_map(J3_FB_BASE, J3_FB_SPAN);
++		if (j3_io_fb == NULL) {
++			return;
++		}
++	}
++
++	volatile uint32_t *band = j3_io_fb +
++	    (J3_MARK_ROW0 + slot * J3_MARK_PITCH) * J3_FB_STRIDE / 4;
++
++	for (unsigned i = 0; i < J3_MARK_WIDTH * J3_MARK_HEIGHT; i++) {
++		band[i] = colour;
++	}
++	__asm__ volatile ("dsb sy");
++}
++
  void
  arm_init(
  	boot_args       *args)
-@@ -208,6 +241,9 @@
- 	thread_t        thread;
- 	processor_t     my_master_proc;
- 
-+	/* Bring-up: C code is running, from the KVA mapping. */
-+	j3_mark(1, 0x00FFFFFFu);        /* white */
-+
- 	// rebase and sign jops
- 	if (&__thread_starts_sect_end[0] != &__thread_starts_sect_start[0]) {
- 		uintptr_t mh    = (uintptr_t) &_mh_execute_header;
-@@ -341,11 +377,20 @@
- 
- 	kernel_early_bootstrap();
- 
-+	/* Bring-up: kernel_early_bootstrap() returned. */
-+	j3_mark(2, 0x00FF0000u);        /* red */
-+
- 	cpu_init();
- 
-+	/* Bring-up: cpu_init() returned. */
-+	j3_mark(3, 0x000080FFu);        /* blue */
-+
- 	EntropyData.index_ptr = EntropyData.buffer;
- 
- 	processor_bootstrap();
-+
-+	/* Bring-up: processor_bootstrap() returned. */
-+	j3_mark(4, 0x00FFFF00u);        /* yellow */
- 	my_master_proc = master_processor;
- 
- 	(void)PE_parse_boot_argn("diag", &arm_diag, sizeof(arm_diag));
-@@ -381,8 +426,19 @@
+@@ -381,8 +446,14 @@
  	__builtin_arm_wsr("pan", 1);
  #endif  /* __ARM_PAN_AVAILABLE__ */
  
-+	/*
-+	 * Bring-up: the last band that can be trusted. arm_vm_init replaces the
-+	 * V=P bootstrap mapping every band is written through, so a missing
-+	 * cyan below means either that it did not return or merely that the
-+	 * framebuffer is no longer at that address.
-+	 */
-+	j3_mark(5, 0x00FF00FFu);        /* magenta */
++	/* Bring-up: everything up to here is confirmed working. */
++	j3_mark(1, 0x00FFFFFFu);        /* white */
 +
  	arm_vm_init(xmaxmem, args);
  
-+	/* Bring-up: arm_vm_init returned AND the old mapping survived it. */
-+	j3_mark(6, 0x0000FFFFu);        /* cyan */
++	/* Bring-up: arm_vm_init returned; the real page tables are live. */
++	j3_mark_io(2, 0x00FF0000u);     /* red */
 +
  	uint32_t debugmode;
  	if (PE_parse_boot_argn("debug", &debugmode, sizeof(debugmode)) &&
  	    debugmode) {
+@@ -391,6 +462,9 @@
+ 
+ 	printf_init();
+ 	panic_init();
++
++	/* Bring-up: panic_init() returned. */
++	j3_mark_io(3, 0x000080FFu);     /* blue */
+ #if __arm64__
+ 	/* Enable asynchronous exceptions */
+ 	__builtin_arm_wsr("DAIFClr", DAIFSC_ASYNCF);
+@@ -404,6 +478,9 @@
+ 	/* setup debugging output if one has been chosen */
+ 	PE_init_kprintf(FALSE);
+ 
++	/* Bring-up: PE_init_kprintf(FALSE) returned. */
++	j3_mark_io(4, 0x00FFFF00u);     /* yellow */
++
+ 	kprintf("kprintf initialized\n");
+ 
+ 	serialmode = 0;                                                      /* Assume normal keyboard and console */
+@@ -430,8 +507,14 @@
+ 		(void)switch_to_serial_console(); /* Switch into serial mode */
+ 		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
+ 	}
++	/* Bring-up: about to bring up the kernel's own console. */
++	j3_mark_io(5, 0x00FF00FFu);     /* magenta */
++
+ 	PE_create_console();
+ 
++	/* Bring-up: PE_create_console returned. */
++	j3_mark_io(6, 0x0000FFFFu);     /* cyan */
++
+ 	/* setup console output */
+ 	PE_init_printf(FALSE);
+ 
