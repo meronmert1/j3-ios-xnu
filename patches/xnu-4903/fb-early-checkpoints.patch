@@ -1,0 +1,120 @@
+Draw progress bands on the framebuffer from arm64 start.s.
+
+On a board with no serial port there is no way to see anything the kernel does
+before PE_create_console, and that is a long way in: start_first_cpu has to
+read boot_args, build the bootstrap translation tables, enable the MMU and get
+a good way through arm_init first. Until then a failure is a frozen screen and
+nothing else -- made worse by start_first_cpu setting VBAR_EL1 to
+LowExceptionVectorBase almost immediately, which catches an early fault in a
+spin loop, so the machine does not even reset to say something went wrong.
+
+This writes a coloured band straight to the framebuffer at three points, low
+on the screen where the bootloader's own output does not reach:
+
+    slot 0  green   first instruction of start_first_cpu
+    slot 1  cyan    boot_args has been read into x20-x26
+    slot 2  yellow  everything is set up; the MMU is about to be enabled
+
+Which bands appear says where it stopped, and the handoff itself stops being a
+question: with no green band the kernel never executed at all and the fault is
+in the bootloader, not here.
+
+All three are necessarily before the MMU comes on, because they address the
+framebuffer physically and nothing maps it afterwards -- on this board it is a
+carveout outside the memory the kernel manages, so it is not in the physical
+aperture either, and it only becomes reachable much later through
+io_map_spec. Marking after the MMU is enabled would need the framebuffer added
+to the bootstrap V=P mappings, which is a separate change.
+
+x6, x7 and x8 are the only registers touched. start.s uses them in exactly one
+place, inside create_bootstrap_mapping, which sits between the second and third
+checkpoint rather than at any of them; x0 holds the boot_args pointer at the
+first checkpoint and is deliberately left alone.
+
+The macro follows this file's own conventions -- .macro with positional $0/$1
+and .endmacro -- rather than the GNU spellings, which the Apple assembler this
+is built with does not use.
+
+J3_FB_BASE and J3_FB_STRIDE describe this board's display. Another board needs
+those two values changed and nothing else.
+
+This is a debugging aid, not a fix. Drop it once the kernel reaches its own
+console.
+
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -85,6 +85,41 @@
+ .endmacro
+ 
+ /*
++ * Framebuffer progress bands -- bring-up only, see the patch header.
++ *
++ * Physical addressing, so usable only while the MMU is off. Clobbers x6, x7
++ * and x8 and nothing else.
++ */
++#define J3_FB_BASE	0x67000000
++#define J3_FB_STRIDE	2880
++#define J3_MARK_ROW0	1180
++#define J3_MARK_PITCH	14
++#define J3_MARK_HEIGHT	10
++#define J3_MARK_WIDTH	720
++
++#define J3_MARK_OFF(slot) \
++	((J3_MARK_ROW0 + (slot) * J3_MARK_PITCH) * J3_FB_STRIDE)
++
++.macro J3_MARK
++	movz	x6, #((J3_FB_BASE) >> 16), lsl #16
++	movz	x7, #(J3_MARK_OFF($0) & 0xFFFF)
++	movk	x7, #((J3_MARK_OFF($0) >> 16) & 0xFFFF), lsl #16
++	add		x6, x6, x7
++	movz	w7, #(($1) & 0xFFFF)
++	movk	w7, #((($1) >> 16) & 0xFFFF), lsl #16
++	mov		x8, #(J3_MARK_WIDTH * J3_MARK_HEIGHT)
++9991:
++	str		w7, [x6], #4
++	subs	x8, x8, #1
++	b.ne	9991b
++.endmacro
++
++#define J3_MARK_GREEN	0x0000FF40
++#define J3_MARK_CYAN	0x0040FFFF
++#define J3_MARK_YELLOW	0x00FFD000
++
++
++/*
+  * Checks the reset handler for global and CPU-specific reset-assist functions,
+  * then jumps to the reset handler with boot args and cpu data. This is copied
+  * to the first physical page during CPU bootstrap (see cpu.c).
+@@ -449,6 +484,9 @@
+ 	.globl EXT(start_first_cpu)
+ LEXT(start_first_cpu)
+ 
++	/* Bring-up: the kernel is executing. x0 still holds boot_args. */
++	J3_MARK 0, J3_MARK_GREEN
++
+ 	// Unlock the core for debugging
+ 	msr		OSLAR_EL1, xzr
+ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
+@@ -468,6 +506,9 @@
+ 	ldr		x25, [x20, BA_TOP_OF_KERNEL_DATA]	// Get the top of the kernel data
+ 	ldr		x26, [x20, BA_BOOT_FLAGS]			// Get the kernel boot flags
+ 
++	/* Bring-up: boot_args was readable and its fields are loaded. */
++	J3_MARK 1, J3_MARK_CYAN
++
+ 	// Clear the register that will be used to store the userspace thread pointer and CPU number.
+ 	// We may not actually be booting from ordinal CPU 0, so this register will be updated
+ 	// in ml_parse_cpu_topology(), which happens later in bootstrap.
+@@ -723,6 +764,12 @@
+ 1:
+ 	MSR_VBAR_EL1_X0
+ 
++	/*
++	 * Bring-up: last point reachable with the MMU off. If this band appears
++	 * and the kernel still goes no further, the failure is at or after the
++	 * MMU being enabled below.
++	 */
++	J3_MARK 2, J3_MARK_YELLOW
+ 
+ 	// Enable caches and MMU
+ 	mov		x0, #(SCTLR_EL1_DEFAULT & 0xFFFF)
