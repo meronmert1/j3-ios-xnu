@@ -1,30 +1,33 @@
 osfmk/arm64/monotonic.h defines the core counter layout (MT_NDEVS,
-MT_CORE_CYCLES, MT_CORE_INSTRS, MT_CORE_NFIXED) inside #if KERNEL_PRIVATE.
-The exported copy of machine/monotonic.h is run through unifdef, which drops
-that section while leaving the code that reads the constants, so every
-consumer fails with "use of undeclared identifier 'MT_CORE_NFIXED'".
+MT_CORE_CYCLES, MT_CORE_INSTRS, MT_CORE_NFIXED) inside #if MONOTONIC and then
+#if KERNEL_PRIVATE. The exported copy of machine/monotonic.h is run through
+unifdef, which drops the KERNEL_PRIVATE section but keeps the
+MACH_KERNEL_PRIVATE code that reads the constants, so every consumer fails
+with "use of undeclared identifier 'MT_CORE_NFIXED'".
 
-Publish the four constants before the guard. They describe the hardware, not
-a privilege level, and C permits the identical repeat definitions that follow.
+Publish the four constants ahead of both guards. They describe the hardware,
+not a build configuration or a privilege level, and C permits the identical
+repeat definitions that follow.
 
 --- a/osfmk/arm64/monotonic.h
 +++ b/osfmk/arm64/monotonic.h
-@@ -34,6 +34,18 @@
+@@ -30,6 +30,19 @@
  
- #include <pexpert/arm64/board_config.h>
+ #include <sys/cdefs.h>
  
 +/*
-+ * How many counters this core has is a property of the hardware, not of
-+ * who is including the header. The exported copy of machine/monotonic.h
-+ * loses the KERNEL_PRIVATE section to unifdef but keeps the code that
-+ * reads these, so publish them unconditionally. The definitions below
-+ * repeat these verbatim, which C allows.
++ * How many counters a core has is a property of the hardware, not of
++ * the build configuration or of the caller's privilege. Keep these out
++ * of both guards below: the exported copy of machine/monotonic.h is run
++ * through unifdef, which drops the KERNEL_PRIVATE section while leaving
++ * the MACH_KERNEL_PRIVATE code that reads them. The definitions inside
++ * repeat these verbatim, which C permits.
 + */
 +#define MT_NDEVS 1
 +#define MT_CORE_CYCLES 0
 +#define MT_CORE_INSTRS 1
 +#define MT_CORE_NFIXED 2
 +
- #if KERNEL_PRIVATE
+ #if MONOTONIC
  
- __BEGIN_DECLS
+ #include <pexpert/arm64/board_config.h>
