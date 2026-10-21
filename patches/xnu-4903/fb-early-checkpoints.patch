@@ -1,35 +1,46 @@
 Draw progress bands on the framebuffer from arm64 start.s.
 
-On a board with no serial port there is no way to see anything the kernel does
-before PE_create_console, and that is a long way in: start_first_cpu has to
-read boot_args, build the bootstrap translation tables, enable the MMU and get
-a good way through arm_init first. Until then a failure is a frozen screen and
+On a board with no serial port nothing the kernel does before
+PE_create_console is visible, and that is a long way in: start_first_cpu has
+to read boot_args, build the bootstrap translation tables, enable the MMU and
+get well into arm_init first. Until then a failure is a frozen screen and
 nothing else -- made worse by start_first_cpu setting VBAR_EL1 to
 LowExceptionVectorBase almost immediately, which catches an early fault in a
-spin loop, so the machine does not even reset to say something went wrong.
+spin loop, so the machine does not even reset to say that something went
+wrong.
 
-This writes a coloured band straight to the framebuffer at three points, low
-on the screen where the bootloader's own output does not reach:
+This writes a coloured band straight to the framebuffer at four points, low on
+the screen where the bootloader's own output does not reach:
 
-    slot 0  green   first instruction of start_first_cpu
-    slot 1  cyan    boot_args has been read into x20-x26
-    slot 2  yellow  everything is set up; the MMU is about to be enabled
+    slot 0  green    first instruction of start_first_cpu
+    slot 1  cyan     boot_args has been read into x20-x26
+    slot 2  yellow   everything is set up; the MMU is about to be enabled
+    slot 3  magenta  the MMU is on and we are still running
 
-Which bands appear says where it stopped, and the handoff itself stops being a
-question: with no green band the kernel never executed at all and the fault is
-in the bootloader, not here.
+Which bands appear says where it stopped, and slot 3 is the one that matters:
+it separates "the MMU could not be enabled" from "the MMU is fine and the
+failure is later", which from a frozen screen are indistinguishable.
 
-All three are necessarily before the MMU comes on, because they address the
-framebuffer physically and nothing maps it afterwards -- on this board it is a
-carveout outside the memory the kernel manages, so it is not in the physical
-aperture either, and it only becomes reachable much later through
-io_map_spec. Marking after the MMU is enabled would need the framebuffer added
-to the bootstrap V=P mappings, which is a separate change.
+Two things are needed to make slot 3 work at all, and both are easy to miss.
 
-x6, x7 and x8 are the only registers touched. start.s uses them in exactly one
-place, inside create_bootstrap_mapping, which sits between the second and third
-checkpoint rather than at any of them; x0 holds the boot_args pointer at the
-first checkpoint and is deliberately left alone.
+The framebuffer has to stay reachable once translation is on. It is a carveout
+immediately above the memory the kernel manages, so it falls outside the V=P
+bootstrap mapping, which covers exactly memSize bytes; a few extra L2 entries
+bring it back in. That mapping is temporary and arm_vm_init replaces it, so
+the extra coverage costs nothing.
+
+And the pixels have to be flushed. ARM_TTE_BOOT_BLOCK maps with
+CACHE_ATTRINDX_WRITEBACK, so once the MMU is on the band would sit in the
+cache and never reach the panel -- the band would be missing even though the
+code ran, which is precisely the wrong answer to get from a test like this.
+Each mark therefore cleans its own range. Before the MMU is enabled the access
+is Device and the maintenance is a no-op, so the same macro is correct either
+side.
+
+x6 through x9 are the only registers touched. start.s uses them in exactly two
+places, both inside create_bootstrap_mapping calls, which sit between the
+checkpoints rather than at them; x0 holds the boot_args pointer at the first
+checkpoint and is deliberately left alone.
 
 The macro follows this file's own conventions -- .macro with positional $0/$1
 and .endmacro -- rather than the GNU spellings, which the Apple assembler this
@@ -43,14 +54,13 @@ console.
 
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -85,6 +85,41 @@
+@@ -85,6 +85,57 @@
  .endmacro
  
  /*
 + * Framebuffer progress bands -- bring-up only, see the patch header.
 + *
-+ * Physical addressing, so usable only while the MMU is off. Clobbers x6, x7
-+ * and x8 and nothing else.
++ * Clobbers x6-x9 and nothing else.
 + */
 +#define J3_FB_BASE	0x67000000
 +#define J3_FB_STRIDE	2880
@@ -61,12 +71,14 @@ console.
 +
 +#define J3_MARK_OFF(slot) \
 +	((J3_MARK_ROW0 + (slot) * J3_MARK_PITCH) * J3_FB_STRIDE)
++#define J3_MARK_BYTES	(J3_MARK_WIDTH * J3_MARK_HEIGHT * 4)
 +
 +.macro J3_MARK
 +	movz	x6, #((J3_FB_BASE) >> 16), lsl #16
 +	movz	x7, #(J3_MARK_OFF($0) & 0xFFFF)
 +	movk	x7, #((J3_MARK_OFF($0) >> 16) & 0xFFFF), lsl #16
 +	add		x6, x6, x7
++	mov		x9, x6
 +	movz	w7, #(($1) & 0xFFFF)
 +	movk	w7, #((($1) >> 16) & 0xFFFF), lsl #16
 +	mov		x8, #(J3_MARK_WIDTH * J3_MARK_HEIGHT)
@@ -74,18 +86,33 @@ console.
 +	str		w7, [x6], #4
 +	subs	x8, x8, #1
 +	b.ne	9991b
++	/*
++	 * Once the MMU is on this address is reached through a bootstrap block
++	 * entry, and ARM_TTE_BOOT_BLOCK is CACHE_ATTRINDX_WRITEBACK, so the
++	 * pixels would sit in the cache and never reach the panel. Push them
++	 * out. Harmless before the MMU is enabled, where the access is Device
++	 * anyway.
++	 */
++	dsb		sy
++	mov		x8, #(J3_MARK_BYTES / 64)
++9992:
++	dc		cvac, x9
++	add		x9, x9, #64
++	subs	x8, x8, #1
++	b.ne	9992b
++	dsb		sy
 +.endmacro
 +
 +#define J3_MARK_GREEN	0x0000FF40
 +#define J3_MARK_CYAN	0x0040FFFF
 +#define J3_MARK_YELLOW	0x00FFD000
-+
++#define J3_MARK_MAGENTA	0x00FF40FF
 +
 +/*
   * Checks the reset handler for global and CPU-specific reset-assist functions,
   * then jumps to the reset handler with boot args and cpu data. This is copied
   * to the first physical page during CPU bootstrap (see cpu.c).
-@@ -449,6 +484,9 @@
+@@ -449,6 +500,9 @@
  	.globl EXT(start_first_cpu)
  LEXT(start_first_cpu)
  
@@ -95,7 +122,7 @@ console.
  	// Unlock the core for debugging
  	msr		OSLAR_EL1, xzr
  	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
-@@ -468,6 +506,9 @@
+@@ -468,6 +522,9 @@
  	ldr		x25, [x20, BA_TOP_OF_KERNEL_DATA]	// Get the top of the kernel data
  	ldr		x26, [x20, BA_BOOT_FLAGS]			// Get the kernel boot flags
  
@@ -105,16 +132,40 @@ console.
  	// Clear the register that will be used to store the userspace thread pointer and CPU number.
  	// We may not actually be booting from ordinal CPU 0, so this register will be updated
  	// in ml_parse_cpu_topology(), which happens later in bootstrap.
-@@ -723,6 +764,12 @@
+@@ -593,6 +650,13 @@
+ 	 * x5 - total number of L2 entries to allocate
+ 	 */
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
++	/*
++	 * Bring-up: a few extra L2 entries so the V=P mapping reaches past the
++	 * end of kernel-managed memory and still covers the framebuffer, which
++	 * is a carveout just above it. Without this the bands below cannot be
++	 * drawn once the MMU is on. This mapping is torn down by arm_vm_init.
++	 */
++	add		x5, x5, #8
+ 	/* create_bootstrap_mapping(vbase, pbase, num_ents, L1 table, freeptr) */
+ 	create_bootstrap_mapping x0,  x4,  x5, x1, x2, x6, x10, x11, x12, x13
+ 
+@@ -723,6 +787,8 @@
  1:
  	MSR_VBAR_EL1_X0
  
-+	/*
-+	 * Bring-up: last point reachable with the MMU off. If this band appears
-+	 * and the kernel still goes no further, the failure is at or after the
-+	 * MMU being enabled below.
-+	 */
++	/* Bring-up: last point reached with the MMU still off. */
 +	J3_MARK 2, J3_MARK_YELLOW
  
  	// Enable caches and MMU
  	mov		x0, #(SCTLR_EL1_DEFAULT & 0xFFFF)
+@@ -731,6 +797,13 @@
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
++	/*
++	 * Bring-up: the MMU is on and we are still executing, through the V=P
++	 * mapping. A magenta band here and nothing after it puts the failure
++	 * past the MMU rather than at it.
++	 */
++	J3_MARK 3, J3_MARK_MAGENTA
++
+ #if (!CONFIG_KERNEL_INTEGRITY || (CONFIG_KERNEL_INTEGRITY && !defined(KERNEL_INTEGRITY_WT)))
+ 	/* Watchtower
+ 	 *
