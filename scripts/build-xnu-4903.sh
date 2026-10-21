@@ -173,6 +173,8 @@ build_deps() {
     # ships mig.xcodeproj, not bootstrap_cmds.xcodeproj -- so find it.
     proj="$(ls -d "$d"/*.xcodeproj 2>/dev/null | head -1)"
     [ -n "$proj" ] || die "no xcodeproj in $d"
+    # Its install script chowns to root:wheel, which a normal user cannot do.
+    sed -i '' -e 's/-o root -g wheel //g' "$d"/xcodescripts/*.sh 2>/dev/null
     info "project $(basename "$proj")" >&2
     (cd "$d" && xcodebuild install -sdk macosx -project "$(basename "$proj")" \
         -alltargets DSTROOT="$TOOLCHAIN_DST" >>"$LOG_DIR/deps.log" 2>&1) \
@@ -190,7 +192,10 @@ build_deps() {
     if [ "$INSTALL_TOOLCHAIN" = "1" ]; then
         say "Installing tools into the active Xcode toolchain"
         local tc; tc="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain"
-        sudo ditto "$TOOLCHAIN_DST/usr" "$tc/usr" || die "ditto failed"
+        sudo ditto "$TOOLCHAIN_DST/usr" "$tc/usr" 2>/dev/null
+        # bootstrap_cmds installs into $DSTROOT$DT_TOOLCHAIN_DIR, so the
+        # staging root mirrors the real toolchain's absolute path.
+        [ -d "$TOOLCHAIN_DST$tc/usr" ] && sudo ditto "$TOOLCHAIN_DST$tc/usr" "$tc/usr"
         for t in mig migcom ctfconvert ctfmerge; do
             xcrun -find "$t" >/dev/null 2>&1 || warn "xcrun cannot find $t yet"
         done
