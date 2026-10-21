@@ -7,52 +7,45 @@ VBAR_EL1 to LowExceptionVectorBase almost immediately, which catches an early
 fault in a spin loop, so the machine does not even reset to say that something
 went wrong.
 
-This writes a coloured band straight to the framebuffer at twelve points, low
-on the screen where the bootloader's own output does not reach:
+This writes a thick coloured band straight to the framebuffer at seven points,
+low on the screen where the bootloader's own output does not reach:
 
-    0  green     first instruction of start_first_cpu
-    1  cyan      boot_args has been read into x20-x26
-    2  yellow    everything is set up; the MMU is about to be enabled
-    3  magenta   the MMU is on and we are still running
-    4  white     common_start is done; about to ret into KVA
-    5  lt green  first statement of arm_init(), running as C from KVA
-    6  orange    PE_init_platform(FALSE) returned: the device tree parsed
-    7  blue      ml_parse_cpu_topology() returned: /cpus was understood
-    8  pink      rtclock_early_init() returned: the timebase was accepted
-    9  pale grn  processor_bootstrap() returned
-   10  yellow    arm_vm_init() returned: the real page tables are built
-   11  white     printf_init() returned
+    0  green    first instruction of start_first_cpu
+    1  white    first statement of arm_init(), running as C from KVA
+    2  red      rtclock_early_init() returned
+    3  blue     kernel_early_bootstrap() returned
+    4  yellow   cpu_init() returned
+    5  magenta  processor_bootstrap() returned
+    6  cyan     arm_vm_init() returned
 
-The pairs are what matter. 2 against 3 separates "the MMU could not be
-enabled" from "the MMU is fine"; 4 against 5 separates "the KVA mapping is
-wrong" from "we are in C"; after that each band names the last call that
-returned. From a frozen screen none of these are distinguishable.
+Seven, not more, and in six clearly different colours: the count is read off a
+photograph of a phone screen, and a dozen similar bands is a measurement that
+cannot be trusted. Slots 0 and 1 are known-good anchors that confirm the
+handoff and the MMU still work; the rest bracket the calls actually under
+suspicion.
 
-Slot 10 is the last one that can be trusted to mean what it says. Every band
+Slot 6 is the last one that can be trusted to mean what it says. Every band
 reaches the framebuffer through the V=P bootstrap mapping in TTBR0, and
-arm_vm_init replaces that mapping with the real page tables; a missing band
-from 10 onward may mean the code did not run or merely that the address is no
+arm_vm_init replaces that mapping with the real page tables; a missing cyan
+band may mean arm_vm_init did not return or merely that the address is no
 longer mapped. Anything past that point needs a mapping of its own.
 
-Two things are needed to make any band past slot 2 work, and both are easy to
-miss. The framebuffer has to stay reachable once translation is on: it is a
-carveout immediately above the memory the kernel manages, so it falls outside
-the V=P bootstrap mapping, which covers exactly memSize bytes, and a few extra
-L2 entries bring it back in. And the pixels have to be flushed --
-ARM_TTE_BOOT_BLOCK maps with CACHE_ATTRINDX_WRITEBACK, so the band would
+Two things are needed to make any band after the MMU is enabled work, and both
+are easy to miss. The framebuffer has to stay reachable once translation is
+on: it is a carveout immediately above the memory the kernel manages, so it
+falls outside the V=P bootstrap mapping, which covers exactly memSize bytes,
+and a few extra L2 entries bring it back in. And the pixels have to be flushed
+-- ARM_TTE_BOOT_BLOCK maps with CACHE_ATTRINDX_WRITEBACK, so the band would
 otherwise sit in the cache and never reach the panel, missing even though the
 code ran, which is precisely the wrong answer to get from a test like this.
 Before the MMU is enabled the access is Device and the maintenance is a no-op,
 so the same code is correct either side.
 
-x6 through x9 are the only registers the assembly macro touches. start.s uses
-them in exactly two places, both inside create_bootstrap_mapping calls, which
-sit between the checkpoints rather than at them. x0 is deliberately left
-alone: it holds the boot_args pointer at slot 0 and its KVA at slot 4.
-
-The macro follows this file's own conventions -- .macro with positional $0/$1
-and .endmacro -- rather than the GNU spellings, which the Apple assembler this
-is built with does not use.
+x6 through x9 are the only registers the assembly macro touches, and x0, which
+holds the boot_args pointer at slot 0, is deliberately left alone. The macro
+follows this file's own conventions -- .macro with positional $0/$1 and
+.endmacro -- rather than the GNU spellings, which the Apple assembler this is
+built with does not use.
 
 The geometry constants describe this board's display and are repeated in both
 files; another board needs those changed and nothing else.
@@ -62,7 +55,7 @@ console.
 
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -85,6 +85,57 @@
+@@ -85,6 +85,53 @@
  .endmacro
  
  /*
@@ -73,8 +66,8 @@ console.
 +#define J3_FB_BASE	0x67000000
 +#define J3_FB_STRIDE	2880
 +#define J3_MARK_ROW0	1100
-+#define J3_MARK_PITCH	14
-+#define J3_MARK_HEIGHT	10
++#define J3_MARK_PITCH	24
++#define J3_MARK_HEIGHT	16
 +#define J3_MARK_WIDTH	720
 +
 +#define J3_MARK_OFF(slot) \
@@ -110,17 +103,13 @@ console.
 +	dsb		sy
 +.endmacro
 +
-+#define J3_MARK_GREEN	0x0000FF40
-+#define J3_MARK_CYAN	0x0040FFFF
-+#define J3_MARK_YELLOW	0x00FFD000
-+#define J3_MARK_MAGENTA	0x00FF40FF
-+#define J3_MARK_WHITE	0x00FFFFFF
++#define J3_MARK_GREEN	0x0000FF00
 +
 +/*
   * Checks the reset handler for global and CPU-specific reset-assist functions,
   * then jumps to the reset handler with boot args and cpu data. This is copied
   * to the first physical page during CPU bootstrap (see cpu.c).
-@@ -449,6 +500,9 @@
+@@ -449,6 +496,9 @@
  	.globl EXT(start_first_cpu)
  LEXT(start_first_cpu)
  
@@ -130,17 +119,7 @@ console.
  	// Unlock the core for debugging
  	msr		OSLAR_EL1, xzr
  	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
-@@ -468,6 +522,9 @@
- 	ldr		x25, [x20, BA_TOP_OF_KERNEL_DATA]	// Get the top of the kernel data
- 	ldr		x26, [x20, BA_BOOT_FLAGS]			// Get the kernel boot flags
- 
-+	/* Bring-up: boot_args was readable and its fields are loaded. */
-+	J3_MARK 1, J3_MARK_CYAN
-+
- 	// Clear the register that will be used to store the userspace thread pointer and CPU number.
- 	// We may not actually be booting from ordinal CPU 0, so this register will be updated
- 	// in ml_parse_cpu_topology(), which happens later in bootstrap.
-@@ -593,6 +650,13 @@
+@@ -593,6 +643,13 @@
  	 * x5 - total number of L2 entries to allocate
  	 */
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
@@ -153,38 +132,6 @@ console.
 +	add		x5, x5, #8
  	/* create_bootstrap_mapping(vbase, pbase, num_ents, L1 table, freeptr) */
  	create_bootstrap_mapping x0,  x4,  x5, x1, x2, x6, x10, x11, x12, x13
- 
-@@ -723,6 +787,8 @@
- 1:
- 	MSR_VBAR_EL1_X0
- 
-+	/* Bring-up: last point reached with the MMU still off. */
-+	J3_MARK 2, J3_MARK_YELLOW
- 
- 	// Enable caches and MMU
- 	mov		x0, #(SCTLR_EL1_DEFAULT & 0xFFFF)
-@@ -731,6 +797,9 @@
- 	MSR_SCTLR_EL1_X0
- 	isb		sy
- 
-+	/* Bring-up: the MMU is on and we are still executing, through V=P. */
-+	J3_MARK 3, J3_MARK_MAGENTA
-+
- #if (!CONFIG_KERNEL_INTEGRITY || (CONFIG_KERNEL_INTEGRITY && !defined(KERNEL_INTEGRITY_WT)))
- 	/* Watchtower
- 	 *
-@@ -975,6 +1044,12 @@
- 	mov	lr, x21
- #endif
- 
-+	/*
-+	 * Bring-up: common_start is done and x0 holds the KVA of boot_args.
-+	 * The ret below leaves V=P execution for the KVA mapping.
-+	 */
-+	J3_MARK 4, J3_MARK_WHITE
-+
- 	// Return to arm_init()
- 	ret
  
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
@@ -206,8 +153,8 @@ console.
 +#define J3_FB_BASE      0x67000000UL
 +#define J3_FB_STRIDE    2880UL
 +#define J3_MARK_ROW0    1100UL
-+#define J3_MARK_PITCH   14UL
-+#define J3_MARK_HEIGHT  10U
++#define J3_MARK_PITCH   24UL
++#define J3_MARK_HEIGHT  16U
 +#define J3_MARK_WIDTH   720U
 +
 +static void
@@ -235,48 +182,34 @@ console.
  	processor_t     my_master_proc;
  
 +	/* Bring-up: C code is running, from the KVA mapping. */
-+	j3_mark(5, 0x0040FF40u);
++	j3_mark(1, 0x00FFFFFFu);        /* white */
 +
  	// rebase and sign jops
  	if (&__thread_starts_sect_end[0] != &__thread_starts_sect_start[0]) {
  		uintptr_t mh    = (uintptr_t) &_mh_execute_header;
-@@ -225,6 +263,9 @@
- 
- 	PE_init_platform(FALSE, args); /* Get platform expert set up */
- 
-+	/* Bring-up: the platform expert came up and the device tree parsed. */
-+	j3_mark(6, 0x00FF8000u);
-+
- #if __arm64__
- 
- 
-@@ -288,6 +329,9 @@
- 
- 	ml_parse_cpu_topology();
- 
-+	/* Bring-up: the /cpus node was understood. */
-+	j3_mark(7, 0x000080FFu);
-+
- 	master_cpu = ml_get_boot_cpu_number();
- 	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
- 
-@@ -339,6 +383,9 @@
+@@ -339,13 +377,25 @@
  
  	rtclock_early_init();
  
-+	/* Bring-up: the timebase was accepted. */
-+	j3_mark(8, 0x00FF0080u);
++	/* Bring-up: rtclock_early_init() returned. */
++	j3_mark(2, 0x00FF0000u);        /* red */
 +
  	kernel_early_bootstrap();
  
++	/* Bring-up: kernel_early_bootstrap() returned. */
++	j3_mark(3, 0x000080FFu);        /* blue */
++
  	cpu_init();
-@@ -346,6 +393,9 @@
+ 
++	/* Bring-up: cpu_init() returned. */
++	j3_mark(4, 0x00FFFF00u);        /* yellow */
++
  	EntropyData.index_ptr = EntropyData.buffer;
  
  	processor_bootstrap();
 +
-+	/* Bring-up: the boot processor is set up. */
-+	j3_mark(9, 0x0080FF80u);
++	/* Bring-up: processor_bootstrap() returned. */
++	j3_mark(5, 0x00FF00FFu);        /* magenta */
  	my_master_proc = master_processor;
  
  	(void)PE_parse_boot_argn("diag", &arm_diag, sizeof(arm_diag));
@@ -284,19 +217,9 @@ console.
  
  	arm_vm_init(xmaxmem, args);
  
-+	/* Bring-up: the real page tables are built; the V=P mapping these bands rely on may be gone after this. */
-+	j3_mark(10, 0x00FFFF00u);
++	/* Bring-up: arm_vm_init(xmaxmem, args) returned. */
++	j3_mark(6, 0x0000FFFFu);        /* cyan */
 +
  	uint32_t debugmode;
  	if (PE_parse_boot_argn("debug", &debugmode, sizeof(debugmode)) &&
  	    debugmode) {
-@@ -390,6 +443,9 @@
- 	}
- 
- 	printf_init();
-+
-+	/* Bring-up: printf is up; the kernel can talk once a console exists. */
-+	j3_mark(11, 0x00FFFFFFu);
- 	panic_init();
- #if __arm64__
- 	/* Enable asynchronous exceptions */
