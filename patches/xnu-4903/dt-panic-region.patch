@@ -1,0 +1,64 @@
+BCM2837 hardcodes the panic log to a Raspberry Pi 3 physical address.
+
+pexpert/pexpert/arm64/BCM2837.h sets:
+
+    #define PLATFORM_PANIC_LOG_PADDR        0x3c0fc000
+    #define PLATFORM_PANIC_LOG_SIZE         16384
+
+and pexpert/arm/pe_init.c's check_for_panic_log() uses them unconditionally
+when they exist:
+
+    #ifdef PLATFORM_PANIC_LOG_PADDR
+        gPanicBase = ml_io_map_wcomb(PLATFORM_PANIC_LOG_PADDR, PLATFORM_PANIC_LOG_SIZE);
+        ...
+    #else
+        /* read the /pram node's reg and /chosen's embedded-panic-log-size */
+    #endif
+
+0x3c0fc000 is where the Pi 3's VideoCore firmware leaves its region, below
+the 0x40000000 ARM DRAM split. It is a property of one specific board, not
+of the SoC family, and on any other board it is some other device's
+register space -- or, as here, not DRAM at all. Writing a panic log there
+either faults or corrupts an unrelated peripheral, and reading it back on
+the next boot yields garbage that check_for_panic_log() may then mistake
+for a real panic header or an 'SHMC' shared-memory console.
+
+The fix is to delete the two defines, nothing more. The #else branch is
+already the general implementation and needs no new code: it takes the
+region's base from the device tree's /pram node (reg[0]) and its length
+from /chosen's embedded-panic-log-size. That is how every Apple target
+does it, and it lets each board place the region wherever its own memory
+map has room.
+
+So the board supplying the device tree must provide:
+
+    /pram          reg                       = { base, length }   (two u64)
+    /chosen        embedded-panic-log-size   = length             (u32)
+
+and both must agree on the length. If either is missing the function
+returns early, leaving gPanicBase NULL -- no panic log, but no fault
+either, which is a safe default for a board still being brought up.
+
+Place the region outside the memory the kernel manages, i.e. below
+boot_args.physBase. A page inside the managed range gets handed out as
+ordinary memory while also being mapped write-combine here, which both
+aliases mismatched attributes and lets the allocator hand the panic
+buffer to something else.
+
+--- a/pexpert/pexpert/arm64/BCM2837.h
++++ b/pexpert/pexpert/arm64/BCM2837.h
+@@ -76,8 +76,12 @@
+ #define BCM2837_PUT32(addr, value) do { *((volatile uint32_t *) addr) = value; } while(0)
+ #define BCM2837_GET32(addr) *((volatile uint32_t *) addr)
+
+-#define PLATFORM_PANIC_LOG_PADDR        0x3c0fc000
+-#define PLATFORM_PANIC_LOG_SIZE         16384        // 16kb
++/*
++ * No PLATFORM_PANIC_LOG_PADDR here on purpose. 0x3c0fc000 is the Pi 3's own
++ * address and is wrong for every other board using this config, so
++ * check_for_panic_log() in pexpert/arm/pe_init.c takes the region from the
++ * device tree instead: /pram's reg and /chosen's embedded-panic-log-size.
++ */
+ #endif /* ! ASSEMBLER */
+
+ #endif /* ! _PEXPERT_ARM_BCM2837_H */

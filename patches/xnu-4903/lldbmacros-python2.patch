@@ -1,0 +1,54 @@
+xnu-4903's LLDB macros are Python 2, so the build cannot finish on any
+host whose `python` is Python 3.
+
+The kernel compiles and links fine. What fails is the step after it: the
+config_all pass that copies tools/lldbmacros into the kernel's dSYM bundle.
+Every file is validated first by tools/lldbmacros/core/syntax_checker.py,
+which is itself Python 2:
+
+    print >>sys.stderr, "Error: Unknown arguments"
+    print helpdoc
+
+    SyntaxError: Missing parentheses in call to 'print'
+    make[5]: *** [.../lldbmacros/zonetriage.py] Error 1
+    make[2]: *** [config_all_recurse_into_tools] Error 2
+
+Porting syntax_checker.py is not enough. Its actual job is
+
+    py_compile.compile(fname, cfile="/dev/null", doraise=True)
+
+on each file it is given, and the ~50 files under tools/lldbmacros are all
+Python 2 as well. A Python 3 checker would simply reject every one of them
+in turn. Making the whole directory run under Python 3 is the work Apple
+itself only did several releases later, and none of it affects the kernel.
+
+Drop the directory from the build instead. lldbmacros is a bundle of LLDB
+commands for inspecting a live kernel over a KDP debugger connection -- it
+is debugger-side tooling, not kernel code, and nothing in the kernel image
+depends on it. The dSYM is still produced by dsymutil during the link; it
+just carries no Python macros.
+
+Deliberately not done: stubbing syntax_checker.py out to exit(0). That
+would let the copy proceed and leave a dSYM holding macros that cannot
+load, which is worse than a dSYM with none -- and it would silence the
+check for anyone who later does port these files.
+
+If you need the macros, port tools/lldbmacros to Python 3 and revert this;
+nothing else has to change.
+
+--- a/tools/Makefile
++++ b/tools/Makefile
+@@ -6,7 +6,12 @@
+ include $(MakeInc_cmd)
+ include $(MakeInc_def)
+
+-CONFIG_SUBDIRS = lldbmacros
++# lldbmacros is omitted: it is Python 2 and its own syntax_checker.py
++# py_compile()s every file, so the whole directory fails to install on a
++# host where `python` is Python 3. These are debugger-side LLDB commands
++# for a live KDP session; the kernel image does not depend on them, and
++# the dSYM is still produced by the link step without them.
++CONFIG_SUBDIRS =
+
+ include $(MakeInc_rule)
+ include $(MakeInc_dir)
