@@ -232,6 +232,11 @@ build_deps() {
     # inline entry point undeclared. os_log is not how we read this kernel,
     # so link against a stub instead. See scripts/firehose-stub.c.
     mkdir -p "$FAKEROOT/usr/local/lib/kernel"
+    # xnu still includes <os/firehose_buffer_private.h>; take it from
+    # libdispatch even though we are not building the library.
+    local ldd; ldd="$(fetch_oss libdispatch "$LIBDISPATCH_REF")" || exit 1
+    mkdir -p "$FAKEROOT/usr/local/include/kernel/os"
+    cp "$ldd"/os/*.h "$FAKEROOT/usr/local/include/kernel/os/" 2>/dev/null
     (cd "$WORK_DIR" && xcrun clang -arch arm64 -mkernel -ffreestanding \
         -fno-builtin -Wall -c "$PWD_AT_START/scripts/firehose-stub.c" \
         -o firehose-stub.o >>"$LOG_DIR/deps.log" 2>&1 \
