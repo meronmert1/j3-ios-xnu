@@ -1,0 +1,21 @@
+osfmk/kern/kpc.h and the arm64 KPC sources use CORE_NCTRS to size their
+counter arrays whether or not the target enables performance counters, and
+the BCM2837 board config never defines it. The result is 62 "use of
+undeclared identifier 'CORE_NCTRS'" errors across kpc.h, kperf_kpc.h,
+kpc_common.c, kpc.c and monotonic.h.
+
+Give the target the same placeholder the later Apple configs use. Nothing
+reads these counters on this board; the value only has to be a sane bound.
+
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -172,6 +172,9 @@
+ #define __ARM_L2CACHE_SIZE_LOG__ 19
+ #define ARM_BOARD_CLASS_BCM2837
+ #define CPU_COUNT 4
++/* KPC is not enabled for this target, but osfmk/kern/kpc.h and the
++ * arm64 KPC sources size their arrays with CORE_NCTRS regardless. */
++#define CORE_NCTRS 8
+ #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
+ 
+ #endif /* ! _PEXPERT_ARM_BOARD_CONFIG_H */

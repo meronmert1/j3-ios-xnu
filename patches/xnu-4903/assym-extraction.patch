@@ -1,0 +1,63 @@
+The assym.s constants (SS64_X0, CPU_ISTACKPTR, T_DATA_ABT and the rest) are
+extracted from compiled assembly with a sed expression written for the 2018
+compiler's output layout. A current clang lays the same inline-asm labels out
+differently, so the expression stops matching: assym.s ends up holding the raw
+DEFINITION__define__ labels instead of #defines. Everything downstream breaks
+at once -- "symbol is already defined" for every label, then "invalid operand
+for instruction" and "index must be an integer in range [-256, 255]" wherever
+a .s file uses one of the missing constants. On a BCM2837 DEVELOPMENT build
+that is 169 of the 241 errors.
+
+Replace the sed with an awk script that looks for the name and then the first
+quoted value after it, whatever the surrounding layout, and that ignores
+repeats. Tested against the label and value on one line, on two lines, with
+and without $ or # decoration on the value, and with negative values.
+
+--- /dev/null
++++ b/osfmk/conf/gen-assym.awk
+@@ -0,0 +1,34 @@
++# gen-assym.awk -- turn the genassym assembly into the #defines assym.s needs.
++#
++# genassym.c emits, for every constant, an inline-asm label followed by an
++# .ascii holding the value:
++#
++#     DEFINITION__define__T_DATA_ABT: .ascii "4"
++#
++# The exact shape moves between compiler versions: the label and the .ascii
++# may share a line or sit on consecutive ones, the value may carry a $ or #
++# decoration, and the label may be indented or prefixed. Rather than matching
++# one layout, find the name, then take the first quoted string that follows.
++
++/DEFINITION__define__/ {
++    line = $0
++    if (line !~ /ascii/ && (getline nxt) > 0)
++        line = line " " nxt
++
++    if (!match(line, /DEFINITION__define__[A-Za-z_][A-Za-z0-9_]*/))
++        next
++    name = substr(line, RSTART + 20, RLENGTH - 20)
++
++    rest = substr(line, RSTART + RLENGTH)
++    if (!match(rest, /"[^"]*"/))
++        next
++    val = substr(rest, RSTART + 1, RLENGTH - 2)
++
++    gsub(/[$#]/, "", val)          # drop immediate decoration
++    gsub(/^[ \t]+|[ \t]+$/, "", val)
++    if (val == "" || seen[name]++)
++        next
++
++    print "#define " name " " val
++    print "#define " name "_NUM " val
++}
+--- a/osfmk/conf/Makefile.template
++++ b/osfmk/conf/Makefile.template
+@@ -166,7 +166,7 @@
+ 	$(_v)${GENASSYM_KCC} ${CFLAGS} ${CFLAGS_NOLTO_FLAG} -MD -S -o ${@} ${INCFLAGS} $<
+ 
+ assym.s: genassym.o
+-	$(_v)sed -e '/^[[:space:]]*DEFINITION__define__/!d;{N;s/\n//;}' -e 's/^[[:space:]]*DEFINITION__define__\([^:]*\):.*ascii.*\"[\$$]*\([-0-9\#]*\)\".*$$/#define \1 \2/' -e 'p'  -e 's/#//2' -e 's/^[[:space:]]*#define \([A-Za-z0-9_]*\)[[:space:]]*[\$$#]*\([-0-9]*\).*$$/#define \1_NUM \2/' genassym.o > $@
++	$(_v)$(AWK) -f $(SOURCE_DIR)/$(COMPONENT)/conf/gen-assym.awk genassym.o > $@
+ 
+ ${SOBJS}: assym.s
+ 
