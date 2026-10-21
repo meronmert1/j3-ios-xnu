@@ -85,7 +85,7 @@ fetch_oss() { # repo prefix_or_tag -> echoes path
         ref="$(newest_tag "$repo" "${ref:-$repo-}")"
         [ -n "$ref" ] || die "no usable tag found for $repo"
     fi
-    info "$repo @ $ref"
+    info "$repo @ $ref" >&2
     git clone --quiet --depth 1 --branch "$ref" "$OSS/$repo" "$dst" \
         || die "clone failed: $repo @ $ref"
     echo "$dst"
@@ -185,8 +185,7 @@ build_deps() {
     if [ "$INSTALL_TOOLCHAIN" = "1" ]; then
         say "Installing tools into the active Xcode toolchain"
         local tc; tc="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain"
-        sudo ditto "$TOOLCHAIN_DST/usr/local" "$tc/usr/local" || die "ditto failed"
-        sudo ditto "$TOOLCHAIN_DST/usr/local/bin" "$tc/usr/bin" 2>/dev/null
+        sudo ditto "$TOOLCHAIN_DST/usr" "$tc/usr" || die "ditto failed"
         for t in mig migcom ctfconvert ctfmerge; do
             xcrun -find "$t" >/dev/null 2>&1 || warn "xcrun cannot find $t yet"
         done
