@@ -1,60 +1,63 @@
-Draw progress bands on the framebuffer from arm64 start.s.
+Draw progress bands on the framebuffer during early arm64 boot.
 
 On a board with no serial port nothing the kernel does before
-PE_create_console is visible, and that is a long way in: start_first_cpu has
-to read boot_args, build the bootstrap translation tables, enable the MMU and
-get well into arm_init first. Until then a failure is a frozen screen and
-nothing else -- made worse by start_first_cpu setting VBAR_EL1 to
-LowExceptionVectorBase almost immediately, which catches an early fault in a
-spin loop, so the machine does not even reset to say that something went
-wrong.
+PE_create_console is visible, and that is a long way in. Until then a failure
+is a frozen screen and nothing else -- made worse by start_first_cpu setting
+VBAR_EL1 to LowExceptionVectorBase almost immediately, which catches an early
+fault in a spin loop, so the machine does not even reset to say that something
+went wrong.
 
-This writes a coloured band straight to the framebuffer at four points, low on
+This writes a coloured band straight to the framebuffer at six points, low on
 the screen where the bootloader's own output does not reach:
 
     slot 0  green    first instruction of start_first_cpu
     slot 1  cyan     boot_args has been read into x20-x26
     slot 2  yellow   everything is set up; the MMU is about to be enabled
     slot 3  magenta  the MMU is on and we are still running
+    slot 4  white    common_start is done; about to ret into KVA
+    slot 5  lt green first statement of arm_init(), running as C from KVA
 
-Which bands appear says where it stopped, and slot 3 is the one that matters:
-it separates "the MMU could not be enabled" from "the MMU is fine and the
-failure is later", which from a frozen screen are indistinguishable.
+The pairs are what matter. 2 against 3 separates "the MMU could not be
+enabled" from "the MMU is fine"; 4 against 5 separates "the KVA mapping is
+wrong" from "we are in C and the failure is further in". From a frozen screen
+none of these are distinguishable.
 
-Two things are needed to make slot 3 work at all, and both are easy to miss.
+Two things are needed to make anything past slot 2 work, and both are easy to
+miss.
 
 The framebuffer has to stay reachable once translation is on. It is a carveout
 immediately above the memory the kernel manages, so it falls outside the V=P
 bootstrap mapping, which covers exactly memSize bytes; a few extra L2 entries
 bring it back in. That mapping is temporary and arm_vm_init replaces it, so
-the extra coverage costs nothing.
+the extra coverage costs nothing. Slot 5 relies on the same table still being
+live in TTBR0, which it is until pmap_bootstrap.
 
 And the pixels have to be flushed. ARM_TTE_BOOT_BLOCK maps with
 CACHE_ATTRINDX_WRITEBACK, so once the MMU is on the band would sit in the
-cache and never reach the panel -- the band would be missing even though the
-code ran, which is precisely the wrong answer to get from a test like this.
-Each mark therefore cleans its own range. Before the MMU is enabled the access
-is Device and the maintenance is a no-op, so the same macro is correct either
-side.
+cache and never reach the panel -- missing even though the code ran, which is
+precisely the wrong answer to get from a test like this. Each mark cleans its
+own range. Before the MMU is enabled the access is Device and the maintenance
+is a no-op, so the same macro is correct either side.
 
-x6 through x9 are the only registers touched. start.s uses them in exactly two
-places, both inside create_bootstrap_mapping calls, which sit between the
-checkpoints rather than at them; x0 holds the boot_args pointer at the first
-checkpoint and is deliberately left alone.
+x6 through x9 are the only registers the macro touches. start.s uses them in
+exactly two places, both inside create_bootstrap_mapping calls, which sit
+between the checkpoints rather than at them. x0 is deliberately left alone: it
+holds the boot_args pointer at slot 0 and its KVA at slot 4.
 
 The macro follows this file's own conventions -- .macro with positional $0/$1
 and .endmacro -- rather than the GNU spellings, which the Apple assembler this
 is built with does not use.
 
-J3_FB_BASE and J3_FB_STRIDE describe this board's display. Another board needs
-those two values changed and nothing else.
+J3_FB_BASE and J3_FB_STRIDE describe this board's display, as do the
+equivalent constants in the arm_init.c hunk. Another board needs those changed
+and nothing else.
 
 This is a debugging aid, not a fix. Drop it once the kernel reaches its own
 console.
 
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -85,6 +85,57 @@
+@@ -85,6 +85,58 @@
  .endmacro
  
  /*
@@ -107,12 +110,13 @@ console.
 +#define J3_MARK_CYAN	0x0040FFFF
 +#define J3_MARK_YELLOW	0x00FFD000
 +#define J3_MARK_MAGENTA	0x00FF40FF
++#define J3_MARK_WHITE	0x00FFFFFF
 +
 +/*
   * Checks the reset handler for global and CPU-specific reset-assist functions,
   * then jumps to the reset handler with boot args and cpu data. This is copied
   * to the first physical page during CPU bootstrap (see cpu.c).
-@@ -449,6 +500,9 @@
+@@ -449,6 +501,9 @@
  	.globl EXT(start_first_cpu)
  LEXT(start_first_cpu)
  
@@ -122,7 +126,7 @@ console.
  	// Unlock the core for debugging
  	msr		OSLAR_EL1, xzr
  	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
-@@ -468,6 +522,9 @@
+@@ -468,6 +523,9 @@
  	ldr		x25, [x20, BA_TOP_OF_KERNEL_DATA]	// Get the top of the kernel data
  	ldr		x26, [x20, BA_BOOT_FLAGS]			// Get the kernel boot flags
  
@@ -132,7 +136,7 @@ console.
  	// Clear the register that will be used to store the userspace thread pointer and CPU number.
  	// We may not actually be booting from ordinal CPU 0, so this register will be updated
  	// in ml_parse_cpu_topology(), which happens later in bootstrap.
-@@ -593,6 +650,13 @@
+@@ -593,6 +651,13 @@
  	 * x5 - total number of L2 entries to allocate
  	 */
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
@@ -146,7 +150,7 @@ console.
  	/* create_bootstrap_mapping(vbase, pbase, num_ents, L1 table, freeptr) */
  	create_bootstrap_mapping x0,  x4,  x5, x1, x2, x6, x10, x11, x12, x13
  
-@@ -723,6 +787,8 @@
+@@ -723,6 +788,8 @@
  1:
  	MSR_VBAR_EL1_X0
  
@@ -155,7 +159,7 @@ console.
  
  	// Enable caches and MMU
  	mov		x0, #(SCTLR_EL1_DEFAULT & 0xFFFF)
-@@ -731,6 +797,13 @@
+@@ -731,6 +798,13 @@
  	MSR_SCTLR_EL1_X0
  	isb		sy
  
@@ -169,3 +173,48 @@ console.
  #if (!CONFIG_KERNEL_INTEGRITY || (CONFIG_KERNEL_INTEGRITY && !defined(KERNEL_INTEGRITY_WT)))
  	/* Watchtower
  	 *
+@@ -975,6 +1049,13 @@
+ 	mov	lr, x21
+ #endif
+ 
++	/*
++	 * Bring-up: common_start is done and x0 holds the KVA of boot_args. The
++	 * ret below leaves V=P execution for the KVA mapping, which is the last
++	 * thing that can go wrong before C code runs.
++	 */
++	J3_MARK 4, J3_MARK_WHITE
++
+ 	// Return to arm_init()
+ 	ret
+ 
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -208,6 +208,28 @@
+ 	thread_t        thread;
+ 	processor_t     my_master_proc;
+ 
++	/*
++	 * Bring-up: C code is running from the KVA mapping -- see the
++	 * fb-early-checkpoints patch. The framebuffer is still reachable at its
++	 * physical address through the V=P bootstrap table in TTBR0, which
++	 * pmap_bootstrap has not replaced yet, and the mapping is write-back so
++	 * the band has to be pushed out by hand or it never reaches the panel.
++	 */
++	{
++		volatile uint32_t *band =
++		    (volatile uint32_t *)(uintptr_t)(0x67000000UL + 1250UL * 2880UL);
++		const unsigned npx = 720u * 10u;
++
++		for (unsigned i = 0; i < npx; i++) {
++			band[i] = 0x0040FF40u;
++		}
++		__asm__ volatile ("dsb sy");
++		for (unsigned i = 0; i < npx * 4u; i += 64u) {
++			__asm__ volatile ("dc cvac, %0" :: "r"((uintptr_t)band + i) : "memory");
++		}
++		__asm__ volatile ("dsb sy");
++	}
++
+ 	// rebase and sign jops
+ 	if (&__thread_starts_sect_end[0] != &__thread_starts_sect_start[0]) {
+ 		uintptr_t mh    = (uintptr_t) &_mh_execute_header;
