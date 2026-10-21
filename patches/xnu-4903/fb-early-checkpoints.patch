@@ -7,31 +7,27 @@ VBAR_EL1 to LowExceptionVectorBase almost immediately, which catches an early
 fault in a spin loop, so the machine does not even reset to say that something
 went wrong.
 
-Successive rounds have walked the failure down from "somewhere in the kernel"
-to inside lck_mod_init(), so the bands now sit between that function's own
-steps:
+The bands now span what is left of arm_init, up to the point where this
+technique stops working:
 
     0  green    first instruction of start_first_cpu
-    1  white    lck_mod_init() was entered
-    2  red      the boot-arg was read and the group queue initialised
-    3  blue     the compat group was zeroed, named and given its attributes
-    4  yellow   the group is on the queue
-    5  magenta  both attribute defaults are set
-    6  cyan     lck_mtx_init_ext() returned; lck_mod_init() is complete
+    1  white    first statement of arm_init(), running as C from KVA
+    2  red      kernel_early_bootstrap() returned
+    3  blue     cpu_init() returned
+    4  yellow   processor_bootstrap() returned
+    5  magenta  about to call arm_vm_init()
+    6  cyan     arm_vm_init() returned and the old mapping survived it
 
 Seven, not more, and in six clearly different colours: the count is read off a
 photograph of a phone screen, and a dozen similar bands is a measurement that
-cannot be trusted. Slot 0 is a known-good anchor confirming the handoff and
-the MMU still work.
+cannot be trusted.
 
-What makes this worth instrumenting at all is that lck_mod_init() is pure
-software -- queue manipulation, a bzero, a strncpy, two attribute defaults and
-a mutex initialiser -- with nothing in it that should care what board it is
-running on. Something in there does, and narrowing it to one statement is
-cheaper than reasoning about which.
-
-The helper lives in osfmk/arm/arm_init.c and is deliberately not static, so
-osfmk/kern/locks.c can use the same code and the same geometry.
+Slot 5 is the last band that can be trusted to mean what it says. Every band
+is written through the V=P bootstrap mapping in TTBR0, and arm_vm_init
+replaces it with the real page tables, so a missing cyan says either that
+arm_vm_init did not return or merely that the framebuffer is no longer at that
+address. Past that point the kernel's own console is the next thing that can
+speak, and seeing it appear is the answer.
 
 Two things are needed to make any band after the MMU is enabled work, and both
 are easy to miss. The framebuffer has to stay reachable once translation is
@@ -43,10 +39,6 @@ otherwise sit in the cache and never reach the panel, missing even though the
 code ran, which is precisely the wrong answer to get from a test like this.
 Before the MMU is enabled the access is Device and the maintenance is a no-op,
 so the same code is correct either side.
-
-Every band reaches the framebuffer through that V=P bootstrap mapping, so all
-of this has to stay ahead of arm_vm_init, which replaces it. Checkpoints past
-that point need a mapping of their own.
 
 x6 through x9 are the only registers the assembly macro touches, and x0, which
 holds the boot_args pointer at slot 0, is deliberately left alone. The macro
@@ -141,7 +133,7 @@ console.
  
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -198,6 +198,45 @@
+@@ -198,6 +198,39 @@
  extern uint32_t __thread_starts_sect_start[] __asm("section$start$__TEXT$__thread_starts");
  extern uint32_t __thread_starts_sect_end[]   __asm("section$end$__TEXT$__thread_starts");
  
@@ -149,14 +141,10 @@ console.
 +/*
 + * Framebuffer progress bands -- bring-up only, see the patch header.
 + *
-+ * The framebuffer is still reachable at its physical address through the V=P
-+ * bootstrap table in TTBR0, which arm_vm_init has not replaced yet, and that
-+ * mapping is write-back, so the pixels have to be pushed out by hand or the
-+ * band never reaches the panel.
-+ *
-+ * Not static: osfmk/kern/locks.c marks its way through lck_mod_init() with
-+ * the same helper. Keep the geometry in step with the J3_MARK macro in
-+ * osfmk/arm64/start.s.
++ * The framebuffer is reachable at its physical address through the V=P
++ * bootstrap table in TTBR0, and that mapping is write-back, so the pixels
++ * have to be pushed out by hand or the band never reaches the panel. Keep the
++ * geometry in step with the J3_MARK macro in osfmk/arm64/start.s.
 + */
 +#define J3_FB_BASE      0x67000000UL
 +#define J3_FB_STRIDE    2880UL
@@ -165,9 +153,7 @@ console.
 +#define J3_MARK_HEIGHT  16U
 +#define J3_MARK_WIDTH   720U
 +
-+void j3_mark(unsigned slot, uint32_t colour);
-+
-+void
++static void
 +j3_mark(unsigned slot, uint32_t colour)
 +{
 +	volatile uint32_t *band = (volatile uint32_t *)(uintptr_t)
@@ -187,60 +173,54 @@ console.
  void
  arm_init(
  	boot_args       *args)
---- a/osfmk/kern/locks.c
-+++ b/osfmk/kern/locks.c
-@@ -139,10 +139,16 @@
-  * Routine:	lck_mod_init
-  */
+@@ -208,6 +241,9 @@
+ 	thread_t        thread;
+ 	processor_t     my_master_proc;
  
-+/* Bring-up: see the fb-early-checkpoints patch. Defined in osfmk/arm/arm_init.c. */
-+extern void j3_mark(unsigned slot, uint32_t colour);
-+
- void
- lck_mod_init(
- 	void)
- {
-+	/* Bring-up: lck_mod_init was entered. */
++	/* Bring-up: C code is running, from the KVA mapping. */
 +	j3_mark(1, 0x00FFFFFFu);        /* white */
 +
- 	/*
- 	 * Obtain "lcks" options:this currently controls lock statistics
- 	 */
-@@ -159,6 +165,9 @@
+ 	// rebase and sign jops
+ 	if (&__thread_starts_sect_end[0] != &__thread_starts_sect_start[0]) {
+ 		uintptr_t mh    = (uintptr_t) &_mh_execute_header;
+@@ -341,11 +377,20 @@
  
- 	queue_init(&lck_grp_queue);
+ 	kernel_early_bootstrap();
  
-+	/* Bring-up: boot-arg read and the group queue is initialised. */
++	/* Bring-up: kernel_early_bootstrap() returned. */
 +	j3_mark(2, 0x00FF0000u);        /* red */
 +
- 	/*
- 	 * Need to bootstrap the LockCompatGroup instead of calling lck_grp_init() here. This avoids
- 	 * grabbing the lck_grp_lock before it is initialized.
-@@ -175,15 +184,27 @@
- 		LockCompatGroup.lck_grp_attr |= LCK_GRP_ATTR_TIME_STAT;
- 	}
+ 	cpu_init();
  
-+	/* Bring-up: the compat group was zeroed, named and given its attrs. */
++	/* Bring-up: cpu_init() returned. */
 +	j3_mark(3, 0x000080FFu);        /* blue */
 +
- 	LockCompatGroup.lck_grp_refcnt = 1;
+ 	EntropyData.index_ptr = EntropyData.buffer;
  
- 	enqueue_tail(&lck_grp_queue, (queue_entry_t)&LockCompatGroup);
- 	lck_grp_cnt = 1;
- 
-+	/* Bring-up: the group is on the queue. */
-+	j3_mark(4, 0x00FFFF00u);        /* yellow */
+ 	processor_bootstrap();
 +
- 	lck_grp_attr_setdefault(&LockDefaultGroupAttr);
- 	lck_attr_setdefault(&LockDefaultLckAttr);
++	/* Bring-up: processor_bootstrap() returned. */
++	j3_mark(4, 0x00FFFF00u);        /* yellow */
+ 	my_master_proc = master_processor;
  
-+	/* Bring-up: both attribute defaults are set. */
+ 	(void)PE_parse_boot_argn("diag", &arm_diag, sizeof(arm_diag));
+@@ -381,8 +426,19 @@
+ 	__builtin_arm_wsr("pan", 1);
+ #endif  /* __ARM_PAN_AVAILABLE__ */
+ 
++	/*
++	 * Bring-up: the last band that can be trusted. arm_vm_init replaces the
++	 * V=P bootstrap mapping every band is written through, so a missing
++	 * cyan below means either that it did not return or merely that the
++	 * framebuffer is no longer at that address.
++	 */
 +	j3_mark(5, 0x00FF00FFu);        /* magenta */
 +
- 	lck_mtx_init_ext(&lck_grp_lock, &lck_grp_lock_ext, &LockCompatGroup, &LockDefaultLckAttr);
-+
-+	/* Bring-up: lck_mod_init is complete. */
-+	j3_mark(6, 0x0000FFFFu);        /* cyan */
- }
+ 	arm_vm_init(xmaxmem, args);
  
- /*
++	/* Bring-up: arm_vm_init returned AND the old mapping survived it. */
++	j3_mark(6, 0x0000FFFFu);        /* cyan */
++
+ 	uint32_t debugmode;
+ 	if (PE_parse_boot_argn("debug", &debugmode, sizeof(debugmode)) &&
+ 	    debugmode) {
