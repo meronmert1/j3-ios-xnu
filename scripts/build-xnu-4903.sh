@@ -169,7 +169,12 @@ build_deps() {
 
     say "bootstrap_cmds (mig)"
     d="$(fetch_oss bootstrap_cmds "$BOOTSTRAP_CMDS_REF")" || exit 1
-    (cd "$d" && xcodebuild install -sdk macosx -project bootstrap_cmds.xcodeproj \
+    # The project file gets renamed across releases -- bootstrap_cmds-138
+    # ships mig.xcodeproj, not bootstrap_cmds.xcodeproj -- so find it.
+    proj="$(ls -d "$d"/*.xcodeproj 2>/dev/null | head -1)"
+    [ -n "$proj" ] || die "no xcodeproj in $d"
+    info "project $(basename "$proj")" >&2
+    (cd "$d" && xcodebuild install -sdk macosx -project "$(basename "$proj")" \
         -alltargets DSTROOT="$TOOLCHAIN_DST" >>"$LOG_DIR/deps.log" 2>&1) \
         || die "bootstrap_cmds build failed (see $LOG_DIR/deps.log)"
 
