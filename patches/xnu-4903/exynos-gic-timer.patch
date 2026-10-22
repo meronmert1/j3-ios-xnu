@@ -1,0 +1,245 @@
+Deliver the architected timer through a GICv2, so timed sleeps can wake.
+
+XNU's arm64 code never asks an interrupt controller for the timer. It programs
+the architected timer itself and assumes the signal comes back as an FIQ:
+
+    osfmk/arm64/machine_routines.c
+      _enable_virtual_timer()   msr CNTP_CTL_EL0, CNTP_CTL_EL0_ENABLE
+      ml_set_decrementer()      msr CNTP_TVAL_EL0, dec_value
+                                (cpu_set_decrementer_func is never assigned
+                                 anywhere in the tree, so the mimetic path is
+                                 always the one taken)
+
+    osfmk/arm64/sleh.c
+      sleh_fiq()                ml_get_timer_pending() -> rtclock_intr(TRUE)
+
+That works because Apple's AIC routes the timer straight to FIQ. A stock ARM
+SoC does not: the EL1 non-secure physical timer is PPI 30 on a GIC, and from
+non-secure EL1 an interrupt cannot be placed in Group 0, so it can only ever
+be signalled as an IRQ. The IRQ path is
+
+    fleh_irq -> sleh_irq -> cpu_data_t::interrupt_handler
+
+and that handler is installed by IOCPUInterruptController::enableCPUInterrupt,
+from a platform kext this kernel does not have. The pexpert side offers no way
+out either: pe_arm_init_timer() only fills in rtclock_timebase_func, which on
+arm64 is dead weight -- fleh_fiq_generic is literally PANIC_UNIMPLEMENTED in
+osfmk/arm64/locore.s, and the tbd_ops hooks are an arm32 mechanism.
+
+So on a GIC-based SoC the kernel comes up with a running countdown that can
+never be delivered. Nothing is visibly wrong until the first code that sleeps
+on a deadline rather than on a wakeup:
+
+    bsd_init() -> IOKitInitializeTime()
+      t.tv_sec = 30;
+      IOService::waitForService(IOService::resourceMatching("IORTC"), &t);
+        -> waitForMatchingService(matching, 30 * NSEC_PER_SEC)
+        -> SLEEPNOTIFYTO(&result, deadline)
+        -> assert_wait_deadline() + thread_block()
+
+There is no IORTC and there never will be, so the whole 30 seconds has to be
+counted out by the timer interrupt. Without one the sleep is permanent, and
+the boot stops at "bsd_init: calling IOKitInitializeTime" with no panic, no
+reboot and no further output. Every earlier wait in the boot was woken by
+another thread, which is why nothing failed before this line.
+
+This patch does the minimum to close that gap on the boot CPU:
+
+  - masks and clears every interrupt the bootloader left behind, so opening
+    the CPU interface does not immediately storm a handler that knows nothing
+    about them;
+  - unmasks PPI 30 and nothing else, at the highest priority non-secure EL1
+    is permitted to request;
+  - enables the distributor and the CPU interface in their non-secure view;
+  - installs an IRQ handler that acknowledges the GIC, hands a timer
+    interrupt to rtclock_intr() exactly as sleh_fiq() would, and EOIs.
+
+The handler is written into BootCpuData directly rather than through
+ml_install_interrupt_handler(), because that function ends with
+initialize_screen(NULL, kPEAcquireScreen) and would tear down the framebuffer
+console at a point in the boot where it is the only output there is.
+
+It runs from arm_init(), immediately after fiq_context_bootstrap(TRUE) has
+enabled the timer and while interrupts are still masked, and immediately
+after PE_init_platform(TRUE, ...) so that ml_io_map() is usable -- that is the
+same point at which pe_arm_map_interrupt_controller() maps its own registers.
+
+The register addresses are this board's and are the one thing to change when
+porting: GICD 0x104E1000 and GICC 0x104E2000, read out of the stock Android
+device tree for the Exynos 7570 (the same addresses the Exynos 7870 upstream
+DT carries). Everything else is architectural GICv2.
+
+Boot CPU only. SGIs are not configured and the banked PPI registers are
+programmed once, which is enough for cpus=1; bringing up secondary CPUs will
+need the per-CPU half repeated from arm_init_cpu().
+
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -270,6 +270,158 @@
+ 	j3_band(J3_MARK2_ROW0, slot, colour);
+ }
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * Minimal GICv2 bring-up for the boot CPU's timer interrupt.
++ *
++ * XNU's arm64 code expects the architected timer to reach the core by itself:
++ * fiq_context_init() sets CNTP_CTL_EL0.ENABLE, ml_set_decrementer() writes
++ * CNTP_TVAL_EL0 directly (cpu_set_decrementer_func is never assigned on
++ * arm64), and the SoC is expected to deliver the resulting signal as an FIQ,
++ * where sleh_fiq() hands it to rtclock_intr(). That is how Apple's AIC is
++ * wired.
++ *
++ * A stock ARM SoC routes the same timer through a GIC as PPI 30, the
++ * non-secure EL1 physical timer. From non-secure EL1 an interrupt cannot be
++ * moved into Group 0, so it can only ever arrive as an IRQ:
++ * fleh_irq -> sleh_irq -> cpu_data's interrupt_handler.
++ *
++ * With no GIC set up, nothing looks wrong until the first code that sleeps on
++ * a deadline. IOKitInitializeTime()'s 30-second waitForService(IORTC) never
++ * times out, and the boot stops there with no panic and no further output.
++ *
++ * So: mask everything the bootloader left enabled, unmask PPI 30 and nothing
++ * else, open the distributor and the CPU interface, and install a handler
++ * that acknowledges the GIC and calls rtclock_intr() the way sleh_fiq()
++ * would have.
++ *
++ * Boot CPU only. SGIs are not configured and the banked PPI registers are
++ * only programmed here, which is enough for cpus=1; secondary CPUs will need
++ * the same done from arm_init_cpu().
++ * ---------------------------------------------------------------------------
++ */
++#define GIC_DIST_PA             0x104E1000UL    /* Exynos 7570 GICD, from the stock DT */
++#define GIC_CPU_PA              0x104E2000UL    /* Exynos 7570 GICC */
++#define GIC_MMIO_SIZE           0x1000UL
++
++#define GICD_CTLR               0x000
++#define GICD_TYPER              0x004
++#define GICD_ISENABLER          0x100
++#define GICD_ICENABLER          0x180
++#define GICD_ICPENDR            0x280
++#define GICD_IPRIORITYR         0x400
++
++#define GICC_CTLR               0x000
++#define GICC_PMR                0x004
++#define GICC_BPR                0x008
++#define GICC_IAR                0x00C
++#define GICC_EOIR               0x010
++
++#define GIC_TIMER_PPI           30              /* non-secure EL1 physical timer */
++#define GIC_INTID_MASK          0x3FF
++#define GIC_SPURIOUS            0x3FF
++
++static vm_offset_t      j3_gicd;
++static vm_offset_t      j3_gicc;
++
++/* Inspectable from a panic report; proves interrupts are arriving at all. */
++volatile uint64_t       j3_gic_irqs;
++
++static inline uint32_t
++j3_gic_read(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++j3_gic_write(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++}
++
++static void
++j3_gic_timer_handler(void *target __unused, void *refCon __unused,
++    void *nub __unused, int source __unused)
++{
++	uint32_t        iar, intid;
++
++	for (;;) {
++		iar = j3_gic_read(j3_gicc, GICC_IAR);
++		intid = iar & GIC_INTID_MASK;
++
++		/* A spurious ID means the queue is empty, and must not be EOI'd. */
++		if (intid == GIC_SPURIOUS) {
++			break;
++		}
++
++		j3_gic_irqs++;
++
++		if (intid == GIC_TIMER_PPI) {
++			/*
++			 * Mirror sleh_fiq(): drop the software shadow of the
++			 * decrementer before rtclock_intr() reprograms it.
++			 */
++			getCpuDatap()->cpu_decrementer = -1;
++			rtclock_intr(TRUE);
++		}
++
++		j3_gic_write(j3_gicc, GICC_EOIR, iar);
++	}
++}
++
++static void
++j3_gic_init(void)
++{
++	uint32_t        typer, blocks, i;
++
++	j3_gicd = ml_io_map(GIC_DIST_PA, GIC_MMIO_SIZE);
++	j3_gicc = ml_io_map(GIC_CPU_PA, GIC_MMIO_SIZE);
++
++	/* ITLinesNumber counts 32-interrupt blocks, less one. */
++	typer = j3_gic_read(j3_gicd, GICD_TYPER);
++	blocks = (typer & 0x1F) + 1;
++
++	/*
++	 * The bootloader leaves its own interrupts enabled and possibly
++	 * pending. None of them has a driver here, so mask and clear the lot
++	 * before the CPU interface is opened, or the first enable turns into
++	 * an interrupt storm into a handler that knows nothing about them.
++	 */
++	for (i = 0; i < blocks; i++) {
++		j3_gic_write(j3_gicd, GICD_ICENABLER + 4 * i, 0xFFFFFFFF);
++		j3_gic_write(j3_gicd, GICD_ICPENDR + 4 * i, 0xFFFFFFFF);
++	}
++
++	/*
++	 * Priority is written through the non-secure view, where the value is
++	 * shifted right and the top bit forced on, so 0 here is the highest
++	 * priority this exception level is allowed to ask for.
++	 */
++	*(volatile uint8_t *)(j3_gicd + GICD_IPRIORITYR + GIC_TIMER_PPI) = 0x00;
++
++	j3_gic_write(j3_gicd, GICD_ISENABLER, 1U << GIC_TIMER_PPI);
++	j3_gic_write(j3_gicd, GICD_CTLR, 1);            /* non-secure view: EnableGrp1 */
++
++	j3_gic_write(j3_gicc, GICC_PMR, 0xF0);          /* pass every non-secure priority */
++	j3_gic_write(j3_gicc, GICC_BPR, 0x07);          /* no sub-priority preemption */
++	j3_gic_write(j3_gicc, GICC_CTLR, 1);            /* non-secure view: EnableGrp1 */
++
++	/*
++	 * Installed by hand rather than through ml_install_interrupt_handler(),
++	 * which ends in initialize_screen(NULL, kPEAcquireScreen) and would
++	 * take the framebuffer console away this early in the boot.
++	 */
++	BootCpuData.interrupt_handler = j3_gic_timer_handler;
++	BootCpuData.interrupt_nub = NULL;
++	BootCpuData.interrupt_source = GIC_TIMER_PPI;
++	BootCpuData.interrupt_target = NULL;
++	BootCpuData.interrupt_refCon = NULL;
++	BootCpuData.interrupts_enabled = TRUE;
++
++	kprintf("j3_gic_init: GICD %p GICC %p, %u lines, PPI %u enabled\n",
++	    (void *)j3_gicd, (void *)j3_gicc, blocks * 32, GIC_TIMER_PPI);
++}
++
+ void
+ arm_init(
+ 	boot_args       *args)
+@@ -541,6 +693,8 @@
+ 	cpu_timebase_init(TRUE);
+ 	fiq_context_bootstrap(TRUE);
+ 
++	j3_gic_init();
++
+ 
+ 	/*
+ 	 * Initialize the stack protector for all future calls
