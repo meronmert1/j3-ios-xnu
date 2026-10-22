@@ -151,6 +151,20 @@ onto its stack under AAPCS32; rather than guess that, _bsdthread_create
 returns ENOTSUP and _setup_wqthread panics. An arm64 iOS 12 userland has no
 32-bit processes, so neither path should ever be taken.
 
+Last, two symbols the kext calls do not exist on arm64. osfmk/vm/vm_user.c
+defines the plain mach_vm_map() and mach_vm_allocate() only under
+
+    #if defined(__x86_64__)
+
+above which the comment reads: "These symbols are looked up at runtime by
+vmware, VirtualBox, despite not being exported in the symbol sets." The real
+entry points everywhere else are mach_vm_map_external() and
+mach_vm_allocate_external(), which take the VM tag out of the flags -- which
+is exactly how workq_create_threadstack() already passes it, so they are
+drop-in. Their prototypes are behind XNU_KERNEL_PRIVATE, so they are declared
+next to the two defines that redirect the calls, for everything that is not
+x86_64.
+
 This patch needs pthread-guards-without-kext.patch, which applies before it and
 leaves pthread_init() able to survive a NULL table. The two are deliberately
 separate and independently removable: the guards are what keeps the boot alive
@@ -274,7 +288,42 @@ userland process registering its thread start routines.
  
 --- a/bsd/pthread/kext/kern/pthread_support.c
 +++ b/bsd/pthread/kext/kern/pthread_support.c
-@@ -327,6 +327,45 @@
+@@ -107,6 +107,34 @@
+ 
+ #include "kern_internal.h"
+ 
++#if !defined(__x86_64__)
++/*
++ * xnu defines the plain mach_vm_map() and mach_vm_allocate() symbols only on
++ * x86_64 -- osfmk/vm/vm_user.c guards them with "#if defined(__x86_64__)" and
++ * the comment above them says they exist because VMware and VirtualBox look
++ * them up at runtime. Everywhere else the entry points carry an _external
++ * suffix and take the VM tag out of the flags, which is exactly how the call
++ * sites in this file pass it, so they are drop-in replacements.
++ *
++ * They are declared here rather than included, because their prototypes live
++ * behind XNU_KERNEL_PRIVATE in osfmk/vm/vm_kern.h and these sources are
++ * compiled without it on purpose.
++ */
++extern kern_return_t mach_vm_allocate_external(vm_map_t map,
++    mach_vm_offset_t *addr, mach_vm_size_t size, int flags);
++
++extern kern_return_t mach_vm_map_external(vm_map_t target_map,
++    mach_vm_offset_t *address, mach_vm_size_t initial_size,
++    mach_vm_offset_t mask, int flags, ipc_port_t port,
++    vm_object_offset_t offset, boolean_t copy, vm_prot_t cur_protection,
++    vm_prot_t max_protection, vm_inherit_t inheritance);
++
++#undef mach_vm_allocate
++#undef mach_vm_map
++#define mach_vm_allocate        mach_vm_allocate_external
++#define mach_vm_map             mach_vm_map_external
++#endif /* !__x86_64__ */
++
+ #ifndef WQ_SETUP_EXIT_THREAD
+ #define WQ_SETUP_EXIT_THREAD    8
+ #endif
+@@ -327,6 +355,45 @@
  
  		(void)pthread_kern->thread_set_wq_state32(th, (thread_state_t)&state);
  	}
@@ -320,7 +369,7 @@ userland process registering its thread start routines.
  #else
  #error bsdthread_create  not defined for this architecture
  #endif
-@@ -755,6 +794,34 @@
+@@ -755,6 +822,34 @@
  			panic(__func__ ": thread_set_wq_state failed: %d", error);
  		}
  	}
