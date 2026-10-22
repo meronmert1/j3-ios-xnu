@@ -45,17 +45,25 @@ space:
     4  cyan     everything is built; about to retire the V=P mapping
 
 and the upper group (row 700, clear of the booter banner) runs from there to
-the kernel's own console:
+the kernel's own console, with pmap_bootstrap() opened up because that is
+where it currently stops:
 
     0  green    arm_vm_physmap_init() returned
     1  white    survived set_mmu_ttb_alternate(); the kernel is on its own
                 page tables
-    2  red      pmap_bootstrap() returned
-    3  magenta  arm_vm_init() returned
-    4  cyan     printf_init, panic_init, PE_consistent_debug_inherit and
+    2  red      pmap_bootstrap: kernel_pmap set up, pmap_compute_io_rgns()
+                returned
+    3  magenta  pmap_bootstrap: the bookkeeping tables are carved out of
+                avail_start and zeroed -- the first use of the physical
+                aperture by something other than this instrument
+    4  cyan     pmap_bootstrap: ptd_bootstrap and pmap_cpu_data_array_init
+                returned
+    5  orange   pmap_bootstrap() returned
+    6  yellow   arm_vm_init() returned
+    7  blue     printf_init, panic_init, PE_consistent_debug_inherit and
                 PE_init_kprintf are done; about to call PE_create_console()
 
-Upper cyan is the end of the instrument: PE_create_console() clears the screen
+Upper blue is the end of the instrument: PE_create_console() clears the screen
 and the kernel starts printing for itself, so a panel still showing bands means
 it did not get that far.
 
@@ -271,7 +279,7 @@ console.
 +	 * so from here on the kernel speaks for itself and a panel still
 +	 * showing bands means it did not get through.
 +	 */
-+	j3_mark2(4, 0x0000FFFFu);       /* cyan */
++	j3_mark2(7, 0x000080FFu);       /* blue */
 +
  	PE_create_console();
  
@@ -394,22 +402,71 @@ console.
  	// global table pointers may need to be different due to physical aperture remapping
  	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
  	invalid_tte = (tt_entry_t*)(phystokv(invalid_ttep));
-@@ -1590,6 +1657,9 @@
+@@ -1590,6 +1657,10 @@
  	dynamic_memory_begin = ROUND_TWIG(dynamic_memory_begin);
  	pmap_bootstrap(dynamic_memory_begin);
  
-+	/* Bring-up: pmap_bootstrap returned. */
-+	j3_mark2(2, 0x00FF0000u);       /* red */
++	/* Bring-up: pmap_bootstrap returned. Slots 2 to 4 are drawn from inside
++	 * it, in osfmk/arm/pmap.c. */
++	j3_mark2(5, 0x00FF8000u);       /* orange */
 +
  	disable_preemption();
  
  	/*
-@@ -1733,5 +1803,8 @@
+@@ -1733,5 +1804,8 @@
  	first_avail = avail_start;
  	patch_low_glo_static_region(args->topOfKernelData, avail_start - args->topOfKernelData);
  	enable_preemption();
 +
 +	/* Bring-up: arm_vm_init is done. */
-+	j3_mark2(3, 0x00FF00FFu);       /* magenta */
++	j3_mark2(6, 0x00FFFF00u);       /* yellow */
  }
+ 
+--- a/osfmk/arm/pmap.c
++++ b/osfmk/arm/pmap.c
+@@ -3002,6 +3002,9 @@
+  *	avail_end	PA of last managed physical page
+  */
+ 
++/* Bring-up: see the fb-early-checkpoints patch. Defined in osfmk/arm/arm_init.c. */
++extern void j3_mark2(unsigned slot, uint32_t colour);
++
+ void
+ pmap_bootstrap(
+ 	vm_offset_t vstart)
+@@ -3068,6 +3071,13 @@
+ 
+ 	/* allocate space for and initialize the bookkeeping structures */
+ 	io_attr_table_size = pmap_compute_io_rgns();
++
++	/*
++	 * Bring-up: kernel_pmap's fields are set and pmap_compute_io_rgns()
++	 * returned -- so /defaults was found and whatever pmap-io-ranges it
++	 * carries passed the alignment and overlap checks.
++	 */
++	j3_mark2(2, 0x00FF0000u);       /* red */
+ 	npages = (unsigned int)atop(mem_size);
+ 	pp_attr_table_size = npages * sizeof(pp_attr_t);
+ 	pv_head_size = round_page(sizeof(pv_entry_t *) * npages);
+@@ -3087,11 +3097,21 @@
+ 
+ 	memset((char *)phystokv(pmap_struct_start), 0, avail_start - pmap_struct_start);
+ 
++	/*
++	 * Bring-up: the bookkeeping tables are carved out of avail_start and
++	 * zeroed. They are reached through the physical aperture, so this is
++	 * also the first real use of it by code that is not the instrument.
++	 */
++	j3_mark2(3, 0x00FF00FFu);       /* magenta */
++
+ 	pmap_load_io_rgns();
+ 	ptd_bootstrap(ptd_root_table, (unsigned int)(ptd_root_table_size / sizeof(pt_desc_t)));
+ 
+ 	pmap_cpu_data_array_init();
+ 
++	/* Bring-up: ptd_bootstrap and pmap_cpu_data_array_init returned. */
++	j3_mark2(4, 0x0000FFFFu);       /* cyan */
++
+ 	vm_first_phys = gPhysBase;
+ 	vm_last_phys = trunc_page(avail_end);
  
