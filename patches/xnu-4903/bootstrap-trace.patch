@@ -1,0 +1,74 @@
+Turn on the bootstrap traces that are already written, and route them to the
+console.
+
+xnu carries a labelled trace of its own startup in three places, and all three
+are commented out:
+
+    kernel_bootstrap_log()            osfmk/kern/startup.c
+    kernel_bootstrap_thread_log()     osfmk/kern/startup.c
+    bsd_init_kprintf()                bsd/kern/bsd_init.c
+
+What is left behind when they are disabled is kernel_debug_string_early(),
+which writes into the ktrace buffer. That is useful on a machine you can
+attach to afterwards and useless on one whose only output is a panel.
+
+This matters because the stretch between PE_init_iokit() and bsd_init() is
+otherwise completely silent. IOKit prints nothing on its own unless the "io"
+boot-arg raises gIOKitDebug, and the first thing bsd_init() prints is the
+copyright banner, so a kernel that stops anywhere in between looks exactly
+like a kernel that finished booting and has nothing to say. These calls name
+every step of it.
+
+They are turned on as printf rather than the kprintf they were written as.
+kprintf goes to PE_kputc, which is the serial port -- and a board without one
+leaves it pointing at the console, needs debug=0x8 to be unmuted at all, and
+loses everything printed before vcattach(), which clears the screen and
+replays only the message buffer. printf goes through the message buffer, so it
+survives that replay and needs no boot-arg. The ktrace call is left in place in
+both functions.
+
+This is a debugging aid. It is noisy by design and belongs in a bring-up tree,
+not a shipping one.
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -231,14 +231,16 @@
+ static inline void
+ kernel_bootstrap_log(const char *message)
+ {
+-//	kprintf("kernel_bootstrap: %s\n", message);
++	/* Bring-up: printf, not the kprintf this line used to be. See the
++	 * bootstrap-trace patch header. */
++	printf("kernel_bootstrap: %s\n", message);
+ 	kernel_debug_string_early(message);
+ }
+ 
+ static inline void
+ kernel_bootstrap_thread_log(const char *message)
+ {
+-//	kprintf("kernel_bootstrap_thread: %s\n", message);
++	printf("kernel_bootstrap_thread: %s\n", message);
+ 	kernel_debug_string_early(message);
+ }
+ 
+@@ -456,7 +458,7 @@
+ {
+ 	processor_t             processor = current_processor();
+ 
+-#define kernel_bootstrap_thread_kprintf(x...) /* kprintf("kernel_bootstrap_thread: " x) */
++#define kernel_bootstrap_thread_kprintf(x...) printf("kernel_bootstrap_thread: " x)
+ 	kernel_bootstrap_thread_log("idle_thread_create");
+ 	/*
+ 	 * Create the idle processor thread.
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -449,7 +449,9 @@
+ 	boolean_t       netboot = FALSE;
+ #endif
+ 
+-#define bsd_init_kprintf(x...) /* kprintf("bsd_init: " x) */
++/* Bring-up: printf, not the kprintf this line used to be. See the
++ * bootstrap-trace patch header. */
++#define bsd_init_kprintf(x...) printf("bsd_init: " x)
+ 
+ 	throttle_init();
+ 
