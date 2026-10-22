@@ -42,6 +42,14 @@ printf instead, leaving the call dangling. So the trace cannot ever have been
 switched on in this tree. The missing semicolon is added here. It is the only
 statement in either file that depends on the trick -- the rest were checked.
 
+Two stretches had no trace points of their own and have been given some:
+StartIOKit(), and the run from PE_init_iokit() returning to bsd_init(). Those
+are the last unlit parts of the boot, and between them sits everything that
+happens once IOKit exists -- the kext bootstrap being jettisoned, the commpage
+being mapped, kernel text protections being finalised. A kernel that stops in
+there prints its last line from inside PE_init_iokit and says nothing further,
+which is indistinguishable from a kernel that finished.
+
 This is a debugging aid. It is noisy by design and belongs in a bring-up tree,
 not a shipping one.
 --- a/osfmk/kern/startup.c
@@ -74,6 +82,74 @@ not a shipping one.
  	kernel_bootstrap_thread_log("idle_thread_create");
  	/*
  	 * Create the idle processor thread.
+@@ -592,6 +594,7 @@
+ #ifdef  IOKIT
+ 	kernel_bootstrap_log("PE_init_iokit");
+ 	PE_init_iokit();
++	kernel_bootstrap_log("PE_init_iokit - done");
+ #endif
+ 
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+@@ -606,7 +609,9 @@
+ 	// Reset interrupts masked timeout before we enable interrupts
+ 	ml_spin_debug_clear_self();
+ #endif
++	kernel_bootstrap_log("spllo");
+ 	(void) spllo();         /* Allow interruptions */
++	kernel_bootstrap_log("spllo - done");
+ 
+ #if (defined(__i386__) || defined(__x86_64__)) && NCOPY_WINDOWS > 0
+ 	/*
+@@ -622,9 +627,13 @@
+ 	/*
+ 	 *	Initialize the shared region module.
+ 	 */
++	kernel_bootstrap_log("vm_shared_region_init");
+ 	vm_shared_region_init();
++	kernel_bootstrap_log("vm_commpage_init");
+ 	vm_commpage_init();
++	kernel_bootstrap_log("vm_commpage_text_init");
+ 	vm_commpage_text_init();
++	kernel_bootstrap_log("commpage - done");
+ 
+ #if CONFIG_MACF
+ 	kernel_bootstrap_log("mac_policy_initmach");
+@@ -646,7 +655,9 @@
+ 	 * Must be done prior to lockdown so that we can free (and possibly relocate)
+ 	 * the static KVA mappings used for the jettisoned bootstrap segments.
+ 	 */
++	kernel_bootstrap_log("OSKextRemoveKextBootstrap");
+ 	OSKextRemoveKextBootstrap();
++	kernel_bootstrap_log("OSKextRemoveKextBootstrap - done");
+ #if defined(__arm__) || defined(__arm64__)
+ #if CONFIG_KERNEL_INTEGRITY
+ 	machine_lockdown_preflight();
+@@ -654,7 +665,9 @@
+ 	/*
+ 	 *  Finalize protections on statically mapped pages now that comm page mapping is established.
+ 	 */
++	kernel_bootstrap_log("arm_vm_prot_finalize");
+ 	arm_vm_prot_finalize(PE_state.bootArgs);
++	kernel_bootstrap_log("arm_vm_prot_finalize - done");
+ #endif
+ 
+ #if CONFIG_SCHED_SFI
+@@ -680,6 +693,7 @@
+ 	read_random(&vm_kernel_addrhash_salt, sizeof(vm_kernel_addrhash_salt));
+ 	read_random(&vm_kernel_addrhash_salt_ext, sizeof(vm_kernel_addrhash_salt_ext));
+ 
++	kernel_bootstrap_log("vm_set_restrictions");
+ 	vm_set_restrictions();
+ 
+ 
+@@ -697,6 +711,7 @@
+ 	 *	Start the user bootstrap.
+ 	 */
+ #ifdef  MACH_BSD
++	kernel_bootstrap_log("bsd_init");
+ 	bsd_init();
+ #endif
+ 
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -449,7 +449,9 @@
@@ -96,3 +172,57 @@ not a shipping one.
  
  	bsd_init_kprintf("calling bsd_autoconf\n");
  	bsd_autoconf();
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -150,28 +150,39 @@
+ 	// of iokit basic service initialisation, or better we have IOLib stuff
+ 	// initialise as basic OS services.
+ 	//
++	printf("StartIOKit: IOLibInit\n");
+ 	IOLibInit();
++	printf("StartIOKit: OSlibkernInit\n");
+ 	OSlibkernInit();
++	printf("StartIOKit: devsw_init\n");
+ 	devsw_init();
+ 
+ 	gIOProgressBackbufferKey  = OSSymbol::withCStringNoCopy(kIOProgressBackbufferKey);
+ 	gIORemoveOnReadProperties = OSSet::withObjects((const OSObject **) &gIOProgressBackbufferKey, 1);
+ 
++	printf("StartIOKit: interruptAccountingInit\n");
+ 	interruptAccountingInit();
+ 
++	printf("StartIOKit: new IOPlatformExpertDevice\n");
+ 	rootNub = new IOPlatformExpertDevice;
+ 
++	printf("StartIOKit: initWithArgs\n");
+ 	if (rootNub && rootNub->initWithArgs( p1, p2, p3, p4)) {
++		printf("StartIOKit: attach\n");
+ 		rootNub->attach( 0 );
+ 
+ 		/* If the bootstrap segment set up a function to record startup
+ 		 * extensions, call it now.
+ 		 */
+ 		if (record_startup_extensions_function) {
++			printf("StartIOKit: record_startup_extensions\n");
+ 			record_startup_extensions_function();
++			printf("StartIOKit: record_startup_extensions - done\n");
+ 		}
+ 
++		printf("StartIOKit: registerService\n");
+ 		rootNub->registerService();
++		printf("StartIOKit: registerService - done\n");
+ 
+ #if !NO_KEXTD
+ 		/* Add a busy count to keep the registry busy until kextd has
+@@ -179,9 +190,11 @@
+ 		 * messages the kernel after the in-kernel linker has been
+ 		 * removed and personalities have been sent.
+ 		 */
++		printf("StartIOKit: adjustBusy\n");
+ 		IOService::getServiceRoot()->adjustBusy(1);
+ #endif
+ 	}
++	printf("StartIOKit: done\n");
+ }
+ 
+ void
