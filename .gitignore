@@ -1,3 +1,8 @@
 .xnu-build/
 logs-*/
 kernel-*/
+assym.s
+deps.log
+genassym-head.txt
+genassym-lines.txt
+kernel-build.log
