@@ -27,6 +27,21 @@ replays only the message buffer. printf goes through the message buffer, so it
 survives that replay and needs no boot-arg. The ktrace call is left in place in
 both functions.
 
+Turning bsd_init_kprintf() on exposes a latent syntax error a few hundred
+lines further down:
+
+    bsd_init_kprintf("calling sysctl_mib_init\n");
+    sysctl_mib_init()
+
+    bsd_init_kprintf("calling bsd_autoconf\n");
+
+sysctl_mib_init() has no terminator. While the macro expands to nothing, the
+semicolon written after the *next* bsd_init_kprintf() ends up terminating it,
+and the file compiles. Give the macro a body and that semicolon belongs to the
+printf instead, leaving the call dangling. So the trace cannot ever have been
+switched on in this tree. The missing semicolon is added here. It is the only
+statement in either file that depends on the trick -- the rest were checked.
+
 This is a debugging aid. It is noisy by design and belongs in a bring-up tree,
 not a shipping one.
 --- a/osfmk/kern/startup.c
@@ -72,3 +87,12 @@ not a shipping one.
  
  	throttle_init();
  
+@@ -845,7 +847,7 @@
+ #endif
+ 
+ 	bsd_init_kprintf("calling sysctl_mib_init\n");
+-	sysctl_mib_init()
++	sysctl_mib_init();
+ 
+ 	bsd_init_kprintf("calling bsd_autoconf\n");
+ 	bsd_autoconf();
