@@ -1,0 +1,65 @@
+Give IOKit a platform expert it can actually instantiate.
+
+Out of the box this table offers exactly one driver for IOPlatformExpertDevice,
+and that driver's whole job is to panic:
+
+    bool
+    IOPanicPlatform::start(IOService * provider)
+    {
+        ...
+        panic("Unable to find driver for this platform: \"%s\".\n", platform_name);
+    }
+
+On a real device the match is won by AppleARMPlatform, which arrives as a
+prelinked kext. A kernel built straight out of this tree has no kexts at all --
+no __PRELINK_TEXT, no __PRELINK_INFO -- so nothing outbids IOPanicPlatform and
+the boot ends there, at the first moment IOKit looks for a platform. Everything
+before it is already working: zalloc, oslog, the workqueue tables and kdp_core
+all come up, and StartIOKit() runs.
+
+IOPlatformExpert itself is concrete and is the obvious stand-in. Its start()
+does nothing this board would object to: it sets the IOMapper requirement from
+a property that is absent, creates the interrupt-controller dictionary, fixes
+up clock-frequency, installs itself as gIOPlatform, instantiates the power
+domains, and hands off to configure(), which looks for a "top-level" property,
+does not find one, and returns true.
+
+IODTPlatformExpert would be the more faithful choice -- it is what walks the
+device tree and publishes a nub per node -- but it is declared with
+OSDeclareAbstractStructors and leaves deleteList() and excludeList() pure, so
+it cannot be named from a personality. Subclassing it means a new source file
+and the build plumbing to go with it; that is worth doing once there are
+drivers for the nubs to match, and worth nothing before.
+
+So this is deliberately the minimum that gets the boot past IOKit's first
+question. It publishes no device nubs, and no driver will match anything,
+because there are no drivers. What it buys is the next failure instead of this
+one.
+
+The score only has to beat IOPanicPlatform's zero; numbers in these tables are
+decimal unless they start with 0x.
+
+Note the comma. IOCatalogue::initialize() runs this through the legacy
+OSUnserialize, whose grammar is
+
+    elements: object | elements ',' object
+
+so a second entry without one is a syntax error -- and the failure is not
+graceful: the result is asserted non-NULL a few lines later, so IOKit would
+come up with no personalities at all and panic. The table had one entry until
+now, which is why it has never needed a separator.
+
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -35,6 +35,11 @@
+ const char * gIOKernelConfigTables =
+     "("
+     "   {"
++    "     'IOClass'         = IOPlatformExpert;"
++    "     'IOProviderClass' = IOPlatformExpertDevice;"
++    "     'IOProbeScore'    = 1000:32;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+     "     'IOProbeScore'    = 0:32;"
