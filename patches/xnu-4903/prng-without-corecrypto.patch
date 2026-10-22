@@ -1,0 +1,69 @@
+Let read_random() work before anything has registered a kprng.
+
+register_and_init_prng() is defined and exported by xnu but never called from
+inside it. On a shipping system the corecrypto kext makes that call, and it is
+what allocates prng.lock.mutex and initialises prng.ctx. A kernel built from
+this tree has no kexts at all, so neither ever happens, and read_random() --
+whose first statement is lck_mtx_lock(prng.lock.mutex) -- takes a kernel data
+abort on a NULL mutex.
+
+It fails at the first call, which is in kernel_bootstrap_thread() seeding
+vm_kernel_addrperm, immediately below a comment in osfmk/kern/startup.c
+reading "at this stage we can use the cryptographically secure PRNG rather
+than early_random()". That is exactly the assumption that does not hold.
+
+The fallback is read_frandom(), already in this file: it draws from the NIST
+HMAC DRBG that early_random() has been driving since arm_vm_init, seeded from
+the booter's entropy, and it already splits requests to stay under the DRBG's
+per-call limit. So the fallback adds no new machinery -- it routes to the
+generator the kernel has been relying on all along for the stack guard and the
+kernel slide.
+
+Be clear about what this gives up. There is no FIPS-validated implementation
+behind it and no continuous reseeding from the kernel's entropy sources, so
+read_random() is weaker than it claims to be for as long as this branch is
+live. It is the difference between a kernel that boots and one that does not.
+The test is prng_fns == NULL, which is precisely the condition under which the
+normal path would dereference NULL anyway; as soon as something calls
+register_and_init_prng() the branch stops being taken.
+
+read_random() and the Reseed() it calls are the only reachable users of that
+mutex. write_random() also takes it, but its body is behind
+"#if PERMIT_WRITE_RANDOM", which is 0.
+
+--- a/osfmk/prng/prng_random.c
++++ b/osfmk/prng/prng_random.c
+@@ -568,6 +568,33 @@
+ {
+ 	int err;
+ 
++	/*
++	 * Nothing inside xnu ever calls register_and_init_prng(); on a normal
++	 * system the corecrypto kext does, and that is what allocates the
++	 * mutex taken below and initialises prng.ctx. A kernel booted without
++	 * kexts therefore reaches here with prng_fns and prng.lock.mutex both
++	 * NULL, and takes a data abort on the very first call -- which is in
++	 * kernel_bootstrap_thread(), seeding vm_kernel_addrperm, directly
++	 * underneath a comment observing that the cryptographically secure
++	 * PRNG is available by that point. It is not, here.
++	 *
++	 * Fall back to read_frandom(), which draws from the same NIST HMAC
++	 * DRBG that early_random() has been using since arm_vm_init, seeded
++	 * from the booter's entropy, and which already splits requests to stay
++	 * under the DRBG's per-call limit.
++	 *
++	 * This is a real reduction in guarantees and not a substitute for the
++	 * registered kprng: there is no FIPS-validated implementation behind
++	 * it and no continuous reseeding from the kernel's entropy sources.
++	 * It is what makes a kextless kernel boot at all. The moment anything
++	 * calls register_and_init_prng(), prng_fns stops being NULL and this
++	 * branch is never taken again.
++	 */
++	if (prng_fns == NULL) {
++		read_frandom(buffer, numbytes);
++		return;
++	}
++
+ 	lck_mtx_lock(prng.lock.mutex);
+ 
+ 	/*
