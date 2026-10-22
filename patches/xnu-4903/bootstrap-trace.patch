@@ -50,6 +50,13 @@ being mapped, kernel text protections being finalised. A kernel that stops in
 there prints its last line from inside PE_init_iokit and says nothing further,
 which is indistinguishable from a kernel that finished.
 
+commpage_populate() is traced too, because that is where this port currently
+stops: vm_shared_region_init() returns, vm_commpage_init() is entered and never
+comes back, and on arm that function is little more than a call to
+commpage_populate(). The steps inside it reach in several directions -- the
+pmap, the cpuid tables, the clock -- so it is worth naming each one rather than
+guessing which.
+
 This is a debugging aid. It is noisy by design and belongs in a bring-up tree,
 not a shipping one.
 --- a/osfmk/kern/startup.c
@@ -226,3 +233,77 @@ not a shipping one.
  }
  
  void
+--- a/osfmk/arm/commpage/commpage.c
++++ b/osfmk/arm/commpage/commpage.c
+@@ -37,6 +37,7 @@
+  *	Purpose:	Set up and export a RO/RW page
+  */
+ #include <libkern/section_keywords.h>
++#include <kern/misc_protos.h>    /* Bring-up: printf, see the bootstrap-trace patch */
+ #include <mach/mach_types.h>
+ #include <mach/machine.h>
+ #include <mach/vm_map.h>
+@@ -78,13 +79,18 @@
+ 	uint16_t        c2;
+ 	int cpufamily;
+ 
++	printf("commpage: pmap_create_sharedpage\n");
+ 	sharedpage_rw_addr = pmap_create_sharedpage();
++	printf("commpage: pmap_create_sharedpage - done\n");
+ 	commPagePtr = (vm_address_t)_COMM_PAGE_BASE_ADDRESS;
+ 
+ 	*((uint16_t*)(_COMM_PAGE_VERSION + _COMM_PAGE_RW_OFFSET)) = (uint16_t) _COMM_PAGE_THIS_VERSION;
+ 
++	printf("commpage: init_cpu_capabilities\n");
+ 	commpage_init_cpu_capabilities();
++	printf("commpage: set_timestamp\n");
+ 	commpage_set_timestamp(0, 0, 0, 0, 0);
++	printf("commpage: set_timestamp - done\n");
+ 
+ 	if (_cpu_capabilities & kCache32) {
+ 		c2 = 32;
+@@ -99,8 +105,11 @@
+ 	*((uint16_t*)(_COMM_PAGE_CACHE_LINESIZE + _COMM_PAGE_RW_OFFSET)) = c2;
+ 	*((uint32_t*)(_COMM_PAGE_SPIN_COUNT + _COMM_PAGE_RW_OFFSET)) = 1;
+ 
++	printf("commpage: update_active_cpus\n");
+ 	commpage_update_active_cpus();
++	printf("commpage: cpuid_get_cpufamily\n");
+ 	cpufamily = cpuid_get_cpufamily();
++	printf("commpage: cpuid_get_cpufamily - done\n");
+ 
+ 	/* machine_info valid after ml_get_max_cpus() */
+ 	*((uint8_t*)(_COMM_PAGE_PHYSICAL_CPUS + _COMM_PAGE_RW_OFFSET)) = (uint8_t) machine_info.physical_cpu_max;
+@@ -124,12 +133,16 @@
+ 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64 + _COMM_PAGE_RW_OFFSET)) = (uint8_t) PAGE_SHIFT;
+ #endif /* __arm64__ */
+ 
++	printf("commpage: update_timebase\n");
+ 	commpage_update_timebase();
++	printf("commpage: update_mach_continuous_time\n");
+ 	commpage_update_mach_continuous_time(0);
+ 
+ 	clock_sec_t secs;
+ 	clock_usec_t microsecs;
++	printf("commpage: clock_get_boottime_microtime\n");
+ 	clock_get_boottime_microtime(&secs, &microsecs);
++	printf("commpage: clock_get_boottime_microtime - done\n");
+ 	commpage_update_boottime(secs * USEC_PER_SEC + microsecs);
+ 
+ 	/*
+@@ -143,6 +156,7 @@
+ 	*((uint8_t *)(_COMM_PAGE_APPROX_TIME_SUPPORTED + _COMM_PAGE_RW_OFFSET)) = 0;
+ #endif
+ 
++	printf("commpage: update_kdebug_state\n");
+ 	commpage_update_kdebug_state();
+ 
+ #if CONFIG_ATM
+@@ -151,6 +165,7 @@
+ 
+ 
+ 	*((uint64_t*)(_COMM_PAGE_REMOTETIME_PARAMS + _COMM_PAGE_RW_OFFSET)) = BT_RESET_SENTINEL_TS;
++	printf("commpage: populate - done\n");
+ }
+ 
+ struct mu {
