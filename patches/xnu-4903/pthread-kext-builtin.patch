@@ -55,6 +55,26 @@ bsd/conf/Makefile.template in this very tree still carries
 for two files that no longer exist. Renaming to match brings those suppressions
 back to the code they were written for; pthread_kext.c gets the same pair.
 
+The three objects are also compiled with -UXNU_KERNEL_PRIVATE and
+-UBSD_KERNEL_PRIVATE, which is the other half of putting kext code inside xnu.
+These sources are written against the KPI view of the headers -- the view a
+kext gets -- and the bsd component defines both of those, which changes what
+<sys/user.h> does in two ways that both break the build:
+
+  - XNU_KERNEL_PRIVATE makes it include resourcevar.h and signalvar.h, whose
+    declarations use proc_t and thread_t, and neither is defined this early in
+    the include chain the kext arrives through;
+
+  - BSD_KERNEL_PRIVATE makes it include <sys/pthread_internal.h>, which shares
+    its include guard with libpthread's kern_internal.h. That sharing is
+    deliberate -- whichever arrives first wins -- but it means that when the
+    kext's copy came first, xnu's is skipped, struct ksyn_waitq_element stays
+    a forward declaration, and struct uthread embeds an incomplete type.
+
+Undefining both restores exactly the environment the code was written for.
+MakeInc.rule puts ${$@_CFLAGS_ADD} after ${CFLAGS} on the command line
+(C_RULE_1A), so the -U wins over the -D.
+
 This patch needs pthread-guards-without-kext.patch, which applies before it and
 leaves pthread_init() able to survive a NULL table. The two are deliberately
 separate and independently removable: the guards are what keeps the boot alive
@@ -88,7 +108,7 @@ userland process registering its thread start routines.
  ./init_sysent.c				standard
 --- a/bsd/conf/Makefile.template
 +++ b/bsd/conf/Makefile.template
-@@ -83,6 +83,14 @@
+@@ -83,6 +83,27 @@
  pthread_synch.o_CFLAGS_ADD		+= -Wno-unused-parameter -Wno-missing-prototypes
  pthread_support.o_CFLAGS_ADD		+= -Wno-unused-parameter -Wno-missing-prototypes
  
@@ -99,6 +119,19 @@ userland process registering its thread start routines.
 +pthread_support.o_CFLAGS_ADD		+= -I$(SRCROOT)/bsd/pthread/kext
 +pthread_synch.o_CFLAGS_ADD		+= -I$(SRCROOT)/bsd/pthread/kext
 +pthread_kext.o_CFLAGS_ADD		+= -Wno-unused-parameter -Wno-missing-prototypes
++
++# They are also written against the KPI view of the headers, which is what a
++# kext gets. Compiled inside the bsd component they would get xnu's internal
++# view instead, and <sys/user.h> reacts to both of these: XNU_KERNEL_PRIVATE
++# makes it pull in resourcevar.h and signalvar.h, which use proc_t and
++# thread_t before this include chain defines them, and BSD_KERNEL_PRIVATE
++# makes it pull in <sys/pthread_internal.h> -- which shares its include guard
++# with libpthread's kern_internal.h, so the file is skipped and struct uthread
++# ends up embedding an incomplete ksyn_waitq_element. CFLAGS_ADD lands after
++# CFLAGS on the command line (see C_RULE_1A), so these take effect.
++pthread_kext.o_CFLAGS_ADD		+= -UXNU_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE
++pthread_support.o_CFLAGS_ADD		+= -UXNU_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE
++pthread_synch.o_CFLAGS_ADD		+= -UXNU_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE
 +
  # Objects that don't want -Wsign-compare
  OBJS_NO_SIGN_COMPARE =		\
