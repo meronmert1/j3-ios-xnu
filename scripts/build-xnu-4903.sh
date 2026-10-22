@@ -164,7 +164,7 @@ stage_libpthread() {
     mkdir -p "$DEPS_DIR"
     local d; d="$(fetch_oss libpthread "$LIBPTHREAD_REF")" || exit 1
 
-    mkdir -p "$dst/kern" "$dst/pthread" "$dst/private"
+    mkdir -p "$dst/kern" "$dst/pthread" "$dst/private" "$dst/sys/_pthread"
 
     local f
     for f in kern_internal.h synch_internal.h workqueue_internal.h kern_trace.h; do
@@ -172,6 +172,15 @@ stage_libpthread() {
     done
     cp "$d/pthread/qos.h"         "$dst/pthread/qos.h"         || die "libpthread: no pthread/qos.h"
     cp "$d/private/qos_private.h" "$dst/private/qos_private.h" || die "libpthread: no private/qos_private.h"
+
+    # qos.h and qos_private.h name types that live in libpthread too, not in
+    # xnu. Only qos_class_t and the QOS_CLASS_* constants are reachable from a
+    # kernel build; the rest is behind #ifndef KERNEL.
+    cp "$d/sys/qos.h"         "$dst/sys/qos.h"         || die "libpthread: no sys/qos.h"
+    cp "$d/sys/qos_private.h" "$dst/sys/qos_private.h" || die "libpthread: no sys/qos_private.h"
+    for f in _pthread_types.h _pthread_attr_t.h _pthread_t.h; do
+        cp "$d/sys/_pthread/$f" "$dst/sys/_pthread/$f" || die "libpthread: no sys/_pthread/$f"
+    done
 
     cp "$d/kern/kern_init.c"    "$dst/kern/pthread_kext.c"    || die "libpthread: no kern/kern_init.c"
     cp "$d/kern/kern_support.c" "$dst/kern/pthread_support.c" || die "libpthread: no kern/kern_support.c"

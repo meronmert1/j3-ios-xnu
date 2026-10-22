@@ -89,6 +89,33 @@ whoever includes debug.h -- so this patch adds a small stand-in beside the
 staged sources, reachable through the -I they already have, and defines the
 macros from the kernel's own CONFIG_EMBEDDED rather than leaving them absent.
 
+The same thing happens one header deeper. libpthread's kern_internal.h
+includes "pthread/qos.h", for qos_class_t and two QOS_CLASS_* constants the
+kext uses, and that header decorates its enumerators with __API_AVAILABLE
+from the SDK's <Availability.h>. Undefined, the attribute is a syntax error
+inside the enum rather than something the compiler ignores, so a stand-in for
+that header is added too. Both stand-ins define their macros under #ifndef,
+so if xnu ever starts defining them itself these files step aside quietly.
+
+(The libpthread-owned headers that qos.h needs -- sys/qos.h, sys/qos_private.h
+and the sys/_pthread typedefs -- are Apple's and are staged by the build
+script, not carried here.)
+
+One xnu header has to be corrected rather than worked around. osfmk/vm/pmap.h
+declares
+
+    #if CONFIG_PGTRACE
+    kern_return_t pmap_pgtrace_fault(pmap_t, vm_map_offset_t, arm_saved_state_t *);
+    #endif
+
+outside any privacy guard, while arm_saved_state_t is typedef'd inside
+#ifdef XNU_KERNEL_PRIVATE in osfmk/mach/arm/thread_status.h. The declaration
+is therefore unreadable without XNU_KERNEL_PRIVATE -- its parameter type does
+not exist -- which has never mattered because everything inside xnu has that
+define. The staged sources are the first translation units here that do not,
+so the declaration is given the guard its own types already have. Nothing
+that has XNU_KERNEL_PRIVATE sees any change.
+
 This patch needs pthread-guards-without-kext.patch, which applies before it and
 leaves pthread_init() able to survive a NULL table. The two are deliberately
 separate and independently removable: the guards are what keeps the boot alive
@@ -182,6 +209,25 @@ userland process registering its thread start routines.
  	if (PTHREAD_KEXT_ABSENT()) {
  		printf("pthread: kernel extension not loaded; pthread and "
  		    "workqueue syscalls will return ENOTSUP\n");
+--- a/osfmk/vm/pmap.h
++++ b/osfmk/vm/pmap.h
+@@ -770,7 +770,16 @@
+ #if CONFIG_PGTRACE
+ int pmap_pgtrace_add_page(pmap_t pmap, vm_map_offset_t start, vm_map_offset_t end);
+ int pmap_pgtrace_delete_page(pmap_t pmap, vm_map_offset_t start, vm_map_offset_t end);
++#ifdef XNU_KERNEL_PRIVATE
++/*
++ * arm_saved_state_t exists only under XNU_KERNEL_PRIVATE
++ * (osfmk/mach/arm/thread_status.h), so this declaration cannot be read
++ * without it. Everything inside xnu has it, which is why the omission has
++ * never mattered; a translation unit compiled with the KPI view of the
++ * headers, as the staged pthread kext sources are, stops here instead.
++ */
+ kern_return_t pmap_pgtrace_fault(pmap_t pmap, vm_map_offset_t va, arm_saved_state_t *ss);
++#endif /* XNU_KERNEL_PRIVATE */
+ #endif
+ 
+ 
 --- /dev/null
 +++ b/bsd/pthread/kext/TargetConditionals.h
 @@ -0,0 +1,43 @@
@@ -228,3 +274,47 @@ userland process registering its thread start routines.
 +#define TARGET_OS_UNIX          0
 +
 +#endif /* _TARGETCONDITIONALS_H_ */
+--- /dev/null
++++ b/bsd/pthread/kext/Availability.h
+@@ -0,0 +1,41 @@
++/*
++ * Availability.h -- stand-in for the SDK header of the same name.
++ *
++ * This is not an Apple file. libpthread's sys/qos.h decorates the qos_class_t
++ * enumerators with __API_AVAILABLE, which comes from the SDK's Availability.h:
++ *
++ *     #if __has_feature(enumerator_attributes)
++ *     #undef __QOS_CLASS_AVAILABLE
++ *     #define __QOS_CLASS_AVAILABLE __API_AVAILABLE
++ *     #endif
++ *
++ * clang has that feature, so the macro is reached, and a kernel build has no
++ * userland headers on its include path. Without a definition the attribute
++ * would be parsed as a syntax error inside the enum rather than ignored.
++ *
++ * These macros carry no meaning for a kernel: everything is compiled as one
++ * unit against one set of headers, so expanding them to nothing is what the
++ * SDK header would effectively do here anyway. Each is guarded, so if xnu's
++ * own cdefs.h ever starts defining them this file quietly steps aside.
++ */
++
++#ifndef _J3_AVAILABILITY_SHIM_H_
++#define _J3_AVAILABILITY_SHIM_H_
++
++#ifndef __API_AVAILABLE
++#define __API_AVAILABLE(...)
++#endif
++
++#ifndef __API_DEPRECATED
++#define __API_DEPRECATED(...)
++#endif
++
++#ifndef __API_DEPRECATED_WITH_REPLACEMENT
++#define __API_DEPRECATED_WITH_REPLACEMENT(...)
++#endif
++
++#ifndef __API_UNAVAILABLE
++#define __API_UNAVAILABLE(...)
++#endif
++
++#endif /* _J3_AVAILABILITY_SHIM_H_ */
