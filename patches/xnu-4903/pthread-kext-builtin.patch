@@ -165,6 +165,19 @@ drop-in. Their prototypes are behind XNU_KERNEL_PRIVATE, so they are declared
 next to the two defines that redirect the calls, for everything that is not
 x86_64.
 
+Linking the kext in rather than loading it also makes two of its globals
+collide with xnu's. kern_init.c defines
+
+    pthread_callbacks_t pthread_kern;
+
+and a current_uthread(), because a kext cannot link against the kernel's. Both
+already exist here: bsd/pthread/pthread_shims.c defines pthread_kern and
+initialises it to &pthread_callbacks, and bsd/kern/kern_proc.c defines
+current_uthread() doing the same thing. The kext's copies are removed, leaving
+the declarations in kern_internal.h to find xnu's. pthread_kext_register()
+still takes the address of pthread_kern and sets it to the value it already
+holds.
+
 This patch needs pthread-guards-without-kext.patch, which applies before it and
 leaves pthread_init() able to survive a NULL table. The two are deliberately
 separate and independently removable: the guards are what keeps the boot alive
@@ -404,6 +417,39 @@ userland process registering its thread start routines.
  #else
  #error setup_wqthread  not defined for this architecture
  #endif
+--- a/bsd/pthread/kext/kern/pthread_kext.c
++++ b/bsd/pthread/kext/kern/pthread_kext.c
+@@ -13,7 +13,14 @@
+ kern_return_t pthread_start(kmod_info_t * ki, void *d);
+ kern_return_t pthread_stop(kmod_info_t *ki, void *d);
+ 
+-pthread_callbacks_t pthread_kern;
++/*
++ * Built into the kernel rather than loaded, so xnu's own definition in
++ * bsd/pthread/pthread_shims.c is the one that counts -- and it is already
++ * initialised there to &pthread_callbacks. Only the declaration from
++ * kern_internal.h is wanted here; defining it again is a duplicate symbol.
++ * pthread_kext_register() below still takes its address, and sets it to the
++ * same value it already holds.
++ */
+ 
+ const struct pthread_functions_s pthread_internal_functions = {
+ 	.pthread_init = _pthread_init,
+@@ -57,9 +64,8 @@
+ 	return KERN_FAILURE;
+ }
+ 
+-struct uthread*
+-current_uthread(void)
+-{
+-	thread_t th = current_thread();
+-	return pthread_kern->get_bsdthread_info(th);
+-}
++/*
++ * current_uthread() is xnu's own, in bsd/kern/kern_proc.c, and doing the same
++ * thing. The kext carries a copy because it cannot link against that one;
++ * built in, it is a duplicate symbol.
++ */
 --- /dev/null
 +++ b/bsd/pthread/kext/TargetConditionals.h
 @@ -0,0 +1,43 @@
