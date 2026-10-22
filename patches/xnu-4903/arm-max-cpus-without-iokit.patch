@@ -1,0 +1,66 @@
+Publish the CPU count so commpage_populate() stops waiting for a kext.
+
+ml_get_max_cpus() does not compute anything. It sleeps:
+
+    if (max_cpus_initialized != MAX_CPUS_SET) {
+            max_cpus_initialized = MAX_CPUS_WAIT;
+            assert_wait((event_t) &max_cpus_initialized, THREAD_UNINT);
+            (void) thread_block(THREAD_CONTINUE_NULL);
+    }
+
+and waits for ml_init_max_cpus() to wake it. Across the entire tree there is
+exactly one caller of ml_init_max_cpus():
+
+    iokit/Kernel/IOCPU.cpp:830, inside
+    IOCPUInterruptController::initCPUInterruptController()
+
+which is reached only when a platform driver constructs that controller. On a
+shipping device the AppleARMPlatform kext does it. A kernel built from this
+tree has no kexts, so nothing ever does, and the first thread to ask for the
+processor count sleeps for the rest of the boot.
+
+That thread is the one running kernel_bootstrap_thread. The path is
+vm_commpage_init() -> commpage_populate() -> commpage_cpus() ->
+ml_get_max_cpus(), and commpage.c flags the hazard on the line itself:
+
+    cpus = ml_get_max_cpus();       // NB: this call can block
+
+The symptom is a kernel that goes quiet with no panic and no reboot, after
+IOKit has come up and while its matching threads carry on working -- which
+looks exactly like a kernel that finished booting and had nothing more to say.
+
+ml_parse_cpu_topology() has already parsed /cpus a few lines above, so the
+count is known at that point and is the same one the platform driver would
+have supplied. ml_init_max_cpus() is a first-writer-wins operation guarded by
+max_cpus_initialized, so a platform driver that later calls it finds the work
+done and returns without complaint.
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -291,6 +291,27 @@
+ 	master_cpu = ml_get_boot_cpu_number();
+ 	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
+ 
++	/*
++	 * Publish the processor count now, from the topology the device tree
++	 * just gave us.
++	 *
++	 * ml_get_max_cpus() blocks on an assert_wait() until someone has called
++	 * ml_init_max_cpus(), and the only caller of that in the whole tree is
++	 * IOCPUInterruptController::initCPUInterruptController(), which a
++	 * platform kext is supposed to invoke. A kernel with no kexts never
++	 * does, so the first caller of ml_get_max_cpus() sleeps forever -- and
++	 * that caller is commpage_cpus(), reached from commpage_populate() by
++	 * way of vm_commpage_init(), with a comment in commpage.c that reads
++	 * "NB: this call can block". It blocks for good here.
++	 *
++	 * ml_parse_cpu_topology() has already read /cpus, so max_cpu_number is
++	 * the honest answer and is the same number the platform driver would
++	 * eventually supply. ml_init_max_cpus() only acts while
++	 * max_cpus_initialized is unset, so a later call from a real platform
++	 * driver becomes a no-op rather than a conflict.
++	 */
++	ml_init_max_cpus((unsigned int)(ml_get_max_cpu_number() + 1));
++
+ 	BootCpuData.cpu_number = (unsigned short)master_cpu;
+ #if     __arm__
+ 	BootCpuData.cpu_exc_vectors = (vm_offset_t)&ExceptionVectorsTable;
