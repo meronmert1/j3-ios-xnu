@@ -55,6 +55,7 @@ BOOTSTRAP_CMDS_REF="${BOOTSTRAP_CMDS_REF:-}"
 AVAILABILITY_REF="${AVAILABILITY_REF:-}"
 LIBDISPATCH_REF="${LIBDISPATCH_REF:-libdispatch-1008}"   # prefix match, 10.14 train
 LIBPLATFORM_REF="${LIBPLATFORM_REF:-libplatform-177}"
+LIBPTHREAD_REF="${LIBPTHREAD_REF:-libpthread-330.250.2}"   # 10.14.6 train, matches xnu-4903
 
 SRC_DIR="$WORK_DIR/src"
 DEPS_DIR="$WORK_DIR/deps"
@@ -132,6 +133,51 @@ apply_patches() {
             || die "patch failed: $p"
         basename "$p" >> "$applied"
     done
+}
+
+# -------------------------------------------------------------- pthread kext
+
+# xnu carries no pthread implementation: bsd/pthread/pthread_shims.c is a table
+# of function pointers, and the only thing that ever fills it is
+# com.apple.kec.pthread, the kext half of Apple's libpthread. Without it
+# bsd_init() panics at pthread_init(), and no process could create a thread
+# even if it got that far. There are no kexts in this port, so the kext is
+# compiled into the kernel and its sources are staged into the xnu tree here.
+#
+# libpthread's own directory layout is preserved, because the sources include
+# each other by project-relative path ("kern/synch_internal.h", "pthread/qos.h",
+# "private/qos_private.h"). The angle-bracket includes -- bsdthread_private.h,
+# priority_private.h, workqueue_syscalls.h -- are xnu's own and are not staged.
+#
+# Two sources are renamed on the way in. kern_synch.c would collide with xnu's
+# own bsd/kern/kern_synch.c, because the conf system names objects after the
+# basename alone. The names chosen are the ones Apple used while this code
+# still lived in xnu, and bsd/conf/Makefile.template in this tree still carries
+# warning suppressions written for them.
+#
+# The matching patch is patches/xnu-4903/pthread-kext-builtin.patch.
+stage_libpthread() {
+    local dst="$XNU_SRC/bsd/pthread/kext"
+    [ -f "$dst/kern/pthread_synch.c" ] && { info "pthread kext already staged"; return 0; }
+
+    say "libpthread (pthread kext, built into the kernel)"
+    mkdir -p "$DEPS_DIR"
+    local d; d="$(fetch_oss libpthread "$LIBPTHREAD_REF")" || exit 1
+
+    mkdir -p "$dst/kern" "$dst/pthread" "$dst/private"
+
+    local f
+    for f in kern_internal.h synch_internal.h workqueue_internal.h kern_trace.h; do
+        cp "$d/kern/$f" "$dst/kern/$f" || die "libpthread: no kern/$f"
+    done
+    cp "$d/pthread/qos.h"         "$dst/pthread/qos.h"         || die "libpthread: no pthread/qos.h"
+    cp "$d/private/qos_private.h" "$dst/private/qos_private.h" || die "libpthread: no private/qos_private.h"
+
+    cp "$d/kern/kern_init.c"    "$dst/kern/pthread_kext.c"    || die "libpthread: no kern/kern_init.c"
+    cp "$d/kern/kern_support.c" "$dst/kern/pthread_support.c" || die "libpthread: no kern/kern_support.c"
+    cp "$d/kern/kern_synch.c"   "$dst/kern/pthread_synch.c"   || die "libpthread: no kern/kern_synch.c"
+
+    info "staged into bsd/pthread/kext"
 }
 
 # Modern clang finds far more warnings than the 2018 one; -Werror turns every one
@@ -351,6 +397,7 @@ clang --version | head -1
 info "SDK: $(xcrun --sdk macosx --show-sdk-path 2>/dev/null)"
 
 fetch_xnu
+stage_libpthread
 apply_patches
 patch_no_werror
 patch_ld_classic

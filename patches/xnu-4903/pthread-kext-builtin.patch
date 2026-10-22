@@ -1,0 +1,137 @@
+Build the pthread kext into the kernel instead of loading it.
+
+xnu has no pthread implementation of its own. bsd/pthread/pthread_shims.c is a
+table of function pointers and nothing more, and the only thing that ever fills
+it is com.apple.kec.pthread -- the kext half of Apple's libpthread. A kernel
+built from this tree alone therefore cannot create a user thread at all:
+libpthread's runtime calls bsdthread_register() during the startup of every
+process, and that call goes straight through the table.
+
+There are no kexts in this port, so the kext is compiled into the kernel.
+
+Three things make this smaller than it sounds. xnu-4903 already carries the
+workqueue engine itself -- bsd/conf/files lists pthread_workqueue.c and
+pthread_priority.c as standard -- so what remains in the kext is the psynch
+locks, bsdthread_*, and registration: three sources, about 4200 lines.
+Compatibility is structural rather than negotiated, because the kext includes
+<sys/pthread_shims.h> from xnu, so the table is defined in exactly one place
+and the static_asserts at the top of pthread_shims.c check both halves against
+it. And the start routine is three lines:
+
+    kern_return_t pthread_start(kmod_info_t *ki, void *d)
+    {
+            pthread_kext_register((pthread_functions_t)&pthread_internal_functions,
+                &pthread_kern);
+            return KERN_SUCCESS;
+    }
+
+Nothing calls it when the code is linked in, so pthread_init() calls it by hand
+the first time the table is needed. The call is guarded on the table still
+being NULL, so it happens once; pthread_kext_register() panics on a second
+registration.
+
+The sources are staged into bsd/pthread/kext by the build script, which fetches
+libpthread-330.250.2 -- the 10.14.6 release train, the same one xnu-4903.270.47
+comes from. They keep libpthread's own directory layout, because they include
+each other by project-relative path ("kern/synch_internal.h", "pthread/qos.h",
+"private/qos_private.h"), which is why the three objects get an -I pointing at
+the staging root. The angle-bracket includes -- <pthread/bsdthread_private.h>,
+<pthread/priority_private.h>, <pthread/workqueue_syscalls.h> -- are xnu's own
+and resolve against the installed headers, so they are not staged.
+
+Two of the three sources are renamed on the way in:
+
+    kern/kern_synch.c    -> kern/pthread_synch.c
+    kern/kern_support.c  -> kern/pthread_support.c
+
+kern_synch.c would collide with xnu's own bsd/kern/kern_synch.c, because the
+conf system names objects after the basename alone. The new names are not
+arbitrary: they are the ones Apple used while this code still lived in xnu, and
+bsd/conf/Makefile.template in this very tree still carries
+
+    pthread_synch.o_CFLAGS_ADD   += -Wno-unused-parameter -Wno-missing-prototypes
+    pthread_support.o_CFLAGS_ADD += -Wno-unused-parameter -Wno-missing-prototypes
+
+for two files that no longer exist. Renaming to match brings those suppressions
+back to the code they were written for; pthread_kext.c gets the same pair.
+
+This patch needs pthread-guards-without-kext.patch, which applies before it and
+leaves pthread_init() able to survive a NULL table. The two are deliberately
+separate and independently removable: the guards are what keeps the boot alive
+if the registration ever does not happen, and if this integration has to be
+backed out the guards stay behind on their own.
+
+How to tell whether it worked: with the kext registered, pthread_init() prints
+nothing. The line
+
+    pthread: kernel extension not loaded; pthread and workqueue syscalls will
+    return ENOTSUP
+
+appearing at boot means the table is still NULL and only the guards are holding
+the kernel up.
+
+This cannot be tested beyond that until there is a root filesystem. Nothing in
+the kernel calls into the table on its own; the first real exercise of it is a
+userland process registering its thread start routines.
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -385,6 +385,9 @@
+ bsd/pthread/pthread_shims.c		standard
+ bsd/pthread/pthread_priority.c		standard
+ bsd/pthread/pthread_workqueue.c		standard
++bsd/pthread/kext/kern/pthread_kext.c	standard
++bsd/pthread/kext/kern/pthread_support.c	standard
++bsd/pthread/kext/kern/pthread_synch.c	standard
+ 
+ bsd/kern/bsd_init.c			standard
+ ./init_sysent.c				standard
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -83,6 +83,14 @@
+ pthread_synch.o_CFLAGS_ADD		+= -Wno-unused-parameter -Wno-missing-prototypes
+ pthread_support.o_CFLAGS_ADD		+= -Wno-unused-parameter -Wno-missing-prototypes
+ 
++# The pthread kext sources staged under bsd/pthread/kext keep libpthread's
++# own layout, because they include each other by project-relative path
++# ("kern/synch_internal.h", "pthread/qos.h", "private/qos_private.h").
++pthread_kext.o_CFLAGS_ADD		+= -I$(SRCROOT)/bsd/pthread/kext
++pthread_support.o_CFLAGS_ADD		+= -I$(SRCROOT)/bsd/pthread/kext
++pthread_synch.o_CFLAGS_ADD		+= -I$(SRCROOT)/bsd/pthread/kext
++pthread_kext.o_CFLAGS_ADD		+= -Wno-unused-parameter -Wno-missing-prototypes
++
+ # Objects that don't want -Wsign-compare
+ OBJS_NO_SIGN_COMPARE =		\
+ 		radix.o	\
+--- a/bsd/pthread/pthread_shims.c
++++ b/bsd/pthread/pthread_shims.c
+@@ -53,6 +53,14 @@
+ #include <vm/vm_map.h>
+ #include <vm/vm_protos.h>
+ #include <kern/kcdata.h>
++#include <mach/kmod.h>
++
++/*
++ * com.apple.kec.pthread's start routine. This port has no kexts, so the kext
++ * is compiled into the kernel (bsd/pthread/kext, staged by the build script)
++ * and its start routine is called by hand from pthread_init() below.
++ */
++extern kern_return_t pthread_start(kmod_info_t *ki, void *d);
+ 
+ /* version number of the in-kernel shims given to pthread.kext */
+ #define PTHREAD_SHIMS_VERSION 1
+@@ -321,6 +329,14 @@
+ void
+ pthread_init(void)
+ {
++	/*
++	 * Nothing loads the kext, so nothing has called pthread_kext_register()
++	 * yet. Do it here, once, immediately before the table is first needed.
++	 */
++	if (PTHREAD_KEXT_ABSENT()) {
++		(void)pthread_start(NULL, NULL);
++	}
++
+ 	if (PTHREAD_KEXT_ABSENT()) {
+ 		printf("pthread: kernel extension not loaded; pthread and "
+ 		    "workqueue syscalls will return ENOTSUP\n");

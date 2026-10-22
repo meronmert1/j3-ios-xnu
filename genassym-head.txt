@@ -1,0 +1,263 @@
+	.section	__TEXT,__text,regular,pure_instructions
+	.build_version macos, 15, 5	sdk_version 15, 5
+	.file	0 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT" "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/src/xnu-4903.270.47/osfmk/arm64/genassym.c" md5 0x89d2d691a054eb3965e4d9febaba02d6
+	.file	1 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/processor.h" md5 0x2a717dfbf59eae0ec7dde74c1b2eef37
+	.file	2 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/kern_types.h" md5 0x61fdb5107d047dcd47d85930b935536f
+	.file	3 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/sched_urgency.h" md5 0xa92f9a9ee6155a37e074ab6b462e716b
+	.file	4 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/cpu_quiesce.h" md5 0xe08d199d138c63cb7b7ecb79e2bce20a
+	.file	5 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/debug.h" md5 0xf3fa851eb93def18ac773b6d94b126f2
+	.file	6 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/turnstile.h" md5 0x0327e10a0063f464c968fe17245d06f4
+	.file	7 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/sched.h" md5 0x65bd5b950ef31bee369120b833bd2e4c
+	.file	8 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/thread_call.h" md5 0x9989304c938cee9a045814c73f02a93d
+	.file	9 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/arm/machine_routines.h" md5 0x09c00e7e518c068d25f9d21cb5c78533
+	.file	10 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/arm/cpu_data_internal.h" md5 0x91491a72b3d64891c144a90abd85e48b
+	.file	11 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/sys/_types/_uintptr_t.h" md5 0x05d6c72601f38d5cc562a1172eaf583e
+	.file	12 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/arm/vm_types.h" md5 0xf5015df22146d6eaa588fd73cd1ded67
+	.file	13 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/arm/boolean.h" md5 0x4fac68d3a7d62b49cf072340a37fba11
+	.file	14 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/sys/_types/_u_int64_t.h" md5 0x466f994226288d9979ea32e237e3f3c2
+	.file	15 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/EXTERNAL_HEADERS/stdint.h" md5 0x345854274314d07d93bd249cd3cabd4e
+	.file	16 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/thread.h" md5 0x7d7cebe2edfd45fa14c1dd6653bed932
+	.file	17 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/queue.h" md5 0x1c2067b48d7f0ca3dbb90b144e61509f
+	.file	18 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/priority_queue.h" md5 0x471559212cf79a59eefdd64ba9141c6d
+	.file	19 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/bits.h" md5 0x591b7d1d78601dc67824a024d12943a1
+	.file	20 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/sys/_types/_u_int16_t.h" md5 0x20fb61aa655de1ae21f6fe1799ea5928
+	.file	21 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/locks.h" md5 0x688755bae2173851d098f490e2ea8beb
+	.file	22 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/sys/_types/_u_int8_t.h" md5 0xcf25460e3a2d25a50de2bd9cd0738ad8
+	.file	23 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/arm/hw_lock_types.h" md5 0x71a0d42c7e2ec01d5c5c0b61e9dfd65b
+	.file	24 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/arm/locks.h" md5 0x56a4da99cd9f3a8d60b349dc34e01ad2
+	.file	25 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/arm/simple_lock.h" md5 0xfbe379980b509260e29f3d31820a4451
+	.file	26 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/arm/_types.h" md5 0x8bb92d14050a9b4c0206f3128e1f1984
+	.file	27 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/ipc/ipc_object.h" md5 0x96fbd0bff28bf65887392d59db6d090d
+	.file	28 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/ipc/ipc_port.h" md5 0x9a8e18610182e3eec8b3ff1ea70be4a2
+	.file	29 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/sys/_types/_u_int32_t.h" md5 0x1be414e13025ba0d11004877ba3f558a
+	.file	30 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/waitq.h" md5 0x2e0637df40f0df82508782df1d9dbc9d
+	.file	31 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/ipc/ipc_mqueue.h" md5 0x6f7bc9c1d295501649fb29325ba38b13
+	.file	32 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/message.h" md5 0x0394a038a22345062ccc628c3c49b5c8
+	.file	33 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/ipc/ipc_kmsg.h" md5 0xeef5fa6976de71705f332a889cd6ef74
+	.file	34 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/port.h" md5 0x159df5ee5e4f9df4a25d2a30bbe467a7
+	.file	35 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/libkern/os/refcnt.h" md5 0x3f8a49f4e1ee4bba2f71194c5371e37f
+	.file	36 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/sys/event.h" md5 0x62315d17ee2b69089d7f21076052328e
+	.file	37 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/sys/_types/_intptr_t.h" md5 0xcc0279e1d9c513617a89eb0ebad8f3f9
+	.file	38 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/sys/_types/_int64_t.h" md5 0xe6d85c1a9e23dbf7518ce3b162aac800
+	.file	39 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/sys/_types/_int16_t.h" md5 0x47ed3c3ac6f65bfec021ca2b7be18e7e
+	.file	40 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/sys/_types/_int32_t.h" md5 0xd23e8406e80ee79983f28509c741fa17
+	.file	41 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/ipc/ipc_space.h" md5 0xc913b2607cc276dad728ec47ab28cb89
+	.file	42 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/ipc/ipc_types.h" md5 0xd9c74ee90380d3cd05ff2c23d9677cf7
+	.file	43 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/ipc/ipc_entry.h" md5 0x4b278b1665b010c36ef617406a521938
+	.file	44 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/lock_group.h" md5 0x674e9d6a49d13f6603f75c489434a8fd
+	.file	45 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/task.h" md5 0xfc3c40df5fbf58c0d3953b61f8f4a647
+	.file	46 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/vm/vm_map.h" md5 0xab3d774c9b5dc2f45369515c4b0496ee
+	.file	47 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/vm/vm_map_store.h" md5 0x6bb9107cf170a71dfc0e06bea9805cb3
+	.file	48 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/vm/vm_page.h" md5 0x637a92ac96c5aa09d38eade0070b0d99
+	.file	49 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/vm/vm_object.h" md5 0xd780f4106d1b69cd07ad97c0b2fb578f
+	.file	50 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/vm_types.h" md5 0x9d52e9e1efdd541e8b151d3934c223a1
+	.file	51 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/clock.h" md5 0x64d7dafae7ee19eb641b33476f5d41d3
+	.file	52 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/memory_object_types.h" md5 0xb054509562d796d2482795cd9ea4a05f
+	.file	53 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/arm/kern_return.h" md5 0x2ce698c74320bf2d1b162a17b2c94182
+	.file	54 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/vm_prot.h" md5 0xc75061f06f069d902486100560be09f9
+	.file	55 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/vm_sync.h" md5 0x5ee1df60857c7a1a6bc69c1b881fbf44
+	.file	56 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/arm/pmap.h" md5 0xf38158764f2ca6bf1bfc153c3ae3f00a
+	.file	57 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/arm/pmap_public.h" md5 0x3ce490f95d7ced5e6a5059c55616deb8
+	.file	58 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/mach_types.h" md5 0x5f7a9a7bce0f3b420fb590815bf6e72a
+	.file	59 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/vm_statistics.h" md5 0xe01fcbc9a8ce8169ab1584e67b9b39bf
+	.file	60 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/exception.h" md5 0xadf83b1179b71a2389ea3e5c1af07964
+	.file	61 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/thread_status.h" md5 0xa5ac9980eb3d8ed845fec84acb0c862b
+	.file	62 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/exception_types.h" md5 0x51fa50bb865bf0a5403495d8c74b5f97
+	.file	63 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/security/security/_label.h" md5 0x91ab112d779e321f5cff547decc34709
+	.file	64 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/kern_cdata.h" md5 0xa0e2edc146192a5f9fb118c39e629fae
+	.file	65 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/sys/_types/_int8_t.h" md5 0xc557e2bc92889fdc0231ac8d1999a00c
+	.file	66 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/call_entry.h" md5 0xb40402f6527d8856d23da705e5f895af
+	.file	67 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/atm/atm_internal.h" md5 0x0b8acef50172beab84a5d5a83f7c6fa2
+	.file	68 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/bank/bank_internal.h" md5 0x03fc9b4f49bb308d12126407b47e66db
+	.file	69 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/bank/bank_types.h" md5 0xc10e4a96dcee07241c8b394da0a021b9
+	.file	70 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/task_policy.h" md5 0xd8acfbe6d8a38af29ea5fcadcb6b19ce
+	.file	71 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/thread_info.h" md5 0x64e8a76b4bf8e5061588780e1da0d6db
+	.file	72 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/prng/random.h" md5 0xa407a17edf4aa57b6d7e74366e367aeb
+	.file	73 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/sfi_class.h" md5 0x1625c059c824f142f92ae87bd4d5ba5d
+	.file	74 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/timer_call.h" md5 0xe3eec0ab9bba16234f65abff2c9e7d60
+	.file	75 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/timer.h" md5 0x5decac15159c74a60301008fc7037fe9
+	.file	76 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/processor_data.h" md5 0x1a2f1cbe6d8868baaca9cddf161245a2
+	.file	77 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/EXTERNAL_HEADERS/stdarg.h" md5 0xab42d95d8f322e9ed9aca572f02c01cb
+	.file	78 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/ast.h" md5 0xf7352d20db3609759dc3c2a38dd885fa
+	.file	79 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/affinity.h" md5 0x0c5475ecdce74fb85ca41f4a7171adaf
+	.file	80 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/arm/thread_status.h" md5 0x739c811c3e9fc07711a32945bd6168a4
+	.file	81 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/arm/thread.h" md5 0x2670b38dd16e0dda7e52b907ee471a11
+	.file	82 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/arm/_structs.h" md5 0x6598697734a35e60c6bce1c4a17a5bb2
+	.file	83 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/thread_policy.h" md5 0x9a9a3979cef66246e39ae781d181a7e9
+	.file	84 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/bsd/arm/types.h" md5 0x24e647d7ae8b4782ab04825f51772f01
+	.file	85 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/ipc/ipc_voucher.h" md5 0x892ffc2b4974f6cdd33f97c115383084
+	.file	86 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/mach_voucher_types.h" md5 0x9b164549d14fa2a2e3a354f7fef9e67b
+	.file	87 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/block_hint.h" md5 0xd9cca9ee2b9ab2a822af67ce046b43cf
+	.file	88 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/pexpert/pexpert/pexpert.h" md5 0xb51f74a29923813b5df9535a471c1344
+	.file	89 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build/obj" "EXPORT_HDRS/iokit/IOKit/IOInterrupts.h" md5 0x1adb7da9dafbaee357db090a4f94b6d5
+	.file	90 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/kern/mpqueue.h" md5 0x5f5596219192fae1a594f2391c78e483
+	.file	91 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/arm/rtclock.h" md5 0xe35ef611e97243c8249bced1221c5437
+	.file	92 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/mach/mach_time.h" md5 0xfc0a5f9ed663bcbf9a88d6e1a72cfda5
+	.file	93 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/arm/dbgwrap.h" md5 0xf3c64c84d9588c9c47ec1f78d90d562f
+	.globl	_main                           ; -- Begin function main
+	.p2align	4
+_main:                                  ; @main
+Lfunc_begin0:
+	.cfi_sections .debug_frame
+	.cfi_startproc
+; %bb.0:
+	;DEBUG_VALUE: main:argc <- $w0
+	;DEBUG_VALUE: main:argv <- $x1
+	.file	94 "/Users/runner/work/j3-ios-xnu/j3-ios-xnu/.xnu-build" "src/xnu-4903.270.47/osfmk/arm64/genassym.c" md5 0x89d2d691a054eb3965e4d9febaba02d6
+	.loc	94 429 2 prologue_end           ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:429:2
+	mov	w0, wzr
+Ltmp0:
+	;DEBUG_VALUE: main:argc <- [DW_OP_LLVM_entry_value 1] $w0
+	.loc	94 115 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:115:2
+	; InlineAsm Start
+DEFINITION__define__T_PREFETCH_ABT:
+	.byte	51
+	; InlineAsm End
+	.loc	94 116 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:116:2
+	; InlineAsm Start
+DEFINITION__define__T_DATA_ABT:
+	.byte	52
+	; InlineAsm End
+	.loc	94 118 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:118:2
+	; InlineAsm Start
+DEFINITION__define__AST_URGENT:
+	.byte	52
+	; InlineAsm End
+	.loc	94 119 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:119:2
+	; InlineAsm Start
+DEFINITION__define__AST_PREEMPTION:
+	.byte	55
+	; InlineAsm End
+	.loc	94 121 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:121:2
+	; InlineAsm Start
+DEFINITION__define__TH_RECOVER:
+	.ascii	"856"
+	; InlineAsm End
+	.loc	94 122 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:122:2
+	; InlineAsm Start
+DEFINITION__define__TH_CONTINUATION:
+	.ascii	"136"
+	; InlineAsm End
+	.loc	94 123 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:123:2
+	; InlineAsm Start
+DEFINITION__define__TH_KERNEL_STACK:
+	.ascii	"152"
+	; InlineAsm End
+	.loc	94 124 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:124:2
+	; InlineAsm Start
+DEFINITION__define__TH_KSTACKPTR:
+	.ascii	"1144"
+	; InlineAsm End
+	.loc	94 125 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:125:2
+	; InlineAsm Start
+DEFINITION__define__THREAD_UTHREAD:
+	.ascii	"976"
+	; InlineAsm End
+	.loc	94 127 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:127:2
+	; InlineAsm Start
+DEFINITION__define__TASK_MACH_EXC_PORT:
+	.ascii	"512"
+	; InlineAsm End
+	.loc	94 131 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:131:2
+	; InlineAsm Start
+DEFINITION__define__ACT_TASK:
+	.ascii	"896"
+	; InlineAsm End
+	.loc	94 132 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:132:2
+	; InlineAsm Start
+DEFINITION__define__ACT_CONTEXT:
+	.ascii	"1120"
+	; InlineAsm End
+	.loc	94 133 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:133:2
+	; InlineAsm Start
+DEFINITION__define__ACT_UPCB:
+	.ascii	"1128"
+	; InlineAsm End
+	.loc	94 135 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:135:2
+	; InlineAsm Start
+DEFINITION__define__ACT_UNEON:
+	.ascii	"1136"
+	; InlineAsm End
+	.loc	94 137 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:137:2
+	; InlineAsm Start
+DEFINITION__define__TH_CTH_SELF:
+	.ascii	"1176"
+	; InlineAsm End
+	.loc	94 138 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:138:2
+	; InlineAsm Start
+DEFINITION__define__TH_CTH_DATA:
+	.ascii	"1184"
+	; InlineAsm End
+	.loc	94 139 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:139:2
+	; InlineAsm Start
+DEFINITION__define__ACT_PREEMPT_CNT:
+	.ascii	"1160"
+	; InlineAsm End
+	.loc	94 140 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:140:2
+	; InlineAsm Start
+DEFINITION__define__ACT_CPUDATAP:
+	.ascii	"1152"
+	; InlineAsm End
+	.loc	94 141 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:141:2
+	; InlineAsm Start
+DEFINITION__define__ACT_MAP:
+	.ascii	"904"
+	; InlineAsm End
+	.loc	94 142 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:142:2
+	; InlineAsm Start
+DEFINITION__define__ACT_DEBUGDATA:
+	.ascii	"1168"
+	; InlineAsm End
+	.loc	94 143 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:143:2
+	; InlineAsm Start
+DEFINITION__define__TH_IOTIER_OVERRIDE:
+	.ascii	"208"
+	; InlineAsm End
+	.loc	94 144 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:144:2
+	; InlineAsm Start
+DEFINITION__define__TH_RWLOCK_CNT:
+	.ascii	"240"
+	; InlineAsm End
+	.loc	94 145 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:145:2
+	; InlineAsm Start
+DEFINITION__define__TH_SCHED_FLAGS:
+	.ascii	"192"
+	; InlineAsm End
+	.loc	94 146 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:146:2
+	; InlineAsm Start
+DEFINITION__define__TH_SFLAG_RW_PROMOTED_BIT:
+	.ascii	"10"
+	; InlineAsm End
+	.loc	94 148 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:148:2
+	; InlineAsm Start
+DEFINITION__define__TH_MACH_SYSCALLS:
+	.ascii	"1076"
+	; InlineAsm End
+	.loc	94 149 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:149:2
+	; InlineAsm Start
+DEFINITION__define__TH_UNIX_SYSCALLS:
+	.ascii	"1072"
+	; InlineAsm End
+	.loc	94 150 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:150:2
+	; InlineAsm Start
+DEFINITION__define__TASK_BSD_INFO:
+	.ascii	"872"
+	; InlineAsm End
+	.loc	94 152 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:152:2
+	; InlineAsm Start
+DEFINITION__define__MACH_TRAP_TABLE_COUNT:
+	.ascii	"128"
+	; InlineAsm End
+	.loc	94 153 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:153:2
+	; InlineAsm Start
+DEFINITION__define__MACH_TRAP_TABLE_ENTRY_SIZE:
+	.ascii	"40"
+	; InlineAsm End
+	.loc	94 155 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:155:2
+	; InlineAsm Start
+DEFINITION__define__MAP_PMAP:
+	.ascii	"72"
+	; InlineAsm End
+	.loc	94 157 2                        ; src/xnu-4903.270.47/osfmk/arm64/genassym.c:157:2
+	; InlineAsm Start
+DEFINITION__defin

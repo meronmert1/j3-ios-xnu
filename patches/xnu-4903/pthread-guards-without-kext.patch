@@ -1,0 +1,268 @@
+Let a kernel with no pthread kext finish bsd_init instead of panicking.
+
+bsd_init() reaches, without even a trace line in front of it:
+
+    bsd/kern/bsd_init.c:788
+        pthread_init();
+
+and that is:
+
+    bsd/pthread/pthread_shims.c
+        void
+        pthread_init(void)
+        {
+                if (!pthread_functions) {
+                        panic("pthread kernel extension not loaded "
+                              "(function table is NULL).");
+                }
+                pthread_functions->pthread_init();
+        }
+
+pthread_functions is filled in by pthread_kext_register(), whose only caller
+lives in com.apple.kec.pthread -- the kext half of Apple's libpthread project,
+which is not part of xnu. A kernel built from this tree alone has no kexts, so
+the table stays NULL and the boot dies at that line. It is the same shape of
+problem as read_random() needing corecrypto, and it is handled the same way.
+
+Nineteen entry points in that file dereference the table. The table itself is
+not worth stubbing: struct pthread_functions_s is about a hundred and ten
+function pointers with a compile-time assert on its size, so a stub would be a
+hundred no-op functions that still cannot do any of the work, and a mistake in
+it would show up as a wild call rather than an error. Guarding the entry points
+is smaller, and it fails in a way that names what is missing.
+
+So:
+
+  - pthread_init() prints one line and returns instead of panicking;
+  - pth_proc_hashinit() and pth_proc_hashdelete(), which fork and exit call on
+    every process, become no-ops;
+  - the bsdthread_* and psynch_* syscalls return ENOTSUP, which is already the
+    idiom in this file for the ones Apple never implemented (psynch_rw_upgrade,
+    psynch_rw_downgrade, psynch_rw_unlock2);
+  - kdp_pthread_find_owner() and kdp_pthread_get_thread_kwq() return without
+    touching the table, so a panic stackshot cannot fault on it.
+
+In bsdthread_register() and bsdthread_terminate() the guard goes after the
+existing declarations rather than at the top of the block, so that no statement
+precedes a declaration. Neither function can do anything meaningful before the
+guard: the work in both is behind the table.
+
+What this buys is the rest of bsd_init, which is worth having -- the next thing
+of substance after this line is vfs_mountroot(). What it does not buy is a
+working userland. libpthread's runtime calls bsdthread_register() during the
+startup of every process, so the first thing that runs will get ENOTSUP and
+nothing threaded will work. That is not a reason to keep the panic: there is no
+root filesystem to run anything from yet. When there is one, the kern/ half of
+libpthread has to be built into this kernel, and these guards then simply stop
+being taken.
+
+--- a/bsd/pthread/pthread_shims.c
++++ b/bsd/pthread/pthread_shims.c
+@@ -308,13 +308,23 @@
+ 	return kr;
+ }
+ 
++/*
++ * This kernel is built without the pthread kernel extension, so nothing ever
++ * calls pthread_kext_register() and pthread_functions stays NULL. Every shim
++ * below dereferences it; see the patch header for why the table is guarded
++ * rather than stubbed out.
++ */
++#define PTHREAD_KEXT_ABSENT()   (pthread_functions == NULL)
++
+ /* kernel (core) to kext shims */
+ 
+ void
+ pthread_init(void)
+ {
+-	if (!pthread_functions) {
+-		panic("pthread kernel extension not loaded (function table is NULL).");
++	if (PTHREAD_KEXT_ABSENT()) {
++		printf("pthread: kernel extension not loaded; pthread and "
++		    "workqueue syscalls will return ENOTSUP\n");
++		return;
+ 	}
+ 	pthread_functions->pthread_init();
+ }
+@@ -322,12 +332,18 @@
+ void
+ pth_proc_hashinit(proc_t p)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return;
++	}
+ 	pthread_functions->pth_proc_hashinit(p);
+ }
+ 
+ void
+ pth_proc_hashdelete(proc_t p)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return;
++	}
+ 	pthread_functions->pth_proc_hashdelete(p);
+ }
+ 
+@@ -335,6 +351,9 @@
+ int
+ bsdthread_create(struct proc *p, struct bsdthread_create_args *uap, user_addr_t *retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->bsdthread_create(p, uap->func, uap->func_arg, uap->stack, uap->pthread, uap->flags, retval);
+ }
+ 
+@@ -344,6 +363,10 @@
+ 	kern_return_t kr;
+ 	static_assert(offsetof(struct bsdthread_register_args, threadstart) + sizeof(user_addr_t) ==
+ 	    offsetof(struct bsdthread_register_args, wqthread));
++
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	kr = machine_thread_function_pointers_convert_from_user(current_thread(), &uap->threadstart, 2);
+ 	assert(kr == KERN_SUCCESS);
+ 
+@@ -364,6 +387,10 @@
+ bsdthread_terminate(struct proc *p, struct bsdthread_terminate_args *uap, int32_t *retval)
+ {
+ 	thread_t th = current_thread();
++
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	if (thread_get_tag(th) & THREAD_TAG_WORKQUEUE) {
+ 		workq_thread_terminate(p, get_bsdthread_info(th));
+ 	}
+@@ -373,6 +400,9 @@
+ int
+ thread_selfid(struct proc *p, __unused struct thread_selfid_args *uap, uint64_t *retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->thread_selfid(p, retval);
+ }
+ 
+@@ -381,54 +411,81 @@
+ int
+ psynch_mutexwait(proc_t p, struct psynch_mutexwait_args *uap, uint32_t *retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->psynch_mutexwait(p, uap->mutex, uap->mgen, uap->ugen, uap->tid, uap->flags, retval);
+ }
+ 
+ int
+ psynch_mutexdrop(proc_t p, struct psynch_mutexdrop_args *uap, uint32_t *retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->psynch_mutexdrop(p, uap->mutex, uap->mgen, uap->ugen, uap->tid, uap->flags, retval);
+ }
+ 
+ int
+ psynch_cvbroad(proc_t p, struct psynch_cvbroad_args *uap, uint32_t *retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->psynch_cvbroad(p, uap->cv, uap->cvlsgen, uap->cvudgen, uap->flags, uap->mutex, uap->mugen, uap->tid, retval);
+ }
+ 
+ int
+ psynch_cvsignal(proc_t p, struct psynch_cvsignal_args *uap, uint32_t *retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->psynch_cvsignal(p, uap->cv, uap->cvlsgen, uap->cvugen, uap->thread_port, uap->mutex, uap->mugen, uap->tid, uap->flags, retval);
+ }
+ 
+ int
+ psynch_cvwait(proc_t p, struct psynch_cvwait_args * uap, uint32_t * retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->psynch_cvwait(p, uap->cv, uap->cvlsgen, uap->cvugen, uap->mutex, uap->mugen, uap->flags, uap->sec, uap->nsec, retval);
+ }
+ 
+ int
+ psynch_cvclrprepost(proc_t p, struct psynch_cvclrprepost_args * uap, int *retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->psynch_cvclrprepost(p, uap->cv, uap->cvgen, uap->cvugen, uap->cvsgen, uap->prepocnt, uap->preposeq, uap->flags, retval);
+ }
+ 
+ int
+ psynch_rw_longrdlock(proc_t p, struct psynch_rw_longrdlock_args * uap, uint32_t *retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->psynch_rw_longrdlock(p, uap->rwlock, uap->lgenval, uap->ugenval, uap->rw_wc, uap->flags, retval);
+ }
+ 
+ int
+ psynch_rw_rdlock(proc_t p, struct psynch_rw_rdlock_args * uap, uint32_t * retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->psynch_rw_rdlock(p, uap->rwlock, uap->lgenval, uap->ugenval, uap->rw_wc, uap->flags, retval);
+ }
+ 
+ int
+ psynch_rw_unlock(proc_t p, struct psynch_rw_unlock_args *uap, uint32_t *retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->psynch_rw_unlock(p, uap->rwlock, uap->lgenval, uap->ugenval, uap->rw_wc, uap->flags, retval);
+ }
+ 
+@@ -441,12 +498,18 @@
+ int
+ psynch_rw_wrlock(proc_t p, struct psynch_rw_wrlock_args *uap, uint32_t *retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->psynch_rw_wrlock(p, uap->rwlock, uap->lgenval, uap->ugenval, uap->rw_wc, uap->flags, retval);
+ }
+ 
+ int
+ psynch_rw_yieldwrlock(proc_t p, struct psynch_rw_yieldwrlock_args *uap, uint32_t *retval)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return ENOTSUP;
++	}
+ 	return pthread_functions->psynch_rw_yieldwrlock(p, uap->rwlock, uap->lgenval, uap->ugenval, uap->rw_wc, uap->flags, retval);
+ }
+ 
+@@ -465,6 +528,9 @@
+ void
+ kdp_pthread_find_owner(thread_t thread, struct stackshot_thread_waitinfo *waitinfo)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return;
++	}
+ 	if (pthread_functions->pthread_find_owner) {
+ 		pthread_functions->pthread_find_owner(thread, waitinfo);
+ 	}
+@@ -473,6 +539,9 @@
+ void *
+ kdp_pthread_get_thread_kwq(thread_t thread)
+ {
++	if (PTHREAD_KEXT_ABSENT()) {
++		return NULL;
++	}
+ 	if (pthread_functions->pthread_get_thread_kwq) {
+ 		return pthread_functions->pthread_get_thread_kwq(thread);
+ 	}
