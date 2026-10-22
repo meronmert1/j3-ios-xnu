@@ -75,6 +75,20 @@ Undefining both restores exactly the environment the code was written for.
 MakeInc.rule puts ${$@_CFLAGS_ADD} after ${CFLAGS} on the command line
 (C_RULE_1A), so the -U wins over the -D.
 
+Undefining XNU_KERNEL_PRIVATE flips one more line, in osfmk/kern/debug.h:
+
+    #ifndef XNU_KERNEL_PRIVATE
+    #include <TargetConditionals.h>
+    #endif
+
+That include exists for kexts, which are compiled against the SDK and have
+the header; a kernel build has no userland headers on its include path, and
+putting them there to satisfy one include would cost far more than it buys.
+debug.h does not read a single TARGET_OS macro -- the include is purely for
+whoever includes debug.h -- so this patch adds a small stand-in beside the
+staged sources, reachable through the -I they already have, and defines the
+macros from the kernel's own CONFIG_EMBEDDED rather than leaving them absent.
+
 This patch needs pthread-guards-without-kext.patch, which applies before it and
 leaves pthread_init() able to survive a NULL table. The two are deliberately
 separate and independently removable: the guards are what keeps the boot alive
@@ -168,3 +182,49 @@ userland process registering its thread start routines.
  	if (PTHREAD_KEXT_ABSENT()) {
  		printf("pthread: kernel extension not loaded; pthread and "
  		    "workqueue syscalls will return ENOTSUP\n");
+--- /dev/null
++++ b/bsd/pthread/kext/TargetConditionals.h
+@@ -0,0 +1,43 @@
++/*
++ * TargetConditionals.h -- stand-in for the SDK header of the same name.
++ *
++ * This is not an Apple file. The pthread kext sources staged beside it are
++ * compiled with -UXNU_KERNEL_PRIVATE, because they are written against the
++ * KPI view of xnu's headers (see the patch that adds them). That flips one
++ * line in osfmk/kern/debug.h:
++ *
++ *     #ifndef XNU_KERNEL_PRIVATE
++ *     #include <TargetConditionals.h>
++ *     #endif
++ *
++ * which is there for kexts, who are compiled against the SDK and have it.
++ * A kernel build does not: the include path has no userland headers on it,
++ * and putting them there to satisfy one include would be a bad trade.
++ *
++ * Nothing in debug.h or in the staged sources reads any TARGET_OS macro, so
++ * an empty file would do. The macros are defined anyway, because an absent
++ * macro in an #if is silently zero, and a wrong answer that says nothing is
++ * worse than no answer. They follow the kernel's own CONFIG_EMBEDDED, which
++ * config/MASTER.arm64 sets for every arm64 configuration.
++ */
++
++#ifndef _TARGETCONDITIONALS_H_
++#define _TARGETCONDITIONALS_H_
++
++#define TARGET_OS_MAC           1
++
++#if CONFIG_EMBEDDED
++#define TARGET_OS_OSX           0
++#define TARGET_OS_IPHONE        1
++#define TARGET_OS_EMBEDDED      1
++#else
++#define TARGET_OS_OSX           1
++#define TARGET_OS_IPHONE        0
++#define TARGET_OS_EMBEDDED      0
++#endif
++
++#define TARGET_OS_SIMULATOR     0
++#define TARGET_OS_WIN32         0
++#define TARGET_OS_UNIX          0
++
++#endif /* _TARGETCONDITIONALS_H_ */
