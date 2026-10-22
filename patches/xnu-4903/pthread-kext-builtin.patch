@@ -274,7 +274,7 @@ userland process registering its thread start routines.
  
 --- a/bsd/pthread/kext/kern/pthread_support.c
 +++ b/bsd/pthread/kext/kern/pthread_support.c
-@@ -327,6 +327,43 @@
+@@ -327,6 +327,45 @@
  
  		(void)pthread_kern->thread_set_wq_state32(th, (thread_state_t)&state);
  	}
@@ -290,19 +290,21 @@ userland process registering its thread start routines.
 +	 *         unsigned int flags)
 +	 *
 +	 * AAPCS64 has no red zone, so sp is the stack top as handed in, where
-+	 * x86-64 has to subtract C_64_REDZONE_LEN.
++	 * x86-64 has to subtract C_64_REDZONE_LEN. The field names carry no
++	 * leading underscores because __DARWIN_UNIX03 is 0 in a kernel build,
++	 * which is also why osfmk/arm64/status.c spells them this way.
 +	 */
 +	if (proc_is64bit_data(p)) {
 +		arm_thread_state64_t state = {
-+			.__pc   = (uint64_t)pthread_kern->proc_get_threadstart(p),
-+			.__x[0] = (uint64_t)user_pthread,
-+			.__x[1] = (uint64_t)th_thport,
-+			.__x[2] = (uint64_t)user_func,
-+			.__x[3] = (uint64_t)user_funcarg,
-+			.__x[4] = (uint64_t)user_stack,
-+			.__x[5] = (uint64_t)flags,
++			.pc   = (uint64_t)pthread_kern->proc_get_threadstart(p),
++			.x[0] = (uint64_t)user_pthread,
++			.x[1] = (uint64_t)th_thport,
++			.x[2] = (uint64_t)user_func,
++			.x[3] = (uint64_t)user_funcarg,
++			.x[4] = (uint64_t)user_stack,
++			.x[5] = (uint64_t)flags,
 +
-+			.__sp   = (uint64_t)user_stack,
++			.sp   = (uint64_t)user_stack,
 +		};
 +
 +		(void)pthread_kern->thread_set_wq_state64(th, (thread_state_t)&state);
@@ -318,7 +320,7 @@ userland process registering its thread start routines.
  #else
  #error bsdthread_create  not defined for this architecture
  #endif
-@@ -755,6 +792,34 @@
+@@ -755,6 +794,34 @@
  			panic(__func__ ": thread_set_wq_state failed: %d", error);
  		}
  	}
@@ -332,15 +334,15 @@ userland process registering its thread start routines.
 +	 */
 +	if (proc_is64bit_data(p)) {
 +		arm_thread_state64_t state = {
-+			.__pc   = (uint64_t)wqstart_fnptr,
-+			.__x[0] = /* arg0 */ (uint64_t)addrs->self,
-+			.__x[1] = /* arg1 */ (uint64_t)kport,
-+			.__x[2] = /* arg2 */ (uint64_t)addrs->stack_bottom,
-+			.__x[3] = /* arg3 */ (uint64_t)kevent_list,
-+			.__x[4] = /* arg4 */ (uint64_t)upcall_flags,
-+			.__x[5] = /* arg5 */ (uint64_t)kevent_count,
++			.pc   = (uint64_t)wqstart_fnptr,
++			.x[0] = /* arg0 */ (uint64_t)addrs->self,
++			.x[1] = /* arg1 */ (uint64_t)kport,
++			.x[2] = /* arg2 */ (uint64_t)addrs->stack_bottom,
++			.x[3] = /* arg3 */ (uint64_t)kevent_list,
++			.x[4] = /* arg4 */ (uint64_t)upcall_flags,
++			.x[5] = /* arg5 */ (uint64_t)kevent_count,
 +
-+			.__sp   = (uint64_t)addrs->stack_top,
++			.sp   = (uint64_t)addrs->stack_top,
 +		};
 +
 +		int error = pthread_kern->thread_set_wq_state64(th, (thread_state_t)&state);
