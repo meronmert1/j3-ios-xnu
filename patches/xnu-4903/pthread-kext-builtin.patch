@@ -112,6 +112,45 @@ define. The staged sources are the first translation units here that do not,
 so the declaration is given the guard its own types already have. Nothing
 that has XNU_KERNEL_PRIVATE sees any change.
 
+Two more things follow from compiling with the KPI view.
+
+xnu's bsd/pthread/priority_private.h and bsd/pthread/workqueue_syscalls.h
+hide everything behind __PTHREAD_EXPOSE_INTERNALS__:
+
+    #if XNU_KERNEL_PRIVATE && !defined(__PTHREAD_EXPOSE_INTERNALS__)
+    #define __PTHREAD_EXPOSE_INTERNALS__ 1
+    #endif
+    #ifdef __PTHREAD_EXPOSE_INTERNALS__
+    ... everything ...
+    #endif
+
+Undefining XNU_KERNEL_PRIVATE takes that self-definition with it and both
+headers arrive empty. So it is asked for by name instead, which is exactly
+what libpthread's own kext build does.
+
+And the arm64 register setup is missing from the open source release. In
+_bsdthread_create() and _setup_wqthread(), every published libpthread --
+301.50.1, 330.201.1, 330.230.1, 330.250.2 -- has an i386/x86_64 block and
+then
+
+    #else
+    #error bsdthread_create  not defined for this architecture
+    #endif
+
+with no arm branch at all, although the arm stack-address hint further up the
+same file is present. The branches are written here from the x86-64 block,
+which names its argument order explicitly: those are the System V argument
+registers in order, so the AAPCS64 equivalents are x0 through x5, and the
+entry point goes in pc with the stack top in sp. AAPCS64 has no red zone, so
+sp is the stack top unmodified where x86-64 subtracts C_64_REDZONE_LEN.
+
+This is the one part of this patch that is reconstructed rather than
+transplanted, and it cannot be exercised until a userland process calls
+bsdthread_create. A 32-bit process would need arguments five and six spilled
+onto its stack under AAPCS32; rather than guess that, _bsdthread_create
+returns ENOTSUP and _setup_wqthread panics. An arm64 iOS 12 userland has no
+32-bit processes, so neither path should ever be taken.
+
 This patch needs pthread-guards-without-kext.patch, which applies before it and
 leaves pthread_init() able to survive a NULL table. The two are deliberately
 separate and independently removable: the guards are what keeps the boot alive
@@ -145,7 +184,7 @@ userland process registering its thread start routines.
  ./init_sysent.c				standard
 --- a/bsd/conf/Makefile.template
 +++ b/bsd/conf/Makefile.template
-@@ -83,6 +83,27 @@
+@@ -83,6 +83,36 @@
  pthread_synch.o_CFLAGS_ADD		+= -Wno-unused-parameter -Wno-missing-prototypes
  pthread_support.o_CFLAGS_ADD		+= -Wno-unused-parameter -Wno-missing-prototypes
  
@@ -169,6 +208,15 @@ userland process registering its thread start routines.
 +pthread_kext.o_CFLAGS_ADD		+= -UXNU_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE
 +pthread_support.o_CFLAGS_ADD		+= -UXNU_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE
 +pthread_synch.o_CFLAGS_ADD		+= -UXNU_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE
++
++# xnu's own pthread headers hide their contents behind
++# __PTHREAD_EXPOSE_INTERNALS__, which they define for themselves when
++# XNU_KERNEL_PRIVATE is set. Undefining that above takes the definitions with
++# it, so it is asked for by name -- which is what libpthread's own kext build
++# does. Without it, priority_private.h and workqueue_syscalls.h arrive empty.
++pthread_kext.o_CFLAGS_ADD		+= -D__PTHREAD_EXPOSE_INTERNALS__=1
++pthread_support.o_CFLAGS_ADD		+= -D__PTHREAD_EXPOSE_INTERNALS__=1
++pthread_synch.o_CFLAGS_ADD		+= -D__PTHREAD_EXPOSE_INTERNALS__=1
 +
  # Objects that don't want -Wsign-compare
  OBJS_NO_SIGN_COMPARE =		\
@@ -224,6 +272,87 @@ userland process registering its thread start routines.
  #endif
  
  
+--- a/bsd/pthread/kext/kern/pthread_support.c
++++ b/bsd/pthread/kext/kern/pthread_support.c
+@@ -327,6 +327,43 @@
+ 
+ 		(void)pthread_kern->thread_set_wq_state32(th, (thread_state_t)&state);
+ 	}
++#elif defined(__arm64__)
++	/*
++	 * The arm64 register setup is not in the open source release; it is
++	 * written out here from the x86-64 block above, which names the argument
++	 * order explicitly. Those are the System V argument registers in order,
++	 * so the AAPCS64 equivalents are x0 through x5:
++	 *
++	 *     _pthread_start(pthread_t self, mach_port_t kport,
++	 *         void *(*fun)(void *), void *arg, size_t stacksize,
++	 *         unsigned int flags)
++	 *
++	 * AAPCS64 has no red zone, so sp is the stack top as handed in, where
++	 * x86-64 has to subtract C_64_REDZONE_LEN.
++	 */
++	if (proc_is64bit_data(p)) {
++		arm_thread_state64_t state = {
++			.__pc   = (uint64_t)pthread_kern->proc_get_threadstart(p),
++			.__x[0] = (uint64_t)user_pthread,
++			.__x[1] = (uint64_t)th_thport,
++			.__x[2] = (uint64_t)user_func,
++			.__x[3] = (uint64_t)user_funcarg,
++			.__x[4] = (uint64_t)user_stack,
++			.__x[5] = (uint64_t)flags,
++
++			.__sp   = (uint64_t)user_stack,
++		};
++
++		(void)pthread_kern->thread_set_wq_state64(th, (thread_state_t)&state);
++	} else {
++		/*
++		 * A 32-bit process on an arm64 kernel. iOS 12 has no such thing,
++		 * and guessing the AAPCS32 spill of arguments five and six onto
++		 * the user stack is a worse answer than refusing.
++		 */
++		error = ENOTSUP;
++		goto out;
++	}
+ #else
+ #error bsdthread_create  not defined for this architecture
+ #endif
+@@ -755,6 +792,34 @@
+ 			panic(__func__ ": thread_set_wq_state failed: %d", error);
+ 		}
+ 	}
++#elif defined(__arm64__)
++	/*
++	 * As in _bsdthread_create above: the argument order is the one the
++	 * x86-64 block spells out, mapped onto the AAPCS64 registers.
++	 *
++	 *     _pthread_wqthread(pthread_t self, mach_port_t kport,
++	 *         void *stackaddr, void *keventlist, int flags, int nkevents)
++	 */
++	if (proc_is64bit_data(p)) {
++		arm_thread_state64_t state = {
++			.__pc   = (uint64_t)wqstart_fnptr,
++			.__x[0] = /* arg0 */ (uint64_t)addrs->self,
++			.__x[1] = /* arg1 */ (uint64_t)kport,
++			.__x[2] = /* arg2 */ (uint64_t)addrs->stack_bottom,
++			.__x[3] = /* arg3 */ (uint64_t)kevent_list,
++			.__x[4] = /* arg4 */ (uint64_t)upcall_flags,
++			.__x[5] = /* arg5 */ (uint64_t)kevent_count,
++
++			.__sp   = (uint64_t)addrs->stack_top,
++		};
++
++		int error = pthread_kern->thread_set_wq_state64(th, (thread_state_t)&state);
++		if (error != KERN_SUCCESS) {
++			panic(__func__ ": thread_set_wq_state failed: %d", error);
++		}
++	} else {
++		panic(__func__ ": 32-bit processes are not supported on this kernel");
++	}
+ #else
+ #error setup_wqthread  not defined for this architecture
+ #endif
 --- /dev/null
 +++ b/bsd/pthread/kext/TargetConditionals.h
 @@ -0,0 +1,43 @@
