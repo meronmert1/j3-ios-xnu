@@ -122,29 +122,36 @@ ubc_create_upl is the one HFS calls; and of the 49 _public:_real aliases in
 config/*.exports, HFS calls three -- sysctlbyname, ubc_create_upl and kalloc,
 and kalloc is a working macro inside the kernel.
 
-How the flags are applied matters, and it is not add_perfile_cflags. That
-macro, in makedefs/MakeInc.def, appends to _CWARNFLAGS_ADD:
+How the flags are applied matters, and the one C++ source makes it awkward
+twice over. hfs_iokit.cpp is the first and only .cpp in bsd/conf/files, and
+two mechanisms here are C-only.
+
+The first is add_perfile_cflags, in makedefs/MakeInc.def:
 
     define add_perfile_cflags
     $(1)_CWARNFLAGS_ADD += $2
     endef
 
-and only C_RULE_1A reads that variable -- P_RULE_1A reads _CXXWARNFLAGS_ADD.
-So everything passed that way reaches the 39 C files and silently misses
-hfs_iokit.cpp, which is the first and only C++ source in bsd/conf/files. That
-is why the first build with -UCONFIG_PROTECT still could not find
-AppleKeyStore: the guard was there and the flag was not. The defines are now
-passed through _CFLAGS_ADD, which both rules read, and the warning
-suppressions stay on their own so the C-only -Wmissing-prototypes is not
-handed to the C++ driver; hfs_iokit.o gets the rest through
-_CXXWARNFLAGS_ADD.
+Only C_RULE_1A reads _CWARNFLAGS_ADD; P_RULE_1A reads _CXXWARNFLAGS_ADD. So
+anything passed that way reaches the 39 C files and silently misses the C++
+one. The defines therefore go through _CFLAGS_ADD, which both rules read, and
+the warning suppressions are applied once to the C objects through
+add_perfile_cflags and once to the C++ object through _CXXWARNFLAGS_ADD.
+
+The second is the object's name. The conf tool builds it by replacing the
+last character of the source file name with 'o' (SETUP/config/mkmakefile.c:
+cp = sp + strlen(sp) - 1; *cp = 'o'), so a .c becomes .o and a .cpp becomes
+.cpo. The object is hfs_iokit.cpo, which is what iokit/conf/Makefile.template
+calls its own C++ objects as well. Naming it hfs_iokit.o sets variables that
+no rule ever reads, which is exactly how -UCONFIG_PROTECT came to be present
+in the makefile and absent from the command line that compiled hfs_iokit.cpp.
 
 This gets a filesystem into the kernel. It does not yet get a volume into the
 ramdisk: the image the shim carries still has to be made, and made as HFS+.
 
 --- a/bsd/conf/Makefile.template
 +++ b/bsd/conf/Makefile.template
-@@ -150,6 +150,63 @@
+@@ -150,6 +150,62 @@
  
  $(foreach file,$(OBJS_NO_SIGN_COMPARE),$(eval $(call add_perfile_cflags,$(file),-Wno-sign-compare)))
  
@@ -165,6 +172,11 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
 +#
 +# Everything else not named below is left undefined, which the sources read
 +# as off.
++#
++# Note hfs_iokit.cpo. The conf tool names an object by replacing only the
++# last character of the source file name, so a .cpp becomes .cpo -- the same
++# convention iokit/conf/Makefile.template uses. It is the one C++ source here
++# and the only one in bsd/conf/files.
 +HFS_OBJS =			\
 +		BTree.o	BTreeAllocate.o	BTreeMiscOps.o \
 +		BTreeNodeOps.o	BTreeNodeReserve.o	BTreeScanner.o \
@@ -174,36 +186,30 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
 +		hfs_btreeio.o	hfs_catalog.o	hfs_chash.o \
 +		hfs_cnode.o	hfs_cprotect.o	hfs_endian.o \
 +		hfs_extents.o	hfs_fsinfo.o	hfs_hotfiles.o \
-+		hfs_iokit.o	hfs_journal.o	hfs_key_roll.o \
++		hfs_iokit.cpo	hfs_journal.o	hfs_key_roll.o \
 +		hfs_link.o	hfs_lookup.o	hfs_notification.o \
 +		hfs_quota.o	hfs_readwrite.o	hfs_resize.o \
 +		hfs_search.o	hfs_vfsops.o	hfs_vfsutils.o \
 +		hfs_vnops.o	hfs_xattr.o	rangelist.o \
 +		hfs_encodinghint.o
 +
-+# The defines go through _CFLAGS_ADD rather than through add_perfile_cflags.
-+# That macro (makedefs/MakeInc.def) appends to _CWARNFLAGS_ADD, which only
-+# C_RULE_1A reads; P_RULE_1A reads _CXXWARNFLAGS_ADD instead. So the one C++
-+# source in this list, hfs_iokit.cpp, would silently get none of it. Both
-+# rules read _CFLAGS_ADD. The warning suppressions stay separate so the C-only
-+# ones are not handed to the C++ driver.
 +HFS_DEFINES = -I$(SRCROOT)/bsd/hfs/core -DCONFIG_HFS_STD=0 -DHFS_COMPRESSION=1 \
 +              -UCONFIG_PROTECT
 +
 +HFS_WARNFLAGS = -Wno-unused-parameter -Wno-missing-prototypes \
 +                -Wno-sign-compare -Wno-cast-align -Wno-shorten-64-to-32
 +
++# The defines go through _CFLAGS_ADD, which both C_RULE_1A and P_RULE_1A read.
++# add_perfile_cflags cannot carry them: it appends to _CWARNFLAGS_ADD, which
++# only the C rule reads, so the C++ object would silently get none of them.
 +define add_hfs_defines
 +$(1)_CFLAGS_ADD += $(2)
 +endef
 +
 +$(foreach file,$(HFS_OBJS),$(eval $(call add_hfs_defines,$(file),$(HFS_DEFINES))))
-+$(foreach file,$(HFS_OBJS),$(eval $(call add_perfile_cflags,$(file),$(HFS_WARNFLAGS))))
++$(foreach file,$(filter-out hfs_iokit.cpo,$(HFS_OBJS)),$(eval $(call add_perfile_cflags,$(file),$(HFS_WARNFLAGS))))
 +
-+# hfs_iokit.cpp, by the variable its own rule reads. -Wmissing-prototypes is
-+# a C-only option and is left out here.
-+hfs_iokit.o_CXXWARNFLAGS_ADD += -Wno-unused-parameter -Wno-sign-compare \
-+                                -Wno-cast-align -Wno-shorten-64-to-32
++hfs_iokit.cpo_CXXWARNFLAGS_ADD += $(HFS_WARNFLAGS)
 +
  # Objects that don't want -Wcast-align warning (8474835)
  OBJS_NO_CAST_ALIGN =			\
