@@ -1,0 +1,103 @@
+Turn on the memory device, so a RAM disk can be the root device.
+
+The kernel now boots all the way through bsd_init and stops where it should:
+
+    Waiting on <dict><key>IOProviderClass</key><string>IOMedia</string>
+               <key>Content</key><string>Apple_HFS</string></dict>
+    Still waiting for root device
+
+Nothing publishes an IOMedia, because nothing drives this board's storage.
+The way out is the memory device: bsd/dev/memdev.c turns a region of memory
+named on the command line into a block device, which is exactly the shape of
+what the shim already does -- it places the kernel, the device tree and the
+boot arguments in physical memory and could as easily place a disk image.
+
+Two things stand between that and here.
+
+First, the whole body of mdevinit() is inside
+
+    #ifdef CONFIG_MEMDEV_INSECURE
+
+and nothing in xnu-4903 defines that symbol -- not config/MASTER, not
+config/MASTER.arm64, not makedefs/MakeInc.def. The function compiles to
+nothing. The name is Apple's own warning: the boot arguments can point the
+device at any physical address, so a kernel built this way will hand out
+whatever is there. That is a real objection to shipping it and no objection
+at all to a bring-up kernel that has no security model yet and whose whole
+boot chain is already a custom shim.
+
+Second, and less obvious: mdevinit() is never called. Across the entire tree
+there are exactly three mentions of the name -- its prototype in memdev.c,
+its definition in memdev.c, and a stale prototype in bsd/dev/memdev.h that
+has a different signature and is included by nothing. So defining the macro
+alone would still leave the parser unreached.
+
+The call goes into bsd_init() right after inittodr(), which is after
+vfsinit() -- mdevadd() makes devfs nodes -- and immediately before the
+"Mount the root file system" loop, which is where setconf() runs
+IOFindBSDRoot(). It sits outside that loop deliberately: the loop retries,
+and a second mdevinit() would panic in mdevadd() on a device it had already
+added.
+
+The boot arguments mdevinit() looks for are
+
+    pmd<N>=<base>.<size>     a device in physical memory
+    vmd<N>=<base>.<size>     a device in the kernel's virtual memory
+
+with N a hex digit, base and size hex and both page aligned. pmd is the one
+that matches what the shim can do. Worth knowing: it scans only the first 256
+bytes of the command line, so the memory device argument belongs near the
+front of a long one.
+
+With this in, a root RAM disk needs three more things, none of them here:
+the image has to be placed and its address passed (the shim), rd=md0 has to
+name it as the root device (a boot argument), and the kernel has to be able
+to mount what is in it -- which means HFS, which Apple moved out of xnu after
+10.12 and which this tree therefore does not have.
+
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -80,6 +80,11 @@
+ ubc_subr.o_CFLAGS_ADD			+= -Wshorten-64-to-32
+ vnode_pager.o_CFLAGS_ADD		+= -Wshorten-64-to-32
+ vm_unix.o_CFLAGS_ADD			+= -Wshorten-64-to-32
++
++# The memory device is compiled out unless CONFIG_MEMDEV_INSECURE is defined,
++# and nothing in the tree defines it. See the patch header.
++memdev.o_CFLAGS_ADD			+= -DCONFIG_MEMDEV_INSECURE=1
++
+ pthread_synch.o_CFLAGS_ADD		+= -Wno-unused-parameter -Wno-missing-prototypes
+ pthread_support.o_CFLAGS_ADD		+= -Wno-unused-parameter -Wno-missing-prototypes
+ 
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -387,6 +387,12 @@
+ extern thread_t cloneproc(task_t, coalition_t, proc_t, int, int);
+ extern int      (*mountroot)(void);
+ 
++/*
++ * bsd/dev/memdev.c. Declared here because bsd/dev/memdev.h carries a stale
++ * prototype with a different signature and is included by nothing.
++ */
++extern void     mdevinit(int the_cnt);
++
+ lck_grp_t * proc_lck_grp;
+ lck_grp_t * proc_slock_grp;
+ lck_grp_t * proc_fdmlock_grp;
+@@ -922,6 +928,16 @@
+ 	bsd_init_kprintf("calling inittodr\n");
+ 	inittodr(0);
+ 
++	/*
++	 * Publish any memory devices named by the boot arguments, so that
++	 * setconf() below can find one when "rd=md0" asks for it. This has to
++	 * happen after vfsinit(), because mdevadd() makes devfs nodes, and
++	 * outside the retry loop, because a second call would panic on a device
++	 * it had already added.
++	 */
++	bsd_init_kprintf("calling mdevinit\n");
++	mdevinit(0);
++
+ 	/* Mount the root file system. */
+ 	while (TRUE) {
+ 		int err;
