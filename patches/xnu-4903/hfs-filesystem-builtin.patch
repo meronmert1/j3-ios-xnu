@@ -66,19 +66,33 @@ there is no collision to work around.
 
 The configuration is given as -D flags rather than through core/kext-config.h.
 That file is a prefix header (GCC_PREFIX_HEADER in core/kext.xcconfig) that no
-source includes, and it reads
+source includes, and it keys the whole configuration off TARGET_OS_EMBEDDED.
+What is defined here is deliberately small: CONFIG_HFS_STD=0, because nothing
+needs to read 1980s HFS, and HFS_COMPRESSION=1, because the kernel has decmpfs
+(config_fs_compression is in this configuration's FILESYS_BASE) and an iOS
+system volume is full of compressed files. FIFO, QUOTA, NAMEDSTREAMS,
+CONFIG_SEARCHFS and CONFIG_HFS_DIRLINK are left undefined, which the sources
+read as off. They can be turned on one at a time once a volume mounts at all.
 
-    #include <TargetConditionals.h>
-    #if TARGET_OS_EMBEDDED // iOS
-    #define CONFIG_PROTECT 1
+CONFIG_PROTECT is the one that has to be switched off rather than left out,
+with -UCONFIG_PROTECT. Leaving it out is not enough: config_protect is in this
+configuration's FILESYS_BASE, so config/MASTER defines it for the whole
+kernel, and the HFS sources pick it up. Both C_RULE_1A and P_RULE_1A put
+${$@_CFLAGS_ADD} after ${CFLAGS}, so the -U wins over the config's -D -- the
+same mechanism the pthread kext uses to get the KPI view of the headers.
 
-which on this target would turn on content protection and pull in
-AppleKeyStore key wrapping that does not exist here. Leaving it out keeps
-hfs_cprotect.c and hfs_key_roll.c as empty translation units, which is what
-they are designed to be: both files are wrapped end to end in #if
-CONFIG_PROTECT.
+Content protection has two reasons not to be on. It cannot work: every key
+operation ends in a callPlatformFunction to AppleKeyStore, which is not part
+of this kernel. And the published sources do not compile with it on --
+hfs_readwrite.c calls cp_handle_vnop(), cp_io_params(), cp_vnode_transcode()
+and cp_handle_strategy() without including hfs_cprotect.h, the only header
+that declares them, and hfs_key_roll.c reads cp_key_roll_ctx out of struct
+cprotect, where that member exists only under HFS_CONFIG_KEY_ROLL. Off, both
+hfs_cprotect.c and hfs_key_roll.c become empty translation units, which is
+what their end-to-end #if CONFIG_PROTECT is for, and every cp_* call site in
+hfs_readwrite.c disappears with them.
 
-AppleKeyStore leaks out of those two files in one place, and that is the
+One AppleKeyStore reference survives being switched off, and that is the
 second thing this patch corrects. core/hfs_iokit.h includes
 <AppleKeyStore/AppleKeyStoreFSServices.h> unconditionally, and hfs_vfsops.c
 and hfs_vfsutils.c include that header unconditionally for three functions
@@ -87,13 +101,13 @@ that need it are given the CONFIG_PROTECT guard that their only caller,
 hfs_cprotect.c, already has; the matching definitions at the end of
 hfs_iokit.cpp -- key_services() and the four wrappers -- get the same guard.
 
-What is defined is deliberately small: CONFIG_HFS_STD=0, because nothing here
-needs to read 1980s HFS, and HFS_COMPRESSION=1, because the kernel has
-decmpfs (config_fs_compression is in this configuration's FILESYS_BASE) and an
-iOS system volume is full of compressed files. FIFO, QUOTA, NAMEDSTREAMS,
-CONFIG_SEARCHFS, CONFIG_HFS_DIRLINK and CONFIG_SECLUDED_RENAME are all left
-undefined, which the sources read as off. They can be turned on one at a time
-once a volume mounts at all.
+The third correction is sysctlbyname(). hfs_journal.c calls it to size the
+transaction buffer from hw.memsize, and that call compiles in a kext because
+config/Libkern.exports maps _sysctlbyname to _kernel_sysctlbyname. Inside the
+kernel the name belongs to the syscall entry point, which takes
+(proc_t, struct sysctlbyname_args *, int32_t *), and bsd/sys/sysctl.h declares
+the five-argument form only in its !KERNEL branch. So the real function is
+declared and the name redirected to it where def_tbuffer_size is defined.
 
 The warning suppressions are the ones a 2018 filesystem needs from a 2025
 clang, and they are applied through the add_perfile_cflags mechanism this
@@ -104,7 +118,7 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
 
 --- a/bsd/conf/Makefile.template
 +++ b/bsd/conf/Makefile.template
-@@ -150,6 +150,34 @@
+@@ -150,6 +150,46 @@
  
  $(foreach file,$(OBJS_NO_SIGN_COMPARE),$(eval $(call add_perfile_cflags,$(file),-Wno-sign-compare)))
  
@@ -112,8 +126,19 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
 +# tree, so it carries its own include path. The configuration comes from here
 +# rather than from core/kext-config.h, which is a prefix header this build
 +# does not use and which would key CONFIG_PROTECT off TARGET_OS_EMBEDDED --
-+# turning on AppleKeyStore key wrapping that does not exist here. Everything
-+# not named below is left undefined, which the sources read as off.
++# turning on AppleKeyStore key wrapping that does not exist here.
++#
++# CONFIG_PROTECT has to be switched off rather than merely left out: this
++# configuration's FILESYS_BASE carries config_protect, so config/MASTER turns
++# it on for the whole kernel. Content protection cannot work here in any case
++# -- every key operation ends in an AppleKeyStore platform function -- and the
++# published sources do not even compile with it on: hfs_readwrite.c uses
++# cp_handle_vnop(), cp_io_params() and friends without including the header
++# that declares them, hfs_cprotect.h. Both C_RULE_1A and P_RULE_1A put
++# ${$@_CFLAGS_ADD} after ${CFLAGS}, so the -U wins over the config's -D.
++#
++# Everything else not named below is left undefined, which the sources read
++# as off.
 +HFS_OBJS =			\
 +		BTree.o	BTreeAllocate.o	BTreeMiscOps.o \
 +		BTreeNodeOps.o	BTreeNodeReserve.o	BTreeScanner.o \
@@ -131,6 +156,7 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
 +		hfs_encodinghint.o
 +
 +HFS_CFLAGS = -I$(SRCROOT)/bsd/hfs/core -DCONFIG_HFS_STD=0 -DHFS_COMPRESSION=1 \
++             -UCONFIG_PROTECT \
 +             -Wno-unused-parameter -Wno-missing-prototypes -Wno-sign-compare \
 +             -Wno-cast-align -Wno-shorten-64-to-32
 +
@@ -320,6 +346,28 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
  
  __END_DECLS
  
+--- a/bsd/hfs/core/hfs_journal.c
++++ b/bsd/hfs/core/hfs_journal.c
+@@ -1516,6 +1516,19 @@
+ // XXXdbg - so I can change it in the debugger
+ int def_tbuffer_size = 0;
+ 
++/*
++ * A kext's sysctlbyname() is an alias: config/Libkern.exports maps
++ * _sysctlbyname to _kernel_sysctlbyname. Inside the kernel, sysctlbyname is
++ * the syscall entry point and takes (proc_t, struct sysctlbyname_args *,
++ * int32_t *), so the name resolves to something with an entirely different
++ * signature. The function this code wants has to be named directly, and it
++ * has no header of its own -- bsd/sys/sysctl.h declares sysctlbyname only in
++ * its !KERNEL branch.
++ */
++extern int kernel_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
++                               void *newp, size_t newlen);
++#define sysctlbyname kernel_sysctlbyname
++
+ 
+ //
+ // This function sets the size of the tbuffer and the
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -387,6 +387,13 @@
