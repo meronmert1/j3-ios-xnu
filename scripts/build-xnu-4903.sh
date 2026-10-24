@@ -56,6 +56,7 @@ AVAILABILITY_REF="${AVAILABILITY_REF:-}"
 LIBDISPATCH_REF="${LIBDISPATCH_REF:-libdispatch-1008}"   # prefix match, 10.14 train
 LIBPLATFORM_REF="${LIBPLATFORM_REF:-libplatform-177}"
 LIBPTHREAD_REF="${LIBPTHREAD_REF:-libpthread-330.250.2}"   # 10.14.6 train, matches xnu-4903
+HFS_REF="${HFS_REF:-hfs-407.30.1}"                  # the 10.14 tag that still ships core/
 
 SRC_DIR="$WORK_DIR/src"
 DEPS_DIR="$WORK_DIR/deps"
@@ -133,6 +134,45 @@ apply_patches() {
             || die "patch failed: $p"
         basename "$p" >> "$applied"
     done
+}
+
+# ---------------------------------------------------------------------- hfs
+
+# xnu-4903 has no HFS. Apple moved it out of xnu after 10.12 and into its own
+# project, and bsd/vfs/vfs_conf.c here does not mention it -- which is fine,
+# because the kext registers itself with vfs_fsadd() rather than through that
+# table, and its vfs_fsentry carries VFS_TBLCANMOUNTROOT.
+#
+# Only some tags of the hfs project ship the kernel sources: hfs-407.50.6 and
+# hfs-407.200.4 have the userland tools and no core/ directory. hfs-407.30.1
+# is the 10.14-line tag that has it.
+#
+# The names are left alone. None of the 39 sources collides with an existing
+# xnu object, so unlike the pthread kext nothing needs renaming.
+#
+# core/kext-config.h is not copied: it is a prefix header (GCC_PREFIX_HEADER
+# in core/kext.xcconfig), no source includes it, and it keys the configuration
+# off TARGET_OS_EMBEDDED -- which would turn on CONFIG_PROTECT and pull in
+# AppleKeyStore key wrapping that does not exist here. The configuration is
+# passed as -D flags by the patch instead.
+#
+# The matching patch is patches/xnu-4903/hfs-filesystem-builtin.patch.
+stage_hfs() {
+    local dst="$XNU_SRC/bsd/hfs"
+    [ -f "$dst/hfs_vfsops.c" ] && { info "hfs already staged"; return 0; }
+
+    say "hfs (filesystem, built into the kernel)"
+    mkdir -p "$DEPS_DIR"
+    local d; d="$(fetch_oss hfs "$HFS_REF")" || exit 1
+
+    [ -d "$d/core" ] || die "hfs: $HFS_REF has no core/ -- wrong tag"
+
+    mkdir -p "$dst"
+    cp "$d"/core/*.c "$d"/core/*.cpp "$d"/core/*.h "$dst/" \
+        || die "hfs: could not stage core/"
+    rm -f "$dst/kext-config.h"
+
+    info "staged $(ls "$dst"/*.c "$dst"/*.cpp | wc -l | tr -d ' ') sources into bsd/hfs"
 }
 
 # -------------------------------------------------------------- pthread kext
@@ -407,6 +447,7 @@ info "SDK: $(xcrun --sdk macosx --show-sdk-path 2>/dev/null)"
 
 fetch_xnu
 stage_libpthread
+stage_hfs
 apply_patches
 patch_no_werror
 patch_ld_classic

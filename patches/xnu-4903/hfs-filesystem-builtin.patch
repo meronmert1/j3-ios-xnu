@@ -1,0 +1,259 @@
+Build HFS into the kernel, so the RAM disk can be mounted as root.
+
+The kernel reaches the root mount with a working memory device and cannot do
+anything with it:
+
+    BSD root: md0, major 2, minor 0
+    bsd_init: vfs_mountroot
+    cannot mount root, errno = 19
+
+ENODEV, because no filesystem in this tree claimed the device. xnu-4903 has
+no HFS: Apple moved it out after 10.12 and bsd/vfs/vfs_conf.c does not mention
+it anywhere. IOFindBSDRoot() asks for Apple_HFS by default, so HFS is both
+what the kernel wants and what a ramdisk image can plausibly be.
+
+The sources are staged into bsd/hfs by the build script, from hfs-407.30.1 --
+the 10.14-line tag that still ships core/. Two later tags of the same line,
+hfs-407.50.6 and hfs-407.200.4, carry only the userland tools.
+
+Registration does not go through vfs_conf.c, which is why its silence does not
+matter. The kext registers itself:
+
+    struct vfs_fsentry vfe = {
+            .vfe_vfsops = &hfs_vfsops,
+            .vfe_fsname = "hfs",
+            .vfe_flags  = ... | VFS_TBLCANMOUNTROOT | ...
+    };
+    int ret = vfs_fsadd(&vfe, &vfs_handle);
+
+VFS_TBLCANMOUNTROOT is already there, so nothing has to be added for HFS to be
+a root filesystem. What has to change is who calls it. That code sits in
+com_apple_filesystems_hfs::start(), an IOService method, and a filesystem
+linked into the kernel has no IOService to be started. So hfs_iokit.cpp loses
+the class, the metaclass registration and the stop() method, start() becomes
+
+    extern "C" int hfs_module_start(void)
+
+and bsd_init() calls it directly, after vnode_pager_bootstrap() and before the
+root mount goes looking for a filesystem. The one member the class held,
+vfs_handle, becomes a file static. The rest of hfs_iokit.cpp stays: it also
+holds hfs_is_ejectable(), hfs_iterate_media_with_content() and
+hfs_get_platform_serial_number(), which the filesystem calls.
+
+Nothing is renamed. All 39 sources have names no existing xnu object uses --
+checked against bsd, osfmk, iokit and libkern -- so unlike the pthread kext
+there is no collision to work around.
+
+The configuration is given as -D flags rather than through core/kext-config.h.
+That file is a prefix header (GCC_PREFIX_HEADER in core/kext.xcconfig) that no
+source includes, and it reads
+
+    #include <TargetConditionals.h>
+    #if TARGET_OS_EMBEDDED // iOS
+    #define CONFIG_PROTECT 1
+
+which on this target would turn on content protection and pull in
+AppleKeyStore key wrapping -- aks_cred_s, hfs_unwrap_key and friends -- that
+does not exist here. Leaving it out keeps hfs_cprotect.c and hfs_key_roll.c as
+empty translation units, which is what they are designed to be: both files are
+wrapped end to end in #if CONFIG_PROTECT.
+
+What is defined is deliberately small: CONFIG_HFS_STD=0, because nothing here
+needs to read 1980s HFS, and HFS_COMPRESSION=1, because the kernel has
+decmpfs (config_fs_compression is in this configuration's FILESYS_BASE) and an
+iOS system volume is full of compressed files. FIFO, QUOTA, NAMEDSTREAMS,
+CONFIG_SEARCHFS, CONFIG_HFS_DIRLINK and CONFIG_SECLUDED_RENAME are all left
+undefined, which the sources read as off. They can be turned on one at a time
+once a volume mounts at all.
+
+The warning suppressions are the ones a 2018 filesystem needs from a 2025
+clang, and they are applied through the add_perfile_cflags mechanism this
+makefile already uses for OBJS_NO_SIGN_COMPARE rather than file by file.
+
+This gets a filesystem into the kernel. It does not yet get a volume into the
+ramdisk: the image the shim carries still has to be made, and made as HFS+.
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -176,6 +176,48 @@
+ bsd/miscfs/fifofs/fifo_vnops.c		optional fifo sockets
+ bsd/miscfs/specfs/spec_vnops.c		standard
+ 
++# HFS, staged from Apple's hfs project by the build script. See
++# patches/xnu-4903/hfs-filesystem-builtin.patch.
++bsd/hfs/BTree.c		standard
++bsd/hfs/BTreeAllocate.c		standard
++bsd/hfs/BTreeMiscOps.c		standard
++bsd/hfs/BTreeNodeOps.c		standard
++bsd/hfs/BTreeNodeReserve.c	standard
++bsd/hfs/BTreeScanner.c		standard
++bsd/hfs/BTreeTreeOps.c		standard
++bsd/hfs/BTreeWrapper.c		standard
++bsd/hfs/CatalogUtilities.c	standard
++bsd/hfs/FileExtentMapping.c	standard
++bsd/hfs/FileIDsServices.c	standard
++bsd/hfs/MacOSStubs.c		standard
++bsd/hfs/UnicodeWrappers.c	standard
++bsd/hfs/VolumeAllocation.c	standard
++bsd/hfs/hfs_attrlist.c		standard
++bsd/hfs/hfs_btreeio.c		standard
++bsd/hfs/hfs_catalog.c		standard
++bsd/hfs/hfs_chash.c		standard
++bsd/hfs/hfs_cnode.c		standard
++bsd/hfs/hfs_cprotect.c		standard
++bsd/hfs/hfs_endian.c		standard
++bsd/hfs/hfs_extents.c		standard
++bsd/hfs/hfs_fsinfo.c		standard
++bsd/hfs/hfs_hotfiles.c		standard
++bsd/hfs/hfs_iokit.cpp		standard
++bsd/hfs/hfs_journal.c		standard
++bsd/hfs/hfs_key_roll.c		standard
++bsd/hfs/hfs_link.c		standard
++bsd/hfs/hfs_lookup.c		standard
++bsd/hfs/hfs_notification.c	standard
++bsd/hfs/hfs_quota.c		standard
++bsd/hfs/hfs_readwrite.c		standard
++bsd/hfs/hfs_resize.c		standard
++bsd/hfs/hfs_search.c		standard
++bsd/hfs/hfs_vfsops.c		standard
++bsd/hfs/hfs_vfsutils.c		standard
++bsd/hfs/hfs_vnops.c		standard
++bsd/hfs/hfs_xattr.c		standard
++bsd/hfs/rangelist.c		standard
++
+ bsd/miscfs/devfs/devfs_tree.c		optional devfs
+ bsd/miscfs/devfs/devfs_vnops.c		optional devfs
+ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -150,6 +150,33 @@
+ 
+ $(foreach file,$(OBJS_NO_SIGN_COMPARE),$(eval $(call add_perfile_cflags,$(file),-Wno-sign-compare)))
+ 
++# HFS is staged into bsd/hfs by the build script rather than living in this
++# tree, so it carries its own include path. The configuration comes from here
++# rather than from core/kext-config.h, which is a prefix header this build
++# does not use and which would key CONFIG_PROTECT off TARGET_OS_EMBEDDED --
++# turning on AppleKeyStore key wrapping that does not exist here. Everything
++# not named below is left undefined, which the sources read as off.
++HFS_OBJS =			\
++		BTree.o	BTreeAllocate.o	BTreeMiscOps.o	\
++		BTreeNodeOps.o	BTreeNodeReserve.o	BTreeScanner.o	\
++		BTreeTreeOps.o	BTreeWrapper.o	CatalogUtilities.o	\
++		FileExtentMapping.o	FileIDsServices.o	MacOSStubs.o	\
++		UnicodeWrappers.o	VolumeAllocation.o	hfs_attrlist.o	\
++		hfs_btreeio.o	hfs_catalog.o	hfs_chash.o	\
++		hfs_cnode.o	hfs_cprotect.o	hfs_endian.o	\
++		hfs_extents.o	hfs_fsinfo.o	hfs_hotfiles.o	\
++		hfs_iokit.o	hfs_journal.o	hfs_key_roll.o	\
++		hfs_link.o	hfs_lookup.o	hfs_notification.o	\
++		hfs_quota.o	hfs_readwrite.o	hfs_resize.o	\
++		hfs_search.o	hfs_vfsops.o	hfs_vfsutils.o	\
++		hfs_vnops.o	hfs_xattr.o	rangelist.o
++
++HFS_CFLAGS = -I$(SRCROOT)/bsd/hfs -DCONFIG_HFS_STD=0 -DHFS_COMPRESSION=1 \
++             -Wno-unused-parameter -Wno-missing-prototypes -Wno-sign-compare \
++             -Wno-cast-align -Wno-shorten-64-to-32
++
++$(foreach file,$(HFS_OBJS),$(eval $(call add_perfile_cflags,$(file),$(HFS_CFLAGS))))
++
+ # Objects that don't want -Wcast-align warning (8474835)
+ OBJS_NO_CAST_ALIGN =			\
+ 		audit_bsm_token.o	\
+--- a/bsd/hfs/hfs_iokit.cpp
++++ b/bsd/hfs/hfs_iokit.cpp
+@@ -46,20 +46,13 @@
+ bool hfs_corruption_panics = true;
+ #endif
+ 
+-class com_apple_filesystems_hfs : public IOService {
+-    OSDeclareDefaultStructors(com_apple_filesystems_hfs)
+-
+-public:
+-
+-	bool start(IOService *provider) override;
+-	void stop(IOService *provider) override;
+-
+-protected:
+-	vfstable_t vfs_handle;
+-};
+-
+-#define super IOService
+-OSDefineMetaClassAndStructors(com_apple_filesystems_hfs, IOService)
++/*
++ * Built into the kernel rather than loaded as a kext, so there is no
++ * IOService to start and no metaclass to register. What was
++ * com_apple_filesystems_hfs::start() is now a plain function that bsd_init()
++ * calls by hand, and the single piece of state it kept becomes a file static.
++ */
++static vfstable_t vfs_handle;
+ 
+ extern struct vnodeopv_desc hfs_vnodeop_opv_desc;
+ #if CONFIG_HFS_STD
+@@ -69,11 +62,8 @@
+ extern struct vnodeopv_desc hfs_fifoop_opv_desc;
+ extern struct vfsops hfs_vfsops;
+ 
+-bool com_apple_filesystems_hfs::start(IOService *provider)
++extern "C" int hfs_module_start(void)
+ {
+-	if (!super::start(provider))
+-		return false;
+-
+ #ifndef panic_on_assert
+ 	panic_on_assert = PE_i_can_has_kernel_configuration() & kPEICanHasAssertions;
+ #endif
+@@ -125,16 +115,11 @@
+ 	return true;
+ }
+ 
+-void com_apple_filesystems_hfs::stop(IOService *provider)
+-{
+-	if (vfs_handle) {
+-		vfs_fsremove(vfs_handle);
+-		hfs_sysctl_unregister();
+-		vfs_handle = NULL;
+-	}
+-
+-	super::stop(provider);
+-}
++/*
++ * There was a stop() here that called vfs_fsremove() and
++ * hfs_sysctl_unregister(). Nothing unloads a filesystem that is linked into
++ * the kernel, so it is gone rather than left unreachable.
++ */
+ 
+ int hfs_is_ejectable(const char *cdev_name)
+ {
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -387,6 +387,13 @@
+ extern thread_t cloneproc(task_t, coalition_t, proc_t, int, int);
+ extern int      (*mountroot)(void);
+ 
++/*
++ * bsd/hfs/hfs_iokit.cpp. The filesystem registers itself with vfs_fsadd()
++ * from what used to be an IOService start method; built in, it has to be
++ * called by hand.
++ */
++extern int      hfs_module_start(void);
++
+ lck_grp_t * proc_lck_grp;
+ lck_grp_t * proc_slock_grp;
+ lck_grp_t * proc_fdmlock_grp;
+@@ -919,6 +926,15 @@
+ 	bsd_init_kprintf("calling vnode_pager_bootstrap\n");
+ 	vnode_pager_bootstrap();
+ 
++	/*
++	 * HFS has to be registered before the root mount below goes looking for
++	 * a filesystem that can read the root device.
++	 */
++	bsd_init_kprintf("calling hfs_module_start\n");
++	if (!hfs_module_start()) {
++		printf("hfs: registration failed; HFS volumes cannot be mounted\n");
++	}
++
+ 	bsd_init_kprintf("calling inittodr\n");
+ 	inittodr(0);
+ 
