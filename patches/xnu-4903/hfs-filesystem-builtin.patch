@@ -12,9 +12,29 @@ no HFS: Apple moved it out after 10.12 and bsd/vfs/vfs_conf.c does not mention
 it anywhere. IOFindBSDRoot() asks for Apple_HFS by default, so HFS is both
 what the kernel wants and what a ramdisk image can plausibly be.
 
-The sources are staged into bsd/hfs by the build script, from hfs-407.30.1 --
-the 10.14-line tag that still ships core/. Two later tags of the same line,
-hfs-407.50.6 and hfs-407.200.4, carry only the userland tools.
+The sources are staged by the build script from hfs-407.30.1 -- the 10.14-line
+tag that still ships core/. Two later tags of the same line, hfs-407.50.6 and
+hfs-407.200.4, carry only the userland tools.
+
+Apple's directory layout is kept: core/ and hfs_encodings/ are staged as
+siblings under bsd/hfs, because sources in each reach into the other with
+relative includes -- core/hfs.h includes "../hfs_encodings/hfs_encodings.h"
+and hfs_encodings/hfs_encodinghint.c includes "../core/hfs.h". Flattening
+them into one directory breaks both.
+
+Of hfs_encodings, only hfs_encodinghint.c is built. It is needed because
+hfs_catalog.c calls hfs_pickencoding() from a branch guarded by
+!TARGET_OS_EMBEDDED rather than by CONFIG_HFS_STD, and nothing defines
+TARGET_OS_EMBEDDED here. The cost is nil: with CONFIG_HFS_STD=0 the 800 lines
+of CJK encoding tables compile away and what is left is a stub returning
+kTextEncodingMacRoman, plus the encoding-bias accessors. hfs_encodings.c is
+a different kext (HFSEncodings, with its own start/stop in
+hfs_encodings_kext.cpp) and is not built: everything it defines --
+hfs_getconverter, hfs_relconverter, the MacRoman converters -- is reached only
+through the standard-HFS path, which is off.
+
+The third relative include, "../tests/hfs_extents_test.h" in hfs_extents.c,
+sits inside #if HFS_EXTENTS_TEST and never fires, so tests/ is not staged.
 
 Registration does not go through vfs_conf.c, which is why its silence does not
 matter. The kext registers itself:
@@ -40,7 +60,7 @@ vfs_handle, becomes a file static. The rest of hfs_iokit.cpp stays: it also
 holds hfs_is_ejectable(), hfs_iterate_media_with_content() and
 hfs_get_platform_serial_number(), which the filesystem calls.
 
-Nothing is renamed. All 39 sources have names no existing xnu object uses --
+Nothing is renamed. All 40 sources have names no existing xnu object uses --
 checked against bsd, osfmk, iokit and libkern -- so unlike the pthread kext
 there is no collision to work around.
 
@@ -53,10 +73,19 @@ source includes, and it reads
     #define CONFIG_PROTECT 1
 
 which on this target would turn on content protection and pull in
-AppleKeyStore key wrapping -- aks_cred_s, hfs_unwrap_key and friends -- that
-does not exist here. Leaving it out keeps hfs_cprotect.c and hfs_key_roll.c as
-empty translation units, which is what they are designed to be: both files are
-wrapped end to end in #if CONFIG_PROTECT.
+AppleKeyStore key wrapping that does not exist here. Leaving it out keeps
+hfs_cprotect.c and hfs_key_roll.c as empty translation units, which is what
+they are designed to be: both files are wrapped end to end in #if
+CONFIG_PROTECT.
+
+AppleKeyStore leaks out of those two files in one place, and that is the
+second thing this patch corrects. core/hfs_iokit.h includes
+<AppleKeyStore/AppleKeyStoreFSServices.h> unconditionally, and hfs_vfsops.c
+and hfs_vfsutils.c include that header unconditionally for three functions
+that have nothing to do with keys. The include and the four key declarations
+that need it are given the CONFIG_PROTECT guard that their only caller,
+hfs_cprotect.c, already has; the matching definitions at the end of
+hfs_iokit.cpp -- key_services() and the four wrappers -- get the same guard.
 
 What is defined is deliberately small: CONFIG_HFS_STD=0, because nothing here
 needs to read 1980s HFS, and HFS_COMPRESSION=1, because the kernel has
@@ -73,60 +102,9 @@ makefile already uses for OBJS_NO_SIGN_COMPARE rather than file by file.
 This gets a filesystem into the kernel. It does not yet get a volume into the
 ramdisk: the image the shim carries still has to be made, and made as HFS+.
 
---- a/bsd/conf/files
-+++ b/bsd/conf/files
-@@ -176,6 +176,48 @@
- bsd/miscfs/fifofs/fifo_vnops.c		optional fifo sockets
- bsd/miscfs/specfs/spec_vnops.c		standard
- 
-+# HFS, staged from Apple's hfs project by the build script. See
-+# patches/xnu-4903/hfs-filesystem-builtin.patch.
-+bsd/hfs/BTree.c		standard
-+bsd/hfs/BTreeAllocate.c		standard
-+bsd/hfs/BTreeMiscOps.c		standard
-+bsd/hfs/BTreeNodeOps.c		standard
-+bsd/hfs/BTreeNodeReserve.c	standard
-+bsd/hfs/BTreeScanner.c		standard
-+bsd/hfs/BTreeTreeOps.c		standard
-+bsd/hfs/BTreeWrapper.c		standard
-+bsd/hfs/CatalogUtilities.c	standard
-+bsd/hfs/FileExtentMapping.c	standard
-+bsd/hfs/FileIDsServices.c	standard
-+bsd/hfs/MacOSStubs.c		standard
-+bsd/hfs/UnicodeWrappers.c	standard
-+bsd/hfs/VolumeAllocation.c	standard
-+bsd/hfs/hfs_attrlist.c		standard
-+bsd/hfs/hfs_btreeio.c		standard
-+bsd/hfs/hfs_catalog.c		standard
-+bsd/hfs/hfs_chash.c		standard
-+bsd/hfs/hfs_cnode.c		standard
-+bsd/hfs/hfs_cprotect.c		standard
-+bsd/hfs/hfs_endian.c		standard
-+bsd/hfs/hfs_extents.c		standard
-+bsd/hfs/hfs_fsinfo.c		standard
-+bsd/hfs/hfs_hotfiles.c		standard
-+bsd/hfs/hfs_iokit.cpp		standard
-+bsd/hfs/hfs_journal.c		standard
-+bsd/hfs/hfs_key_roll.c		standard
-+bsd/hfs/hfs_link.c		standard
-+bsd/hfs/hfs_lookup.c		standard
-+bsd/hfs/hfs_notification.c	standard
-+bsd/hfs/hfs_quota.c		standard
-+bsd/hfs/hfs_readwrite.c		standard
-+bsd/hfs/hfs_resize.c		standard
-+bsd/hfs/hfs_search.c		standard
-+bsd/hfs/hfs_vfsops.c		standard
-+bsd/hfs/hfs_vfsutils.c		standard
-+bsd/hfs/hfs_vnops.c		standard
-+bsd/hfs/hfs_xattr.c		standard
-+bsd/hfs/rangelist.c		standard
-+
- bsd/miscfs/devfs/devfs_tree.c		optional devfs
- bsd/miscfs/devfs/devfs_vnops.c		optional devfs
- bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
 --- a/bsd/conf/Makefile.template
 +++ b/bsd/conf/Makefile.template
-@@ -150,6 +150,33 @@
+@@ -150,6 +150,34 @@
  
  $(foreach file,$(OBJS_NO_SIGN_COMPARE),$(eval $(call add_perfile_cflags,$(file),-Wno-sign-compare)))
  
@@ -137,21 +115,22 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
 +# turning on AppleKeyStore key wrapping that does not exist here. Everything
 +# not named below is left undefined, which the sources read as off.
 +HFS_OBJS =			\
-+		BTree.o	BTreeAllocate.o	BTreeMiscOps.o	\
-+		BTreeNodeOps.o	BTreeNodeReserve.o	BTreeScanner.o	\
-+		BTreeTreeOps.o	BTreeWrapper.o	CatalogUtilities.o	\
-+		FileExtentMapping.o	FileIDsServices.o	MacOSStubs.o	\
-+		UnicodeWrappers.o	VolumeAllocation.o	hfs_attrlist.o	\
-+		hfs_btreeio.o	hfs_catalog.o	hfs_chash.o	\
-+		hfs_cnode.o	hfs_cprotect.o	hfs_endian.o	\
-+		hfs_extents.o	hfs_fsinfo.o	hfs_hotfiles.o	\
-+		hfs_iokit.o	hfs_journal.o	hfs_key_roll.o	\
-+		hfs_link.o	hfs_lookup.o	hfs_notification.o	\
-+		hfs_quota.o	hfs_readwrite.o	hfs_resize.o	\
-+		hfs_search.o	hfs_vfsops.o	hfs_vfsutils.o	\
-+		hfs_vnops.o	hfs_xattr.o	rangelist.o
++		BTree.o	BTreeAllocate.o	BTreeMiscOps.o \
++		BTreeNodeOps.o	BTreeNodeReserve.o	BTreeScanner.o \
++		BTreeTreeOps.o	BTreeWrapper.o	CatalogUtilities.o \
++		FileExtentMapping.o	FileIDsServices.o	MacOSStubs.o \
++		UnicodeWrappers.o	VolumeAllocation.o	hfs_attrlist.o \
++		hfs_btreeio.o	hfs_catalog.o	hfs_chash.o \
++		hfs_cnode.o	hfs_cprotect.o	hfs_endian.o \
++		hfs_extents.o	hfs_fsinfo.o	hfs_hotfiles.o \
++		hfs_iokit.o	hfs_journal.o	hfs_key_roll.o \
++		hfs_link.o	hfs_lookup.o	hfs_notification.o \
++		hfs_quota.o	hfs_readwrite.o	hfs_resize.o \
++		hfs_search.o	hfs_vfsops.o	hfs_vfsutils.o \
++		hfs_vnops.o	hfs_xattr.o	rangelist.o \
++		hfs_encodinghint.o
 +
-+HFS_CFLAGS = -I$(SRCROOT)/bsd/hfs -DCONFIG_HFS_STD=0 -DHFS_COMPRESSION=1 \
++HFS_CFLAGS = -I$(SRCROOT)/bsd/hfs/core -DCONFIG_HFS_STD=0 -DHFS_COMPRESSION=1 \
 +             -Wno-unused-parameter -Wno-missing-prototypes -Wno-sign-compare \
 +             -Wno-cast-align -Wno-shorten-64-to-32
 +
@@ -160,8 +139,69 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
  # Objects that don't want -Wcast-align warning (8474835)
  OBJS_NO_CAST_ALIGN =			\
  		audit_bsm_token.o	\
---- a/bsd/hfs/hfs_iokit.cpp
-+++ b/bsd/hfs/hfs_iokit.cpp
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -176,6 +176,58 @@
+ bsd/miscfs/fifofs/fifo_vnops.c		optional fifo sockets
+ bsd/miscfs/specfs/spec_vnops.c		standard
+ 
++# HFS, staged from Apple's hfs project by the build script. The directory
++# layout is Apple's: core/ and hfs_encodings/ are siblings, because sources
++# in each reach into the other with relative includes. See
++# patches/xnu-4903/hfs-filesystem-builtin.patch.
++
++bsd/hfs/core/BTree.c	standard
++bsd/hfs/core/BTreeAllocate.c	standard
++bsd/hfs/core/BTreeMiscOps.c	standard
++bsd/hfs/core/BTreeNodeOps.c	standard
++bsd/hfs/core/BTreeNodeReserve.c	standard
++bsd/hfs/core/BTreeScanner.c	standard
++bsd/hfs/core/BTreeTreeOps.c	standard
++bsd/hfs/core/BTreeWrapper.c	standard
++bsd/hfs/core/CatalogUtilities.c	standard
++bsd/hfs/core/FileExtentMapping.c	standard
++bsd/hfs/core/FileIDsServices.c	standard
++bsd/hfs/core/MacOSStubs.c	standard
++bsd/hfs/core/UnicodeWrappers.c	standard
++bsd/hfs/core/VolumeAllocation.c	standard
++bsd/hfs/core/hfs_attrlist.c	standard
++bsd/hfs/core/hfs_btreeio.c	standard
++bsd/hfs/core/hfs_catalog.c	standard
++bsd/hfs/core/hfs_chash.c	standard
++bsd/hfs/core/hfs_cnode.c	standard
++bsd/hfs/core/hfs_cprotect.c	standard
++bsd/hfs/core/hfs_endian.c	standard
++bsd/hfs/core/hfs_extents.c	standard
++bsd/hfs/core/hfs_fsinfo.c	standard
++bsd/hfs/core/hfs_hotfiles.c	standard
++bsd/hfs/core/hfs_iokit.cpp	standard
++bsd/hfs/core/hfs_journal.c	standard
++bsd/hfs/core/hfs_key_roll.c	standard
++bsd/hfs/core/hfs_link.c	standard
++bsd/hfs/core/hfs_lookup.c	standard
++bsd/hfs/core/hfs_notification.c	standard
++bsd/hfs/core/hfs_quota.c	standard
++bsd/hfs/core/hfs_readwrite.c	standard
++bsd/hfs/core/hfs_resize.c	standard
++bsd/hfs/core/hfs_search.c	standard
++bsd/hfs/core/hfs_vfsops.c	standard
++bsd/hfs/core/hfs_vfsutils.c	standard
++bsd/hfs/core/hfs_vnops.c	standard
++bsd/hfs/core/hfs_xattr.c	standard
++bsd/hfs/core/rangelist.c	standard
++
++# hfs_pickencoding(), which hfs_catalog.c calls outside any CONFIG_HFS_STD
++# guard. With CONFIG_HFS_STD=0 the 800 lines of encoding tables compile away
++# and this is a stub returning kTextEncodingMacRoman. hfs_encodings.c is a
++# different kext (HFSEncodings) and is not needed: everything it defines is
++# reached only through the standard-HFS path.
++bsd/hfs/hfs_encodings/hfs_encodinghint.c	standard
++
+ bsd/miscfs/devfs/devfs_tree.c		optional devfs
+ bsd/miscfs/devfs/devfs_vnops.c		optional devfs
+ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+--- a/bsd/hfs/core/hfs_iokit.cpp
++++ b/bsd/hfs/core/hfs_iokit.cpp
 @@ -46,20 +46,13 @@
  bool hfs_corruption_panics = true;
  #endif
@@ -225,6 +265,61 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
  
  int hfs_is_ejectable(const char *cdev_name)
  {
+@@ -250,6 +235,12 @@
+ }
+ 
+ // Interface with AKS
++//
++// AppleKeyStore does not exist in this kernel. Everything below is reached
++// only from hfs_cprotect.c, which is itself one big #if CONFIG_PROTECT, so it
++// goes away with the same switch rather than being left to fail to compile.
++
++#if CONFIG_PROTECT
+ 
+ static aks_file_system_key_services_t *
+ key_services(void)
+@@ -305,3 +296,5 @@
+ 		return ENXIO;
+ 	return ks->backup_key(access, wrapped_key_in, wrapped_key_out);
+ }
++
++#endif /* CONFIG_PROTECT */
+--- a/bsd/hfs/core/hfs_iokit.h
++++ b/bsd/hfs/core/hfs_iokit.h
+@@ -30,7 +30,17 @@
+ #define hfs_iokit_h
+ 
+ #include <sys/cdefs.h>
++
++/*
++ * AppleKeyStore is the iOS content-protection key service, and it is not part
++ * of this kernel. The four key functions at the bottom of this header are the
++ * only thing here that needs it, so both are guarded: hfs_vfsops.c and
++ * hfs_vfsutils.c include this header unconditionally and need the three
++ * functions above them.
++ */
++#if CONFIG_PROTECT
+ #include <AppleKeyStore/AppleKeyStoreFSServices.h>
++#endif
+ 
+ __BEGIN_DECLS
+ 
+@@ -42,6 +52,7 @@
+ 									void *arg);
+ kern_return_t hfs_get_platform_serial_number(char *serial_number_str,
+ 											 uint32_t len);
++#if CONFIG_PROTECT
+ int hfs_unwrap_key(aks_cred_t access, const aks_wrapped_key_t wrapped_key_in,
+ 				   aks_raw_key_t key_out);
+ int hfs_rewrap_key(aks_cred_t access, cp_key_class_t dp_class,
+@@ -51,6 +62,7 @@
+ 				aks_raw_key_t key_out, aks_wrapped_key_t wrapped_key_out);
+ int hfs_backup_key(aks_cred_t access, const aks_wrapped_key_t wrapped_key_in,
+ 				   aks_wrapped_key_t wrapped_key_out);
++#endif /* CONFIG_PROTECT */
+ 
+ __END_DECLS
+ 
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -387,6 +387,13 @@
@@ -232,7 +327,7 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
  extern int      (*mountroot)(void);
  
 +/*
-+ * bsd/hfs/hfs_iokit.cpp. The filesystem registers itself with vfs_fsadd()
++ * bsd/hfs/core/hfs_iokit.cpp. The filesystem registers itself with vfs_fsadd()
 + * from what used to be an IOService start method; built in, it has to be
 + * called by hand.
 + */

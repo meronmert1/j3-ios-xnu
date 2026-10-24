@@ -147,8 +147,19 @@ apply_patches() {
 # hfs-407.200.4 have the userland tools and no core/ directory. hfs-407.30.1
 # is the 10.14-line tag that has it.
 #
-# The names are left alone. None of the 39 sources collides with an existing
+# The names are left alone. None of the 40 sources collides with an existing
 # xnu object, so unlike the pthread kext nothing needs renaming.
+#
+# Apple's layout is kept rather than flattened: core/hfs.h includes
+# "../hfs_encodings/hfs_encodings.h" and hfs_encodings/hfs_encodinghint.c
+# includes "../core/hfs.h", so the two directories have to stay siblings.
+#
+# Only hfs_encodinghint.c is taken from hfs_encodings. hfs_catalog.c calls
+# hfs_pickencoding() from a branch guarded by !TARGET_OS_EMBEDDED rather than
+# by CONFIG_HFS_STD, so the symbol has to exist -- but with CONFIG_HFS_STD=0
+# the encoding tables compile away and a stub is all that is left.
+# hfs_encodings.c is a different kext (HFSEncodings) and everything it defines
+# is reached only through the standard-HFS path, so it is left out.
 #
 # core/kext-config.h is not copied: it is a prefix header (GCC_PREFIX_HEADER
 # in core/kext.xcconfig), no source includes it, and it keys the configuration
@@ -159,20 +170,31 @@ apply_patches() {
 # The matching patch is patches/xnu-4903/hfs-filesystem-builtin.patch.
 stage_hfs() {
     local dst="$XNU_SRC/bsd/hfs"
-    [ -f "$dst/hfs_vfsops.c" ] && { info "hfs already staged"; return 0; }
+    [ -f "$dst/core/hfs_vfsops.c" ] && { info "hfs already staged"; return 0; }
 
     say "hfs (filesystem, built into the kernel)"
     mkdir -p "$DEPS_DIR"
     local d; d="$(fetch_oss hfs "$HFS_REF")" || exit 1
 
     [ -d "$d/core" ] || die "hfs: $HFS_REF has no core/ -- wrong tag"
+    [ -d "$d/hfs_encodings" ] || die "hfs: $HFS_REF has no hfs_encodings/"
 
-    mkdir -p "$dst"
-    cp "$d"/core/*.c "$d"/core/*.cpp "$d"/core/*.h "$dst/" \
+    rm -rf "$dst"
+    mkdir -p "$dst/core" "$dst/hfs_encodings"
+
+    cp "$d"/core/*.c "$d"/core/*.cpp "$d"/core/*.h "$dst/core/" \
         || die "hfs: could not stage core/"
-    rm -f "$dst/kext-config.h"
+    rm -f "$dst/core/kext-config.h"
 
-    info "staged $(ls "$dst"/*.c "$dst"/*.cpp | wc -l | tr -d ' ') sources into bsd/hfs"
+    cp "$d"/hfs_encodings/hfs_encodinghint.c \
+       "$d"/hfs_encodings/hfs_encodings.h \
+       "$d"/hfs_encodings/hfs_encodings_internal.h "$dst/hfs_encodings/" \
+        || die "hfs: could not stage hfs_encodings/"
+
+    local n
+    n="$(ls "$dst"/core/*.c "$dst"/core/*.cpp "$dst"/hfs_encodings/*.c \
+         | wc -l | tr -d ' ')"
+    info "staged $n sources into bsd/hfs (core + hfs_encodings)"
 }
 
 # -------------------------------------------------------------- pthread kext
