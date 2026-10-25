@@ -146,6 +146,26 @@ calls its own C++ objects as well. Naming it hfs_iokit.o sets variables that
 no rule ever reads, which is exactly how -UCONFIG_PROTECT came to be present
 in the makefile and absent from the command line that compiled hfs_iokit.cpp.
 
+One more thing follows from linking a kext in rather than loading it, and it
+is the same shape as the duplicate pthread_kern: hfs_sysctl_register() must
+not be called. bsd/sys/sysctl.h emits the __sysctl_set linker-set entry only
+
+    #ifdef XNU_KERNEL_PRIVATE
+    #define SYSCTL_LINKER_SET_ENTRY LINKER_SET_ENTRY
+    #else
+    #define SYSCTL_LINKER_SET_ENTRY(a, b)
+    #endif
+
+A kext is compiled without that define, so its oids never reach the set, and
+that is exactly why HFS chains them onto a list of its own and registers them
+by hand from start(). These sources, compiled in the bsd component, do have
+XNU_KERNEL_PRIVATE: the entries land in __DATA,__sysctl_set and
+sysctl_early_init() registers all of them at bsd_init.c:421, hundreds of lines
+before this function runs. Doing it again hands sysctl_register_oid() an oid
+that is already in its parent's list, and the ordered SLIST_INSERT_AFTER makes
+that element's next pointer refer to itself; the list is circular from then on
+and the next walk never returns. The call is removed, the oids still work.
+
 hfs_module_start() names each of its stages on the console, the way bsd_init
 traces its own. It is called from inside bsd_init rather than loaded as a kext
 at leisure, so anything in it that does not finish stops the boot before the
@@ -340,17 +360,43 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
  	int ret = vfs_fsadd(&vfe, &vfs_handle);
  
  	if (ret) {
-@@ -118,23 +118,21 @@
+@@ -118,23 +118,46 @@
  		return false;
  	}
  
 +	printf("hfs: zones\n");
  	hfs_init_zones();
 -	
-+
-+	printf("hfs: sysctls\n");
- 	hfs_sysctl_register();
+-	hfs_sysctl_register();
  
++	/*
++	 * hfs_sysctl_register() is deliberately NOT called here.
++	 *
++	 * It exists because a kext's sysctls never reach the kernel's linker
++	 * set. bsd/sys/sysctl.h emits the __sysctl_set entry only under
++	 *
++	 *     #ifdef XNU_KERNEL_PRIVATE
++	 *     #define SYSCTL_LINKER_SET_ENTRY LINKER_SET_ENTRY
++	 *     #else
++	 *     #define SYSCTL_LINKER_SET_ENTRY(a, b)
++	 *     #endif
++	 *
++	 * and a kext is compiled without that define, so HFS chains its oids
++	 * onto a list of its own and registers them by hand.
++	 *
++	 * Built into the kernel, these sources do have XNU_KERNEL_PRIVATE. The
++	 * entries land in __DATA,__sysctl_set and sysctl_early_init() has
++	 * already registered every one of them through sysctl_register_set(),
++	 * hundreds of lines earlier in bsd_init. Registering them a second time
++	 * hands sysctl_register_oid() an oid that is already in its parent's
++	 * list, and its ordered SLIST_INSERT_AFTER makes that element point at
++	 * itself. The list becomes circular and the next walk of it never
++	 * returns -- a boot that stops with nothing printed after this point.
++	 *
++	 * The oids are registered and working either way; the call is pure
++	 * duplication here.
++	 */
++
 +	printf("hfs: registered\n");
  	return true;
  }
@@ -373,7 +419,7 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
  
  int hfs_is_ejectable(const char *cdev_name)
  {
-@@ -250,6 +248,12 @@
+@@ -250,6 +273,12 @@
  }
  
  // Interface with AKS
@@ -386,7 +432,7 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
  
  static aks_file_system_key_services_t *
  key_services(void)
-@@ -305,3 +309,5 @@
+@@ -305,3 +334,5 @@
  		return ENXIO;
  	return ks->backup_key(access, wrapped_key_in, wrapped_key_out);
  }
