@@ -1,0 +1,233 @@
+Give the kernel a minimal AMFI, so that dyld can start.
+
+With launchd and its 37 dylibs on the RAM disk, the boot now gets as far as
+running dyld, and dyld stops on its own first question:
+
+    panic(cpu 0 caller 0x...): initproc exited -- exit reason namespace 6
+    subcode 0x9 description: amfi_check_dyld_policy_self() failed
+
+Namespace 6 is OS_REASON_DYLD, so that description is dyld's own halt message
+rather than anything the kernel decided.
+
+amfi_check_dyld_policy_self() is __mac_syscall("AMFI", 0x5a, &args), and
+security/mac_base.c answers that with
+
+    error = ENOPOLICY;
+    for (...) if (strcmp(mpc->mpc_name, target) == 0 && ...)
+
+On a real device "AMFI" is AppleMobileFileIntegrity, a prelinked kext. This
+kernel has no kexts, so no policy carries that name and the call can never
+return anything but ENOPOLICY. dyld treats that as fatal and halts before it
+has opened a single library.
+
+So a policy by that name is registered. It is modelled on vnguard, which is
+already in this tree and already loads on this board -- "Security policy
+loaded: Guarded vnode policy (vnguard)" is on the console -- so the shape is
+not invented: a mac_policy_conf, a mac_policy_register() call, and an init
+function called from kernel_bootstrap() beside vnguard's, long before
+bsd_init() goes looking for an init program.
+
+The call number and the argument block are read out of dyld rather than
+guessed at:
+
+    _amfi_check_dyld_policy_self:
+        cbz  x1, ...                ; no output pointer -> EINVAL
+        str  xzr, [x1]              ; *output_flags = 0
+        add  x8, sp, #8             ; an uninitialised local
+        stp  x0, x8, [sp, #0x10]    ; { input_flags, &local }
+        add  x0, x0, #0x647         ; "AMFI"
+        mov  w1, #0x5a
+        add  x2, sp, #0x10
+        bl   ___mac_syscall
+        cbz  w0, ...                ; on success, *output_flags = local
+
+Two 64-bit words: the input flags, and a user address to write the answer to.
+And the local at sp+8 is never initialised before the call -- so a policy that
+returned success without writing to it would hand dyld whatever was on its
+stack and let it be read as a set of permissions. That is the one thing this
+had to get right, and it is why the function was disassembled instead of
+approximated.
+
+The answer is zero, which is what AMFI gives an ordinary platform binary.
+Every bit in that word grants a relaxation -- honouring @executable_path and
+@loader_path, DYLD_ environment variables, fallback search paths, a custom
+shared cache -- and refusing all of them is both the restrictive choice and
+the ordinary one on a device. dyld says as much itself, in a string a few
+bytes from the one above:
+
+    dyld: warning: @executable_path/ ignored because of amfi policy
+
+amfi_dyld_flags= overrides it, for when something turns out to need one. The
+bit assignments belong to AMFI and are deliberately not written down in the
+patch: this kernel has no way to check a guess about them, and a comment
+asserting the wrong ones would be worse than none.
+
+What this is not: it is not AMFI. It answers one question and implements no
+part of what the name stands for. Nothing here validates a code signature, an
+entitlement or a provisioning profile, and nothing here is a step toward
+doing so -- that work belongs with corecrypto, which this kernel also does
+not have. It exists so that dyld can get past a call that cannot otherwise be
+answered, on a kernel that has no code signing to enforce in the first place.
+A real iOS userland will need the real thing; this gets the loader running.
+
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -156,6 +156,7 @@
+ #if CONFIG_VNGUARD
+ extern void vnguard_policy_init(void);
+ #endif
++extern void amfi_stub_policy_init(void);
+ #endif
+ 
+ #if KPC
+@@ -632,6 +633,13 @@
+ #if CONFIG_VNGUARD
+ 	vnguard_policy_init();
+ #endif
++	/*
++	 * dyld will not start without a policy registered under the name
++	 * "AMFI"; see security/mac_base.c. Registered beside vnguard because
++	 * this is where MAC policies that live in the kernel come up, and long
++	 * before bsd_init() reaches an init program.
++	 */
++	amfi_stub_policy_init();
+ #endif
+ 
+ #if CONFIG_DTRACE
+--- a/security/mac_base.c
++++ b/security/mac_base.c
+@@ -1853,6 +1853,134 @@
+ 	return error;
+ }
+ 
++/*
++ * The two headers below are included again here rather than at the top of the
++ * file: that copy of section_keywords.h sits inside #if CONFIG_EMBEDDED, and
++ * what follows should not depend on which configuration this is. Both have
++ * include guards.
++ */
++#include <pexpert/pexpert.h>
++#include <libkern/section_keywords.h>
++
++/*
++ * A minimal AMFI, so that dyld can start.
++ *
++ * dyld calls amfi_check_dyld_policy_self() before it does anything else, and
++ * treats a failure as fatal:
++ *
++ *     amfi_check_dyld_policy_self() failed
++ *
++ * which is where this kernel's boot ended once launchd was on the RAM disk.
++ * That function is __mac_syscall("AMFI", 0x5a, &args), and __mac_syscall
++ * returns ENOPOLICY when no registered policy carries that name. On a real
++ * device the name belongs to AppleMobileFileIntegrity, a kext; this kernel
++ * has none, so the call could never succeed.
++ *
++ * The argument block and the call number are read out of dyld itself rather
++ * than guessed:
++ *
++ *     _amfi_check_dyld_policy_self:
++ *         str  xzr, [x1]              ; *output_flags = 0
++ *         add  x8, sp, #8             ; an uninitialised local
++ *         stp  x0, x8, [sp, #0x10]    ; { input_flags, &local }
++ *         add  x0, x0, #0x647         ; "AMFI"
++ *         mov  w1, #0x5a
++ *         add  x2, sp, #0x10
++ *         bl   ___mac_syscall
++ *         cbz  w0, ...                ; on success, *output_flags = local
++ *
++ * Note the local at sp+8 is never initialised before the call. A policy that
++ * returned success without writing to it would hand dyld whatever was on its
++ * stack and call it a set of permissions, so this writes the answer every
++ * time it reports success.
++ *
++ * The answer is zero by default, which is what AMFI gives an ordinary
++ * platform binary: every bit in this word grants a relaxation -- honouring
++ * @executable_path, DYLD_ environment variables, fallback paths, a custom
++ * shared cache -- and refusing all of them is both the restrictive choice and
++ * the usual one. dyld says so itself:
++ *
++ *     dyld: warning: @executable_path/ ignored because of amfi policy
++ *
++ * amfi_dyld_flags= sets it otherwise, for when something turns out to need a
++ * relaxation; the bit assignments belong to AMFI and are not documented here
++ * because this kernel has no way to check a guess about them.
++ *
++ * This is not AMFI. It answers one question and implements no part of what
++ * the name stands for: nothing here validates a signature, an entitlement or
++ * a provisioning profile. It exists so that dyld can get past a call that
++ * cannot otherwise be answered, on a kernel that has no code signing to
++ * enforce in the first place.
++ */
++#define AMFI_POLICY_NAME                "AMFI"
++#define AMFI_DYLD_POLICY_SELF           0x5a
++
++struct amfi_dyld_policy_args {
++	uint64_t        input_flags;
++	uint64_t        output_flags;   /* a user address to write the answer to */
++};
++
++static uint64_t amfi_dyld_flags = 0;
++
++static int
++amfi_stub_policy_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	struct amfi_dyld_policy_args args;
++	uint64_t answer;
++	int error;
++
++	if (call != AMFI_DYLD_POLICY_SELF) {
++		return ENOTSUP;
++	}
++
++	/*
++	 * The argument block is two 64-bit words whatever the caller is, and
++	 * every process on this machine is 64-bit. A 32-bit caller would lay
++	 * it out differently, so it is refused rather than misread.
++	 */
++	if (!proc_is64bit(p)) {
++		return ENOTSUP;
++	}
++
++	error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	if (args.output_flags == 0) {
++		return EINVAL;
++	}
++
++	answer = amfi_dyld_flags;
++	return copyout(&answer, (user_addr_t)args.output_flags, sizeof(answer));
++}
++
++static struct mac_policy_ops amfi_stub_policy_ops = {
++	.mpo_policy_syscall = amfi_stub_policy_syscall,
++};
++
++SECURITY_READ_ONLY_LATE(static struct mac_policy_conf) amfi_stub_policy_conf = {
++	.mpc_name               = AMFI_POLICY_NAME,
++	.mpc_fullname           = "Minimal AMFI (dyld policy only)",
++	.mpc_field_off          = NULL,         /* no labels, so no slot */
++	.mpc_labelnames         = NULL,
++	.mpc_labelname_count    = 0,
++	.mpc_ops                = &amfi_stub_policy_ops,
++	.mpc_loadtime_flags     = 0,
++	.mpc_runtime_flags      = 0,
++};
++
++static mac_policy_handle_t amfi_stub_policy_handle;
++
++void amfi_stub_policy_init(void);
++void
++amfi_stub_policy_init(void)
++{
++	PE_parse_boot_argn("amfi_dyld_flags", &amfi_dyld_flags,
++	    sizeof(amfi_dyld_flags));
++	mac_policy_register(&amfi_stub_policy_conf, &amfi_stub_policy_handle,
++	    NULL);
++}
++
+ int
+ mac_mount_label_get(struct mount *mp, user_addr_t mac_p)
+ {
