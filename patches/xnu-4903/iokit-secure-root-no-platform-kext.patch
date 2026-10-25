@@ -1,0 +1,111 @@
+Do not require a registered IOPlatformExpert to mount the root filesystem.
+
+The root filesystem now mounts:
+
+    hfs: mounted iOS on device b(2, 0)
+
+and the boot ends on the next line:
+
+    panic(cpu 0 caller 0x...): iokit/bsddev/IOKitBSDInit.cpp:739
+    Assertion failed: pe
+
+That line is in IOSecureBSDRoot(), which bsd_init() calls right after
+vfs_mountroot() to ask the platform whether the root device is secure:
+
+    matching = IOService::serviceMatching("IOPlatformExpert");
+    pe = (IOPlatformExpert *) IOService::waitForMatchingService(matching, 30ULL * kSecondScale);
+    matching->release();
+    assert(pe);
+
+Nothing matches. IOPlatformExpert::start() does install itself as gIOPlatform
+
+    setPlatform( this );
+    gIOPlatform = this;
+
+but it never calls registerService(), and matching only ever sees services
+that have. On a real device this is invisible: the platform expert there is
+AppleARMPlatform, a prelinked kext, and it registers itself. This kernel has
+no kexts; its platform expert is the stock IOPlatformExpert, started from the
+personality iokit-platform-personality.patch adds to KernelConfigTables.cpp.
+So the wait runs its full timeout and returns NULL while the object it is
+waiting for has been sitting in gIOPlatform since IOKit came up.
+
+The timeout is 30 seconds. It arrives in about one here, because
+pe_identify_machine.c hardcodes tclk = 1000000 for bcm2837-io while this SoC
+counts at roughly 26 MHz, so every deadline in the kernel is reached about 26
+times too early. That is a separate problem and not this patch's business --
+it is noted because it explains why the panic looks instant.
+
+So the platform expert is asked for directly, with getPlatform(), before
+waiting for one to be matched. Where a platform expert does register this
+changes nothing: by the time bsd_init mounts root, bsd_autoconf() has long
+since run, and if somehow it has not, gIOPlatform is NULL and the wait happens
+exactly as before. Where one never registers, the answer is immediate instead
+of a timeout and a panic.
+
+getPlatform() does not retain, so the result is retained to balance the
+OSSafeReleaseNULL() at the end of the function.
+
+A platform expert that is missing entirely is no longer fatal either. The
+function's own logic already has a name for a platform that cannot answer the
+question -- kIOReturnUnsupported, which it handles by doing nothing -- and
+having nobody to ask is the same situation. Only kIOReturnNotPrivileged does
+anything, and what it does is mdevremoveall(): it tears down the memory
+devices, which on this machine would throw away the root filesystem. Guessing
+that answer is the one thing this code must not do.
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -732,11 +732,48 @@
+ 	OSDictionary     *matching;
+ 	const OSSymbol   *functionName = OSSymbol::withCStringNoCopy("SecureRootName");
+ 
+-	matching = IOService::serviceMatching("IOPlatformExpert");
+-	assert(matching);
+-	pe = (IOPlatformExpert *) IOService::waitForMatchingService(matching, 30ULL * kSecondScale);
+-	matching->release();
+-	assert(pe);
++	/*
++	 * Ask the platform expert directly before waiting for one to be
++	 * matched. IOPlatformExpert::start() installs itself as gIOPlatform,
++	 * which is what getPlatform() returns, but it never calls
++	 * registerService(). On a real device that does not matter, because
++	 * the platform expert is AppleARMPlatform, a kext, and it registers
++	 * itself; the wait below is there for the case where it has not
++	 * finished matching yet.
++	 *
++	 * This kernel has no kexts. Its platform expert is the stock
++	 * IOPlatformExpert, started from the personality in
++	 * KernelConfigTables.cpp, so nothing ever matches "IOPlatformExpert",
++	 * the wait runs its full timeout and returns NULL, and the assert
++	 * below ends the boot immediately after the root filesystem mounted.
++	 * The object exists the whole time; it is simply not visible to
++	 * matching.
++	 *
++	 * Asking first also removes a 30 second stall from every boot in that
++	 * case, and changes nothing where a platform expert does register: by
++	 * this point bsd_autoconf() has long since run, and if it has not,
++	 * gIOPlatform is NULL and the wait happens exactly as before.
++	 */
++	pe = IOService::getPlatform();
++	if (pe) {
++		pe->retain();           /* balance the release below */
++	} else {
++		matching = IOService::serviceMatching("IOPlatformExpert");
++		assert(matching);
++		pe = (IOPlatformExpert *) IOService::waitForMatchingService(matching, 30ULL * kSecondScale);
++		matching->release();
++	}
++
++	if (!pe) {
++		/*
++		 * No platform expert at all. That is the kIOReturnUnsupported
++		 * case below -- nobody to answer the question -- and that case
++		 * does nothing, so neither does this.
++		 */
++		functionName->release();
++		return;
++	}
++
+ 	// Returns kIOReturnNotPrivileged is the root device is not secure.
+ 	// Returns kIOReturnUnsupported if "SecureRootName" is not implemented.
+ 	result = pe->callPlatformFunction(functionName, false, (void *)rootName, (void *)0, (void *)0, (void *)0);
