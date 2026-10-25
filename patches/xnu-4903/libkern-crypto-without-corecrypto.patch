@@ -1,0 +1,794 @@
+Let all of libkern/crypto fail instead of faulting when corecrypto is absent.
+
+This replaces aes-without-corecrypto.patch, which covered one file. Its own
+closing note said what would happen next:
+
+    The rest of libkern/crypto -- SHA, MD5, HMAC, ChaCha20 -- has the
+    identical shape and will fault the same way when something reaches it.
+
+Something did. With HFS mounting the RAM disk, the boot now dies in
+
+    pc  _MD5Init + 0x34
+    lr  _hfs_getvoluuid + 0x5c
+    esr 0x96000005      far 0x0000000000000020
+
+far 0x20 is the offset of ccmd5_di in struct crypto_functions: four digest
+function pointers, then the digest infos. The same count puts
+ccaes_cbc_encrypt at 0x78, which is where the earlier AES fault landed. One
+absence, two symptoms.
+
+g_crypto_funcs is filled in by register_crypto_functions(), whose only caller
+is the corecrypto kext. This kernel has no kexts, so it stays NULL, and every
+wrapper in this directory opens by reading a field out of it.
+
+So the whole directory is covered at once rather than a file per boot. The
+shape is the one Apple already uses for the GCM modes -- read through a macro
+that yields NULL when the table is missing, then check:
+
+    #define CRYPTO_MODE(field)  (g_crypto_funcs ? g_crypto_funcs->field : NULL)
+
+File by file:
+
+  corecrypto_aes.c    unchanged from the earlier patch: 22 mode reads routed
+                      through CRYPTO_MODE, and the four CBC wrappers given the
+                      check the GCM ones already had.
+
+  corecrypto_md5.c    MD5Init, MD5Update, MD5Final.
+  corecrypto_sha1.c   SHA1Init, SHA1Update, SHA1Final.
+  corecrypto_sha2.c   SHA{256,384,512}_{Init,Update,Final}.
+
+                      These return void, so there is no way to report the
+                      failure. They do nothing instead, and leave something
+                      deterministic: Init zeroes the context, Final zeroes the
+                      digest. Without that, a caller reads whatever was on the
+                      stack and cannot tell it from a hash.
+
+  corecrypto_des.c    The two key schedules return -1; the two single-block
+                      encrypt entry points return void and zero their output
+                      block. des_is_weak_key() returns 0, which nothing can
+                      act on because the key schedule has already refused.
+
+  corecrypto_rsa.c    Both entry points return -1. rsa_verify_pkcs1v15() also
+                      clears *valid, which its callers would otherwise read
+                      uninitialised from the stack -- on the code-signing
+                      path, that is the difference between a failed check and
+                      an accidentally passed one.
+
+  corecrypto_chacha20poly1305.c
+                      Every entry point here is "return fns()->x(info(), ...)",
+                      so each gets its own check; making fns() return NULL
+                      alone would move the dereference one line down.
+
+corecrypto_aesxts.c is deliberately left alone. xts_start() already opens with
+
+    if (!g_crypto_funcs) {
+            panic("%s: corecrypto not registered!\n", __FUNCTION__);
+    }
+
+so it says what is wrong instead of faulting, and xts_encrypt/xts_decrypt
+cannot be reached without a key schedule from it. XTS is FileVault and
+CoreStorage; neither exists here.
+
+What this does not do is make any of it work. A digest now returns zeros
+rather than faulting, and that is enough for hfs_getvoluuid(), which only
+wants a volume UUID. It is not enough for code signing: iOS validates every
+binary against a SHA hash and an RSA signature through this same table, so a
+real iOS userland needs corecrypto built into the kernel, the way libpthread
+and HFS now are. These guards are not a substitute for that; they are what
+keeps the kernel alive until it is done, and they stay correct afterwards --
+once something registers the table, every check here passes.
+
+--- a/libkern/crypto/corecrypto_aes.c
++++ b/libkern/crypto/corecrypto_aes.c
+@@ -32,10 +32,25 @@
+ #include <corecrypto/ccaes.h>
+ #include <kern/debug.h>
+ 
++/*
++ * This kernel is built without the corecrypto kext, so nothing ever calls
++ * register_crypto_functions() and g_crypto_funcs stays NULL. Every wrapper
++ * below opens by reading a mode out of that table.
++ *
++ * The GCM wrappers already cope with the mode itself being absent -- they
++ * follow the read with "if (!gcm) return aes_error" -- so reading through
++ * this makes a missing table behave exactly like a missing mode, and they
++ * need no other change. The CBC wrappers have no such check and get one.
++ */
++#define CRYPTO_MODE(field)      (g_crypto_funcs ? g_crypto_funcs->field : NULL)
++
+ aes_rval
+ aes_encrypt_key(const unsigned char *key, int key_len, aes_encrypt_ctx cx[1])
+ {
+-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_encrypt;
++	const struct ccmode_cbc *cbc = CRYPTO_MODE(ccaes_cbc_encrypt);
++	if (!cbc) {
++		return aes_error;
++	}
+ 
+ 	/* Make sure the context size for the mode fits in the one we have */
+ 	if (cbc->size > sizeof(aes_encrypt_ctx)) {
+@@ -51,7 +66,10 @@
+ aes_encrypt_cbc(const unsigned char *in_blk, const unsigned char *in_iv, unsigned int num_blk,
+     unsigned char *out_blk, aes_encrypt_ctx cx[1])
+ {
+-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_encrypt;
++	const struct ccmode_cbc *cbc = CRYPTO_MODE(ccaes_cbc_encrypt);
++	if (!cbc) {
++		return aes_error;
++	}
+ 	cccbc_iv_decl(cbc->block_size, ctx_iv);
+ 
+ 	cccbc_set_iv(cbc, ctx_iv, in_iv);
+@@ -72,7 +90,10 @@
+ aes_rval
+ aes_decrypt_key(const unsigned char *key, int key_len, aes_decrypt_ctx cx[1])
+ {
+-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_decrypt;
++	const struct ccmode_cbc *cbc = CRYPTO_MODE(ccaes_cbc_decrypt);
++	if (!cbc) {
++		return aes_error;
++	}
+ 
+ 	/* Make sure the context size for the mode fits in the one we have */
+ 	if (cbc->size > sizeof(aes_decrypt_ctx)) {
+@@ -88,7 +109,10 @@
+ aes_decrypt_cbc(const unsigned char *in_blk, const unsigned char *in_iv, unsigned int num_blk,
+     unsigned char *out_blk, aes_decrypt_ctx cx[1])
+ {
+-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_decrypt;
++	const struct ccmode_cbc *cbc = CRYPTO_MODE(ccaes_cbc_decrypt);
++	if (!cbc) {
++		return aes_error;
++	}
+ 	cccbc_iv_decl(cbc->block_size, ctx_iv);
+ 
+ 	cccbc_set_iv(cbc, ctx_iv, in_iv);
+@@ -134,7 +158,7 @@
+ aes_rval
+ aes_encrypt_key_gcm(const unsigned char *key, int key_len, ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_encrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -145,7 +169,7 @@
+ aes_rval
+ aes_encrypt_key_with_iv_gcm(const unsigned char *key, int key_len, const unsigned char *in_iv, ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_encrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -156,7 +180,7 @@
+ aes_rval
+ aes_encrypt_set_iv_gcm(const unsigned char *in_iv, unsigned int len, ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_encrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -167,7 +191,7 @@
+ aes_rval
+ aes_encrypt_reset_gcm(ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_encrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -178,7 +202,7 @@
+ aes_rval
+ aes_encrypt_inc_iv_gcm(unsigned char *out_iv, ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_encrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -189,7 +213,7 @@
+ aes_rval
+ aes_encrypt_aad_gcm(const unsigned char *aad, unsigned int aad_bytes, ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_encrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -201,7 +225,7 @@
+ aes_encrypt_gcm(const unsigned char *in_blk, unsigned int num_bytes,
+     unsigned char *out_blk, ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_encrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -213,7 +237,7 @@
+ aes_encrypt_finalize_gcm(unsigned char *tag, unsigned int tag_bytes, ccgcm_ctx *ctx)
+ {
+ 	int rc;
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_encrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -226,7 +250,7 @@
+ aes_rval
+ aes_decrypt_key_gcm(const unsigned char *key, int key_len, ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_decrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -237,7 +261,7 @@
+ aes_rval
+ aes_decrypt_key_with_iv_gcm(const unsigned char *key, int key_len, const unsigned char *in_iv, ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_decrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -250,7 +274,7 @@
+ {
+ 	int rc;
+ 
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_decrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -263,7 +287,7 @@
+ aes_rval
+ aes_decrypt_reset_gcm(ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_decrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -274,7 +298,7 @@
+ aes_rval
+ aes_decrypt_inc_iv_gcm(unsigned char *out_iv, ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_decrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -285,7 +309,7 @@
+ aes_rval
+ aes_decrypt_aad_gcm(const unsigned char *aad, unsigned int aad_bytes, ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_decrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -297,7 +321,7 @@
+ aes_decrypt_gcm(const unsigned char *in_blk, unsigned int num_bytes,
+     unsigned char *out_blk, ccgcm_ctx *ctx)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_decrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -309,7 +333,7 @@
+ aes_decrypt_finalize_gcm(unsigned char *tag, unsigned int tag_bytes, ccgcm_ctx *ctx)
+ {
+ 	int rc;
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_decrypt);
+ 	if (!gcm) {
+ 		return aes_error;
+ 	}
+@@ -322,7 +346,7 @@
+ unsigned
+ aes_encrypt_get_ctx_size_gcm(void)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_encrypt);
+ 	if (!gcm) {
+ 		return 0;
+ 	}
+@@ -332,7 +356,7 @@
+ unsigned
+ aes_decrypt_get_ctx_size_gcm(void)
+ {
+-	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
++	const struct ccmode_gcm *gcm = CRYPTO_MODE(ccaes_gcm_decrypt);
+ 	if (!gcm) {
+ 		return 0;
+ 	}
+--- a/libkern/crypto/corecrypto_chacha20poly1305.c
++++ b/libkern/crypto/corecrypto_chacha20poly1305.c
+@@ -30,68 +30,110 @@
+ #include <libkern/crypto/crypto_internal.h>
+ #include <libkern/crypto/chacha20poly1305.h>
+ 
++/*
++ * Built without the corecrypto kext, g_crypto_funcs is NULL. Every entry
++ * point in this file is "return fns()->something(info(), ...)", so the table
++ * has to be checked once at the top of each of them; fns() returning NULL on
++ * its own would only move the dereference one line down.
++ */
+ static ccchacha20poly1305_fns_t
+ fns(void)
+ {
+-	return g_crypto_funcs->ccchacha20poly1305_fns;
++	return g_crypto_funcs ? g_crypto_funcs->ccchacha20poly1305_fns : NULL;
+ }
+ 
+ static const struct ccchacha20poly1305_info *
+ info(void)
+ {
+-	return fns()->info();
++	return fns() ? fns()->info() : NULL;
+ }
+ 
+ int
+ chacha20poly1305_init(chacha20poly1305_ctx *ctx, const uint8_t *key)
+ {
++	if (!fns()) {
++		return -1;
++	}
++
+ 	return fns()->init(info(), ctx, key);
+ }
+ 
+ int
+ chacha20poly1305_reset(chacha20poly1305_ctx *ctx)
+ {
++	if (!fns()) {
++		return -1;
++	}
++
+ 	return fns()->reset(info(), ctx);
+ }
+ 
+ int
+ chacha20poly1305_setnonce(chacha20poly1305_ctx *ctx, const uint8_t *nonce)
+ {
++	if (!fns()) {
++		return -1;
++	}
++
+ 	return fns()->setnonce(info(), ctx, nonce);
+ }
+ 
+ int
+ chacha20poly1305_incnonce(chacha20poly1305_ctx *ctx, uint8_t *nonce)
+ {
++	if (!fns()) {
++		return -1;
++	}
++
+ 	return fns()->incnonce(info(), ctx, nonce);
+ }
+ 
+ int
+ chacha20poly1305_aad(chacha20poly1305_ctx *ctx, size_t nbytes, const void *aad)
+ {
++	if (!fns()) {
++		return -1;
++	}
++
+ 	return fns()->aad(info(), ctx, nbytes, aad);
+ }
+ 
+ int
+ chacha20poly1305_encrypt(chacha20poly1305_ctx *ctx, size_t nbytes, const void *ptext, void *ctext)
+ {
++	if (!fns()) {
++		return -1;
++	}
++
+ 	return fns()->encrypt(info(), ctx, nbytes, ptext, ctext);
+ }
+ 
+ int
+ chacha20poly1305_finalize(chacha20poly1305_ctx *ctx, uint8_t *tag)
+ {
++	if (!fns()) {
++		return -1;
++	}
++
+ 	return fns()->finalize(info(), ctx, tag);
+ }
+ 
+ int
+ chacha20poly1305_decrypt(chacha20poly1305_ctx *ctx, size_t nbytes, const void *ctext, void *ptext)
+ {
++	if (!fns()) {
++		return -1;
++	}
++
+ 	return fns()->decrypt(info(), ctx, nbytes, ctext, ptext);
+ }
+ 
+ int
+ chacha20poly1305_verify(chacha20poly1305_ctx *ctx, const uint8_t *tag)
+ {
++	if (!fns()) {
++		return -1;
++	}
++
+ 	return fns()->verify(info(), ctx, tag);
+ }
+--- a/libkern/crypto/corecrypto_des.c
++++ b/libkern/crypto/corecrypto_des.c
+@@ -33,12 +33,25 @@
+ #include <libkern/crypto/des.h>
+ #include <corecrypto/ccmode.h>
+ 
++/*
++ * Built without the corecrypto kext, g_crypto_funcs is NULL and every mode
++ * read below is a null dereference. DES is unreachable on this machine --
++ * it is only used by IPsec -- but a key schedule that cannot be built has an
++ * error return, and the two encrypt entry points, which do not, leave their
++ * output block zeroed rather than untouched.
++ */
++#define CRYPTO_MODE(field)      (g_crypto_funcs ? g_crypto_funcs->field : NULL)
++
+ /* Single DES ECB - used by ipv6 (esp_core.c) */
+ int
+ des_ecb_key_sched(des_cblock *key, des_ecb_key_schedule *ks)
+ {
+-	const struct ccmode_ecb *enc = g_crypto_funcs->ccdes_ecb_encrypt;
+-	const struct ccmode_ecb *dec = g_crypto_funcs->ccdes_ecb_decrypt;
++	const struct ccmode_ecb *enc = CRYPTO_MODE(ccdes_ecb_encrypt);
++	const struct ccmode_ecb *dec = CRYPTO_MODE(ccdes_ecb_decrypt);
++
++	if (!enc || !dec) {
++		return -1;
++	}
+ 
+ 	/* Make sure the context size for the mode fits in the one we have */
+ 	if ((enc->size > sizeof(ks->enc)) || (dec->size > sizeof(ks->dec))) {
+@@ -57,9 +70,14 @@
+ void
+ des_ecb_encrypt(des_cblock *in, des_cblock *out, des_ecb_key_schedule *ks, int enc)
+ {
+-	const struct ccmode_ecb *ecb = enc ? g_crypto_funcs->ccdes_ecb_encrypt : g_crypto_funcs->ccdes_ecb_decrypt;
++	const struct ccmode_ecb *ecb = enc ? CRYPTO_MODE(ccdes_ecb_encrypt) : CRYPTO_MODE(ccdes_ecb_decrypt);
+ 	ccecb_ctx *ctx = enc ? ks->enc : ks->dec;
+ 
++	if (!ecb) {
++		bzero(out, sizeof(*out));
++		return;
++	}
++
+ 	ecb->ecb(ctx, 1, in, out);
+ }
+ 
+@@ -69,8 +87,12 @@
+ des3_ecb_key_sched(des_cblock *key, des3_ecb_key_schedule *ks)
+ {
+ 	int rc;
+-	const struct ccmode_ecb *enc = g_crypto_funcs->cctdes_ecb_encrypt;
+-	const struct ccmode_ecb *dec = g_crypto_funcs->cctdes_ecb_decrypt;
++	const struct ccmode_ecb *enc = CRYPTO_MODE(cctdes_ecb_encrypt);
++	const struct ccmode_ecb *dec = CRYPTO_MODE(cctdes_ecb_decrypt);
++
++	if (!enc || !dec) {
++		return -1;
++	}
+ 
+ 	/* Make sure the context size for the mode fits in the one we have */
+ 	if ((enc->size > sizeof(ks->enc)) || (dec->size > sizeof(ks->dec))) {
+@@ -87,9 +109,14 @@
+ void
+ des3_ecb_encrypt(des_cblock *in, des_cblock *out, des3_ecb_key_schedule *ks, int enc)
+ {
+-	const struct ccmode_ecb *ecb = enc ? g_crypto_funcs->cctdes_ecb_encrypt : g_crypto_funcs->cctdes_ecb_decrypt;
++	const struct ccmode_ecb *ecb = enc ? CRYPTO_MODE(cctdes_ecb_encrypt) : CRYPTO_MODE(cctdes_ecb_decrypt);
+ 	ccecb_ctx *ctx = enc ? ks->enc : ks->dec;
+ 
++	if (!ecb) {
++		bzero(out, sizeof(*out));
++		return;
++	}
++
+ 	ecb->ecb(ctx, 1, in, out);
+ }
+ 
+@@ -98,5 +125,9 @@
+ int
+ des_is_weak_key(des_cblock *key)
+ {
++	if (!CRYPTO_MODE(ccdes_key_is_weak_fn)) {
++		/* des_ecb_key_sched() has already refused; nothing reaches a cipher. */
++		return 0;
++	}
+ 	return g_crypto_funcs->ccdes_key_is_weak_fn(key, CCDES_KEY_SIZE);
+ }
+--- a/libkern/crypto/corecrypto_md5.c
++++ b/libkern/crypto/corecrypto_md5.c
+@@ -37,10 +37,28 @@
+ 	memcpy(ccdigest_state_ccn(di, di_ctx), md5_ctx->state, di->state_size);
+ }
+ 
++
++/*
++ * This kernel is built without the corecrypto kext, so nothing ever calls
++ * register_crypto_functions() and g_crypto_funcs stays NULL. Every function
++ * below opens by reading the digest info out of that table, and the
++ * ccdigest_di_decl() that follows sizes a stack array from it, so a missing
++ * table is a null dereference before any check could run.
++ *
++ * These wrappers return void: there is no way to report the failure, so they
++ * do nothing and leave a deterministic result behind -- a zeroed context, a
++ * zeroed digest -- rather than whatever was on the stack.
++ */
++#define CRYPTO_DI(field)        (g_crypto_funcs ? g_crypto_funcs->field : NULL)
++
+ void
+ MD5Init(MD5_CTX *ctx)
+ {
+-	const struct ccdigest_info *di = g_crypto_funcs->ccmd5_di;
++	const struct ccdigest_info *di = CRYPTO_DI(ccmd5_di);
++	if (!di) {
++		bzero(ctx, sizeof(*ctx));
++		return;
++	}
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+ 	g_crypto_funcs->ccdigest_init_fn(di, di_ctx);
+@@ -51,7 +69,10 @@
+ void
+ MD5Update(MD5_CTX *ctx, const void *data, unsigned int len)
+ {
+-	const struct ccdigest_info *di = g_crypto_funcs->ccmd5_di;
++	const struct ccdigest_info *di = CRYPTO_DI(ccmd5_di);
++	if (!di) {
++		return;
++	}
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+ 	MD5ToDi(di, ctx, di_ctx);
+@@ -62,7 +83,11 @@
+ void
+ MD5Final(unsigned char digest[MD5_DIGEST_LENGTH], MD5_CTX *ctx)
+ {
+-	const struct ccdigest_info *di = g_crypto_funcs->ccmd5_di;
++	const struct ccdigest_info *di = CRYPTO_DI(ccmd5_di);
++	if (!di) {
++		bzero(digest, MD5_DIGEST_LENGTH);
++		return;
++	}
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+ 	MD5ToDi(di, ctx, di_ctx);
+--- a/libkern/crypto/corecrypto_rsa.c
++++ b/libkern/crypto/corecrypto_rsa.c
+@@ -31,6 +31,15 @@
+ #include <corecrypto/ccrsa.h>
+ 
+ 
++/*
++ * Built without the corecrypto kext, g_crypto_funcs is NULL and both calls
++ * below are a null dereference. rsa_verify_pkcs1v15() matters most: it is on
++ * the code-signing path, so it also clears *valid, which its callers would
++ * otherwise read uninitialised from the stack and could take for a good
++ * signature.
++ */
++#define CRYPTO_FN(field)        (g_crypto_funcs ? g_crypto_funcs->field : NULL)
++
+ int
+ rsa_make_pub(rsa_pub_ctx *pub,
+     size_t exp_nbytes, const uint8_t *exp,
+@@ -40,6 +49,9 @@
+ 	    || (mod_nbytes > RSA_MAX_KEY_BITSIZE / 8)) {
+ 		return -1; // Too big
+ 	}
++	if (!CRYPTO_FN(ccrsa_make_pub_fn)) {
++		return -1;
++	}
+ 	ccrsa_ctx_n(pub->key) = ccn_nof(RSA_MAX_KEY_BITSIZE);
+ 	return g_crypto_funcs->ccrsa_make_pub_fn(pub->key,
+ 	           exp_nbytes, exp,
+@@ -52,6 +64,10 @@
+     size_t sig_len, const uint8_t *sig,
+     bool *valid)
+ {
++	if (!CRYPTO_FN(ccrsa_verify_pkcs1v15_fn)) {
++		*valid = false;
++		return -1;
++	}
+ 	return g_crypto_funcs->ccrsa_verify_pkcs1v15_fn(pub->key, oid,
+ 	           digest_len, digest,
+ 	           sig_len, sig, valid);
+--- a/libkern/crypto/corecrypto_sha1.c
++++ b/libkern/crypto/corecrypto_sha1.c
+@@ -37,10 +37,28 @@
+ 	memcpy(ccdigest_state_ccn(di, di_ctx), sha1_ctx->h.b8, di->state_size);
+ }
+ 
++
++/*
++ * This kernel is built without the corecrypto kext, so nothing ever calls
++ * register_crypto_functions() and g_crypto_funcs stays NULL. Every function
++ * below opens by reading the digest info out of that table, and the
++ * ccdigest_di_decl() that follows sizes a stack array from it, so a missing
++ * table is a null dereference before any check could run.
++ *
++ * These wrappers return void: there is no way to report the failure, so they
++ * do nothing and leave a deterministic result behind -- a zeroed context, a
++ * zeroed digest -- rather than whatever was on the stack.
++ */
++#define CRYPTO_DI(field)        (g_crypto_funcs ? g_crypto_funcs->field : NULL)
++
+ void
+ SHA1Init(SHA1_CTX *ctx)
+ {
+-	const struct ccdigest_info *di = g_crypto_funcs->ccsha1_di;
++	const struct ccdigest_info *di = CRYPTO_DI(ccsha1_di);
++	if (!di) {
++		bzero(ctx, sizeof(*ctx));
++		return;
++	}
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+ 	g_crypto_funcs->ccdigest_init_fn(di, di_ctx);
+@@ -51,7 +69,10 @@
+ void
+ SHA1Update(SHA1_CTX *ctx, const void *data, size_t len)
+ {
+-	const struct ccdigest_info *di = g_crypto_funcs->ccsha1_di;
++	const struct ccdigest_info *di = CRYPTO_DI(ccsha1_di);
++	if (!di) {
++		return;
++	}
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+ 	SHA1ToDi(di, ctx, di_ctx);
+@@ -62,7 +83,11 @@
+ void
+ SHA1Final(void *digest, SHA1_CTX *ctx)
+ {
+-	const struct ccdigest_info *di = g_crypto_funcs->ccsha1_di;
++	const struct ccdigest_info *di = CRYPTO_DI(ccsha1_di);
++	if (!di) {
++		bzero(digest, SHA_DIGEST_LENGTH);
++		return;
++	}
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+ 	SHA1ToDi(di, ctx, di_ctx);
+--- a/libkern/crypto/corecrypto_sha2.c
++++ b/libkern/crypto/corecrypto_sha2.c
+@@ -34,11 +34,27 @@
+ 
+ #if defined(CRYPTO_SHA2)
+ 
++/*
++ * This kernel is built without the corecrypto kext, so nothing ever calls
++ * register_crypto_functions() and g_crypto_funcs stays NULL. Each function
++ * below opens by reading its digest info out of that table and then uses it
++ * without a check, so a missing table is a null dereference.
++ *
++ * These wrappers return void: there is no way to report the failure, so they
++ * do nothing and leave a deterministic result behind -- a zeroed context, a
++ * zeroed digest -- rather than whatever was on the stack.
++ */
++#define CRYPTO_DI(field)        (g_crypto_funcs ? g_crypto_funcs->field : NULL)
++
+ void
+ SHA256_Init(SHA256_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha256_di;
++	di = CRYPTO_DI(ccsha256_di);
++	if (!di) {
++		bzero(ctx, sizeof(*ctx));
++		return;
++	}
+ 
+ 	/* Make sure the context size for the digest info fits in the one we have */
+ 	if (ccdigest_di_size(di) > sizeof(SHA256_CTX)) {
+@@ -52,7 +68,10 @@
+ SHA256_Update(SHA256_CTX *ctx, const void *data, size_t len)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha256_di;
++	di = CRYPTO_DI(ccsha256_di);
++	if (!di) {
++		return;
++	}
+ 
+ 	g_crypto_funcs->ccdigest_update_fn(di, ctx->ctx, len, data);
+ }
+@@ -61,7 +80,11 @@
+ SHA256_Final(void *digest, SHA256_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha256_di;
++	di = CRYPTO_DI(ccsha256_di);
++	if (!di) {
++		bzero(digest, SHA256_DIGEST_LENGTH);
++		return;
++	}
+ 
+ 	ccdigest_final(di, ctx->ctx, digest);
+ }
+@@ -70,7 +93,11 @@
+ SHA384_Init(SHA384_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha384_di;
++	di = CRYPTO_DI(ccsha384_di);
++	if (!di) {
++		bzero(ctx, sizeof(*ctx));
++		return;
++	}
+ 
+ 	/* Make sure the context size for the digest info fits in the one we have */
+ 	if (ccdigest_di_size(di) > sizeof(SHA384_CTX)) {
+@@ -84,7 +111,10 @@
+ SHA384_Update(SHA384_CTX *ctx, const void *data, size_t len)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha384_di;
++	di = CRYPTO_DI(ccsha384_di);
++	if (!di) {
++		return;
++	}
+ 
+ 	g_crypto_funcs->ccdigest_update_fn(di, ctx->ctx, len, data);
+ }
+@@ -94,7 +124,11 @@
+ SHA384_Final(void *digest, SHA384_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha384_di;
++	di = CRYPTO_DI(ccsha384_di);
++	if (!di) {
++		bzero(digest, SHA384_DIGEST_LENGTH);
++		return;
++	}
+ 
+ 	ccdigest_final(di, ctx->ctx, digest);
+ }
+@@ -103,7 +137,11 @@
+ SHA512_Init(SHA512_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha512_di;
++	di = CRYPTO_DI(ccsha512_di);
++	if (!di) {
++		bzero(ctx, sizeof(*ctx));
++		return;
++	}
+ 
+ 	/* Make sure the context size for the digest info fits in the one we have */
+ 	if (ccdigest_di_size(di) > sizeof(SHA512_CTX)) {
+@@ -117,7 +155,10 @@
+ SHA512_Update(SHA512_CTX *ctx, const void *data, size_t len)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha512_di;
++	di = CRYPTO_DI(ccsha512_di);
++	if (!di) {
++		return;
++	}
+ 
+ 	g_crypto_funcs->ccdigest_update_fn(di, ctx->ctx, len, data);
+ }
+@@ -126,7 +167,11 @@
+ SHA512_Final(void *digest, SHA512_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha512_di;
++	di = CRYPTO_DI(ccsha512_di);
++	if (!di) {
++		bzero(digest, SHA512_DIGEST_LENGTH);
++		return;
++	}
+ 
+ 	ccdigest_final(di, ctx->ctx, digest);
+ }
