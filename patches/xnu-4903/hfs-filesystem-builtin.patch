@@ -146,6 +146,13 @@ calls its own C++ objects as well. Naming it hfs_iokit.o sets variables that
 no rule ever reads, which is exactly how -UCONFIG_PROTECT came to be present
 in the makefile and absent from the command line that compiled hfs_iokit.cpp.
 
+hfs_module_start() names each of its stages on the console, the way bsd_init
+traces its own. It is called from inside bsd_init rather than loaded as a kext
+at leisure, so anything in it that does not finish stops the boot before the
+root mount with nothing printed between "calling hfs_module_start" and
+silence. The four lines -- module start, vfs_fsadd, zones, sysctls, registered
+-- cost nothing and say which stage was reached.
+
 This gets a filesystem into the kernel. It does not yet get a volume into the
 ramdisk: the image the shim carries still has to be made, and made as HFS+.
 
@@ -305,7 +312,7 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
  
  extern struct vnodeopv_desc hfs_vnodeop_opv_desc;
  #if CONFIG_HFS_STD
-@@ -69,11 +62,8 @@
+@@ -69,10 +62,16 @@
  extern struct vnodeopv_desc hfs_fifoop_opv_desc;
  extern struct vfsops hfs_vfsops;
  
@@ -314,11 +321,37 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
  {
 -	if (!super::start(provider))
 -		return false;
--
++	/*
++	 * Called from bsd_init() rather than loaded as a kext, so each stage
++	 * names itself the way bsd_init's own trace does. A filesystem that
++	 * does not finish registering stops the boot before the root mount
++	 * with nothing on the console to say where, and these four lines are
++	 * the difference between knowing and guessing.
++	 */
++	printf("hfs: module start\n");
+ 
  #ifndef panic_on_assert
  	panic_on_assert = PE_i_can_has_kernel_configuration() & kPEICanHasAssertions;
- #endif
-@@ -125,16 +115,11 @@
+@@ -110,6 +109,7 @@
+ 					  | VFS_TBLNATIVEXATTR)
+ 	};
+ 
++	printf("hfs: vfs_fsadd, %d vnode operation vectors\n", vfe.vfe_vopcnt);
+ 	int ret = vfs_fsadd(&vfe, &vfs_handle);
+ 
+ 	if (ret) {
+@@ -118,23 +118,21 @@
+ 		return false;
+ 	}
+ 
++	printf("hfs: zones\n");
+ 	hfs_init_zones();
+-	
++
++	printf("hfs: sysctls\n");
+ 	hfs_sysctl_register();
+ 
++	printf("hfs: registered\n");
  	return true;
  }
  
@@ -340,7 +373,7 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
  
  int hfs_is_ejectable(const char *cdev_name)
  {
-@@ -250,6 +235,12 @@
+@@ -250,6 +248,12 @@
  }
  
  // Interface with AKS
@@ -353,7 +386,7 @@ ramdisk: the image the shim carries still has to be made, and made as HFS+.
  
  static aks_file_system_key_services_t *
  key_services(void)
-@@ -305,3 +296,5 @@
+@@ -305,3 +309,5 @@
  		return ENXIO;
  	return ks->backup_key(access, wrapped_key_in, wrapped_key_out);
  }
