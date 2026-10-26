@@ -1,4 +1,4 @@
-Give the kernel a minimal AMFI, so that dyld can start.
+Give the kernel a minimal AMFI, so that dyld and launchd can start.
 
 With launchd and its 37 dylibs on the RAM disk, the boot now gets as far as
 running dyld, and dyld stops on its own first question:
@@ -62,6 +62,31 @@ bit assignments belong to AMFI and are deliberately not written down in the
 patch: this kernel has no way to check a guess about them, and a comment
 asserting the wrong ones would be worse than none.
 
+Once dyld ran and launchd started a daemon, the same absence surfaced a
+second time:
+
+    initproc exited -- exit reason namespace 7 subcode 0x1 description:
+    unexpected exec of non-platform binary: /usr/sbin/syslogd
+
+launchd had spawned /usr/libexec/xpcproxy and xpcproxy had exec'd syslogd;
+what launchd refused was the result. A daemon named by a system LaunchDaemons
+plist has to be a platform binary, and nothing in this kernel could make one.
+That status comes from a single bit in ubc_cs_blob_add():
+
+    if (blob->csb_flags & CS_PLATFORM_BINARY) {
+            blob->csb_platform_binary = 1;
+
+and the only thing that can set it is the policy hook immediately above,
+which is handed the flags by reference so that a policy can add to them. That
+hook is AMFI's on a device. So this policy answers it too, and answers yes.
+
+Yes for everything sounds worse than it is. On a device the answer comes from
+the signature, and Apple's code is platform code because its signature says
+so. This kernel cannot tell one signature from another: the SHA that would
+distinguish them returns zeros, because there is no corecrypto. The
+distinction does not exist here, so refusing to draw it gives nothing away.
+amfi_platform_binary=0 turns it off.
+
 What this is not: it is not AMFI. It answers one question and implements no
 part of what the name stands for. Nothing here validates a code signature, an
 entitlement or a provisioning profile, and nothing here is a step toward
@@ -96,7 +121,7 @@ A real iOS userland will need the real thing; this gets the loader running.
  #if CONFIG_DTRACE
 --- a/security/mac_base.c
 +++ b/security/mac_base.c
-@@ -1853,6 +1853,134 @@
+@@ -1853,6 +1853,209 @@
  	return error;
  }
  
@@ -108,6 +133,7 @@ A real iOS userland will need the real thing; this gets the loader running.
 + */
 +#include <pexpert/pexpert.h>
 +#include <libkern/section_keywords.h>
++#include <kern/cs_blobs.h>
 +
 +/*
 + * A minimal AMFI, so that dyld can start.
@@ -201,8 +227,80 @@ A real iOS userland will need the real thing; this gets the loader running.
 +	return copyout(&answer, (user_addr_t)args.output_flags, sizeof(answer));
 +}
 +
++/*
++ * The second thing AMFI does that this kernel misses: mark Apple's own
++ * binaries as platform binaries.
++ *
++ * With launchd running and a daemon to start, the boot ended here instead:
++ *
++ *     initproc exited -- exit reason namespace 7 subcode 0x1 description:
++ *     unexpected exec of non-platform binary: /usr/sbin/syslogd
++ *
++ * launchd had already spawned /usr/libexec/xpcproxy, which had exec'd
++ * syslogd; what it refused was the result. A daemon out of a system
++ * LaunchDaemons plist is required to be a platform binary, and launchd calls
++ * its own assertion fatal when one is not.
++ *
++ * Nothing in this kernel can make that true. ubc_cs_blob_add() decides it
++ * from one bit:
++ *
++ *     if (blob->csb_flags & CS_PLATFORM_BINARY) {
++ *             blob->csb_platform_binary = 1;
++ *
++ * and the only thing that can put that bit there is the policy hook a few
++ * lines above, which is handed the flags by reference precisely so a policy
++ * can add to them:
++ *
++ *     unsigned int cs_flags = blob->csb_flags;
++ *     error = mac_vnode_check_signature(vp, blob, imgp, &cs_flags, ...);
++ *     blob->csb_flags = cs_flags;
++ *
++ * That hook is AMFI's on a device, where the answer comes from the signature:
++ * Apple's own code is platform code and nothing else is. Here it is answered
++ * yes for everything, which sounds worse than it is -- this kernel cannot
++ * tell one signature from another in the first place, because the SHA that
++ * would distinguish them returns zeros without corecrypto. The distinction
++ * does not exist yet, so nothing is being given away by not drawing it.
++ *
++ * amfi_platform_binary=0 turns it off, which is useful for finding out
++ * whether something depends on it.
++ *
++ * CS_PLATFORM_PATH is cleared rather than left alone: it means "platform by
++ * virtue of where it sits on disk", it is macOS-only, and claiming it here
++ * would be a second claim this kernel cannot support.
++ */
++static int amfi_platform_binary = 1;
++
++static int
++amfi_stub_vnode_check_signature(struct vnode *vp __unused,
++    struct label *label __unused,
++    cpu_type_t cpu_type __unused,
++    struct cs_blob *cs_blob __unused,
++    unsigned int *cs_flags,
++    unsigned int *signer_type,
++    int flags __unused,
++    char **fatal_failure_desc __unused,
++    size_t *fatal_failure_desc_len __unused)
++{
++	if (amfi_platform_binary && cs_flags != NULL) {
++		*cs_flags |= CS_PLATFORM_BINARY;
++		*cs_flags &= ~CS_PLATFORM_PATH;
++	}
++	if (signer_type != NULL) {
++		*signer_type = CS_SIGNER_TYPE_UNKNOWN;
++	}
++
++	/*
++	 * fatal_failure_desc is left alone. mac_vnode_check_signature() reads
++	 * a non-zero length as "the signature failed fatally" and panics if
++	 * that is claimed alongside a zero return.
++	 */
++	return 0;
++}
++
 +static struct mac_policy_ops amfi_stub_policy_ops = {
 +	.mpo_policy_syscall = amfi_stub_policy_syscall,
++	.mpo_vnode_check_signature = amfi_stub_vnode_check_signature,
 +};
 +
 +SECURITY_READ_ONLY_LATE(static struct mac_policy_conf) amfi_stub_policy_conf = {
@@ -224,6 +322,8 @@ A real iOS userland will need the real thing; this gets the loader running.
 +{
 +	PE_parse_boot_argn("amfi_dyld_flags", &amfi_dyld_flags,
 +	    sizeof(amfi_dyld_flags));
++	PE_parse_boot_argn("amfi_platform_binary", &amfi_platform_binary,
++	    sizeof(amfi_platform_binary));
 +	mac_policy_register(&amfi_stub_policy_conf, &amfi_stub_policy_handle,
 +	    NULL);
 +}
