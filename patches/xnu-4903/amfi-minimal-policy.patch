@@ -95,6 +95,59 @@ not have. It exists so that dyld can get past a call that cannot otherwise be
 answered, on a kernel that has no code signing to enforce in the first place.
 A real iOS userland will need the real thing; this gets the loader running.
 
+
+The first attempt at that was not enough: the same panic came back with the
+hook in place. So launchd was disassembled too, to find out what it actually
+asks rather than assume it:
+
+    mov  w1, #0                      ; ops = CS_OPS_STATUS
+    bl   _csops_audittoken
+    cbz  w0, 0x1000205ec             ; on success ->
+    bl   ___error
+    ldr  w8, [x0]
+    cmp  w8, #0x3                    ; ESRCH: the process is gone, let it be
+    b.eq <return>
+    ...
+    adr  x2, "csops returned %d"     ; any other errno: logged, then fatal
+    ...
+  0x1000205ec:
+    ldur w8, [fp, #-0x24]            ; the status word csops wrote
+    tbnz w8, #0x1a, <return>         ; bit 26 set -> accepted
+    ...                              ; clear -> "unexpected exec of
+                                     ;   non-platform binary: %s: %s [%d]"
+
+Bit 26 is CS_PLATFORM_BINARY. That is worth knowing for what it rules out as
+much as for what it confirms: launchd does not compare a cdhash, so this is
+not blocked on corecrypto, and the chain it does depend on is the one this
+policy already writes to --
+
+    amfi_stub_vnode_check_signature()  sets CS_PLATFORM_BINARY in cs_flags
+    ubc_cs_blob_add()                  turns that into csb_platform_binary
+    csproc_get_platform_binary()       reads it back off the text vnode
+    csops(CS_OPS_STATUS)               ORs it into the word launchd reads
+
+-- with every link of it read and found correct. Something in it does not
+join up, and reading further has stopped paying: both ends are known and
+nothing between them is conditional in a way that explains it.
+
+So this adds a trace instead of another guess. amfi_debug=1 prints what the
+signature hook is asked and what it answers, and -- through
+mpo_proc_check_get_cs_info, which csops_internal() calls on the way to
+CS_OPS_STATUS -- prints the kernel's answer at the moment launchd asks for
+it:
+
+    amfi: signature of syslogd: cs_flags 0x0 -> 0x4000000
+    amfi: pid 1 asked csops(0) about pid 23[syslogd]: platform=1
+
+Two lines that put the break on one side or the other. It is a boot-arg of
+its own rather than a use of cs_debug because cs_debug > 1 also turns on
+cs_validate_page()'s per-page report, and on this kernel every page fails to
+validate -- that is corecrypto's absence, and it fills the console faster
+than it can be read.
+
+mac_policy_register()'s return value is now checked as well. It was ignored,
+which would have made a registration failure silent: the boot would carry on
+and die in dyld, with nothing on the console connecting the two.
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
 @@ -156,6 +156,7 @@
@@ -121,7 +174,7 @@ A real iOS userland will need the real thing; this gets the loader running.
  #if CONFIG_DTRACE
 --- a/security/mac_base.c
 +++ b/security/mac_base.c
-@@ -1853,6 +1853,209 @@
+@@ -1853,6 +1853,290 @@
  	return error;
  }
  
@@ -134,6 +187,7 @@ A real iOS userland will need the real thing; this gets the loader running.
 +#include <pexpert/pexpert.h>
 +#include <libkern/section_keywords.h>
 +#include <kern/cs_blobs.h>
++#include <sys/codesign.h>
 +
 +/*
 + * A minimal AMFI, so that dyld can start.
@@ -194,6 +248,22 @@ A real iOS userland will need the real thing; this gets the loader running.
 +};
 +
 +static uint64_t amfi_dyld_flags = 0;
++
++/*
++ * amfi_debug=1 traces what this policy is asked and what it answers.
++ *
++ * It is deliberately a boot-arg of its own rather than a use of cs_debug.
++ * cs_debug is what would otherwise carry these traces, but cs_debug > 1 also
++ * turns on cs_validate_page()'s per-page report, and on this kernel every
++ * page fails to validate -- the SHA that would hash it returns zeros without
++ * corecrypto -- so the console fills with
++ *
++ *     cs_validate_page: ... actual [0x0 0x0 0x0 0x0 0x0] != expected [...]
++ *
++ * faster than it can be read. A separate flag keeps the answers legible
++ * while that remains true.
++ */
++static int amfi_debug = 0;
 +
 +static int
 +amfi_stub_policy_syscall(struct proc *p, int call, user_addr_t arg)
@@ -272,7 +342,7 @@ A real iOS userland will need the real thing; this gets the loader running.
 +static int amfi_platform_binary = 1;
 +
 +static int
-+amfi_stub_vnode_check_signature(struct vnode *vp __unused,
++amfi_stub_vnode_check_signature(struct vnode *vp,
 +    struct label *label __unused,
 +    cpu_type_t cpu_type __unused,
 +    struct cs_blob *cs_blob __unused,
@@ -282,12 +352,20 @@ A real iOS userland will need the real thing; this gets the loader running.
 +    char **fatal_failure_desc __unused,
 +    size_t *fatal_failure_desc_len __unused)
 +{
++	unsigned int before = (cs_flags != NULL) ? *cs_flags : 0;
++
 +	if (amfi_platform_binary && cs_flags != NULL) {
 +		*cs_flags |= CS_PLATFORM_BINARY;
 +		*cs_flags &= ~CS_PLATFORM_PATH;
 +	}
 +	if (signer_type != NULL) {
 +		*signer_type = CS_SIGNER_TYPE_UNKNOWN;
++	}
++
++	if (amfi_debug) {
++		printf("amfi: signature of %s: cs_flags 0x%x -> 0x%x\n",
++		    (vp != NULL && vp->v_name != NULL) ? vp->v_name : "?",
++		    before, (cs_flags != NULL) ? *cs_flags : 0);
 +	}
 +
 +	/*
@@ -298,9 +376,52 @@ A real iOS userland will need the real thing; this gets the loader running.
 +	return 0;
 +}
 +
++/*
++ * Not an access control check: a trace of the one question launchd asks.
++ *
++ * launchd kills the boot when a daemon it started turns out not to be a
++ * platform binary, and it finds that out by asking the kernel. The call and
++ * the bit are its own code, read out of launchd rather than guessed:
++ *
++ *     mov  w1, #0                      ; ops = CS_OPS_STATUS
++ *     bl   _csops_audittoken
++ *     cbz  w0, 0x1000205ec             ; on success ->
++ *     ...
++ *     adr  x2, "csops returned %d"     ; on failure, logged and then fatal
++ *     ...
++ *   0x1000205ec:
++ *     ldur w8, [fp, #-0x24]            ; the status word csops wrote
++ *     tbnz w8, #0x1a, <return>         ; bit 26 set -> accepted
++ *     ...                              ; clear -> "unexpected exec of
++ *                                      ;   non-platform binary: %s"
++ *
++ * Bit 26 is CS_PLATFORM_BINARY, which csops(CS_OPS_STATUS) ORs in from
++ * csproc_get_platform_binary() -- the blob on the process's text vnode, the
++ * same blob the hook above writes to. So the two ends of that chain are
++ * known; what is not known is whether it joins up, and this prints the
++ * kernel's answer at the moment launchd asks for it.
++ *
++ * csops_internal() calls this before it takes proc_lock, so reading the blob
++ * here is safe. Returning 0 is also the right answer in its own right:
++ * nothing about this kernel justifies refusing a process its own code
++ * signing status.
++ */
++static int
++amfi_stub_proc_check_get_cs_info(kauth_cred_t cred __unused,
++    struct proc *target, unsigned int op)
++{
++	if (amfi_debug && target != NULL) {
++		printf("amfi: pid %d asked csops(%u) about pid %d[%s]: "
++		    "platform=%d\n", proc_selfpid(), op, target->p_pid,
++		    target->p_comm, csproc_get_platform_binary(target));
++	}
++	return 0;
++}
++
 +static struct mac_policy_ops amfi_stub_policy_ops = {
 +	.mpo_policy_syscall = amfi_stub_policy_syscall,
 +	.mpo_vnode_check_signature = amfi_stub_vnode_check_signature,
++	.mpo_proc_check_get_cs_info = amfi_stub_proc_check_get_cs_info,
 +};
 +
 +SECURITY_READ_ONLY_LATE(static struct mac_policy_conf) amfi_stub_policy_conf = {
@@ -320,12 +441,25 @@ A real iOS userland will need the real thing; this gets the loader running.
 +void
 +amfi_stub_policy_init(void)
 +{
++	int error;
++
 +	PE_parse_boot_argn("amfi_dyld_flags", &amfi_dyld_flags,
 +	    sizeof(amfi_dyld_flags));
 +	PE_parse_boot_argn("amfi_platform_binary", &amfi_platform_binary,
 +	    sizeof(amfi_platform_binary));
-+	mac_policy_register(&amfi_stub_policy_conf, &amfi_stub_policy_handle,
-+	    NULL);
++	PE_parse_boot_argn("amfi_debug", &amfi_debug, sizeof(amfi_debug));
++
++	/*
++	 * Reported rather than ignored. A failure here is silent otherwise:
++	 * the boot carries on and dies much later in dyld, with nothing on
++	 * the console to connect the two.
++	 */
++	error = mac_policy_register(&amfi_stub_policy_conf,
++	    &amfi_stub_policy_handle, NULL);
++	if (error != 0) {
++		printf("amfi: mac_policy_register failed: %d -- dyld will not "
++		    "start\n", error);
++	}
 +}
 +
  int
