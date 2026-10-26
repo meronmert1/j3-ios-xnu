@@ -148,6 +148,39 @@ than it can be read.
 mac_policy_register()'s return value is now checked as well. It was ignored,
 which would have made a registration failure silent: the boot would carry on
 and die in dyld, with nothing on the console connecting the two.
+
+The trace found the break, and it was two links further along than either end
+of the chain above. csproc_get_blob() will not look the blob up at all unless
+the PROCESS is marked as having a signature:
+
+    if (NULL == p->p_textvp)             return NULL;
+    if ((p->p_csflags & CS_SIGNED) == 0) return NULL;
+    return ubc_cs_blob_get(p->p_textvp, -1, p->p_textoff);
+
+so csproc_get_platform_binary() answered 0 however the blob was marked, and
+launchd was told the daemon had no signature at all. The trace showed the
+hook running on every binary and setting the bit --
+
+    amfi: signature of syslogd: cs_flags 0x3 -> 0x4000003
+
+-- which is what ruled the hook out and sent the search to the reader instead
+of the writer. 0x3 is CS_VALID | CS_ADHOC, which is also worth noting: iOS
+platform binaries are ad-hoc signed, with the trust cache rather than a CMS
+blob vouching for them.
+
+Nothing else in the kernel sets CS_SIGNED on this path, because it is not in
+CS_ALLOWED_MACHO and a Mach-O does not get to claim it about itself. On a
+device AMFI adds it. So this policy adds it too, which is true as well as
+necessary: the hook is only reached with a parsed CS_CodeDirectory in hand.
+
+That is one of the two links. The other is that exec_mach_imgact() hands over
+no flags at all unless CS_VALID survived the initial page check, and on this
+kernel it cannot -- that belongs with the loader, and is
+codesign-valid-without-corecrypto.patch.
+
+amfi_debug=2 is now what prints the per-signature line. At 1 only the csops
+answer is printed, which is the one that matters once the chain is joined up,
+and one line per dylib is what scrolled it off the screen the first time.
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
 @@ -156,6 +156,7 @@
@@ -174,7 +207,7 @@ and die in dyld, with nothing on the console connecting the two.
  #if CONFIG_DTRACE
 --- a/security/mac_base.c
 +++ b/security/mac_base.c
-@@ -1853,6 +1853,290 @@
+@@ -1853,6 +1853,320 @@
  	return error;
  }
  
@@ -250,7 +283,9 @@ and die in dyld, with nothing on the console connecting the two.
 +static uint64_t amfi_dyld_flags = 0;
 +
 +/*
-+ * amfi_debug=1 traces what this policy is asked and what it answers.
++ * amfi_debug=1 traces the one question launchd asks; 2 also traces every
++ * signature the policy is shown, which is one line per binary and dylib and
++ * scrolls the interesting part off a phone screen.
 + *
 + * It is deliberately a boot-arg of its own rather than a use of cs_debug.
 + * cs_debug is what would otherwise carry these traces, but cs_debug > 1 also
@@ -354,6 +389,34 @@ and die in dyld, with nothing on the console connecting the two.
 +{
 +	unsigned int before = (cs_flags != NULL) ? *cs_flags : 0;
 +
++	if (cs_flags != NULL) {
++		/*
++		 * CS_SIGNED, which nothing else in the kernel sets on this
++		 * path. cs_blob_create_validated() builds csb_flags as
++		 *
++		 *     (ntohl(cd->flags) & CS_ALLOWED_MACHO) | CS_VALID
++		 *
++		 * and CS_SIGNED is not in CS_ALLOWED_MACHO -- a Mach-O does
++		 * not get to claim it about itself. On a device AMFI adds it,
++		 * which is why the only other place it appears is the
++		 * taskgated fallback in check_for_signature().
++		 *
++		 * Without it csproc_get_blob() refuses to look the blob up at
++		 * all:
++		 *
++		 *     if ((p->p_csflags & CS_SIGNED) == 0) return NULL;
++		 *
++		 * so csproc_get_platform_binary() answers 0 no matter what
++		 * the blob says, and csops(CS_OPS_STATUS) reports a process
++		 * with no signature -- which is what launchd was refusing.
++		 *
++		 * It is also simply true: this hook is only reached with a
++		 * parsed CS_CodeDirectory in hand, so the binary does carry a
++		 * signature. Whether that signature is any good is a separate
++		 * question, and CS_VALID is the bit that answers it.
++		 */
++		*cs_flags |= CS_SIGNED;
++	}
 +	if (amfi_platform_binary && cs_flags != NULL) {
 +		*cs_flags |= CS_PLATFORM_BINARY;
 +		*cs_flags &= ~CS_PLATFORM_PATH;
@@ -362,7 +425,7 @@ and die in dyld, with nothing on the console connecting the two.
 +		*signer_type = CS_SIGNER_TYPE_UNKNOWN;
 +	}
 +
-+	if (amfi_debug) {
++	if (amfi_debug > 1) {
 +		printf("amfi: signature of %s: cs_flags 0x%x -> 0x%x\n",
 +		    (vp != NULL && vp->v_name != NULL) ? vp->v_name : "?",
 +		    before, (cs_flags != NULL) ? *cs_flags : 0);

@@ -1,0 +1,105 @@
+Keep CS_VALID when nothing can validate a page.
+
+parse_machfile() validates the first pages of every image it loads, and on
+this kernel all of them fail:
+
+    CODE SIGNING: cs_validate_page: ... off 0x6a000 size 0x1000:
+        actual [0x0 0x0 0x0 0x0 0x0] != expected [0x9f3bc4d7 ...]
+
+The computed side is zeros because there is no corecrypto: the SHA that would
+hash the page is a stub that writes nothing. Every page of every binary comes
+out the same way, so the verdict distinguishes nothing -- it is not that
+these images failed a check, it is that the check does not exist here.
+
+The loader already knows not to act on it. cs_process_global_enforcement() is
+false with cs_enforcement_disable=1, so the load is allowed to continue. But
+one line ran regardless of that:
+
+    if (cs_process_global_enforcement() || (result->csflags & (CS_HARD|CS_KILL|CS_ENFORCEMENT))) {
+            ret = LOAD_FAILURE;
+    }
+    result->csflags &= ~CS_VALID;
+
+and that bit is load-bearing far beyond what it looks like. In
+exec_mach_imgact():
+
+    if (load_result.csflags & CS_VALID) {
+            imgp->ip_csflags |= load_result.csflags &
+                (CS_VALID | CS_SIGNED | CS_DEV_CODE | ...);
+    } else {
+            imgp->ip_csflags &= ~CS_VALID;
+    }
+
+the whole handover is gated on it, so clearing CS_VALID also drops CS_SIGNED,
+and p_csflags ends up zero. That is visible on the console as
+
+    cs_invalid_page(0x100eb4000): p=1[launchd] final status 0x0
+
+and it was read, wrongly, as meaning only that the page had been rejected.
+What it actually meant was that the process had no code signing state at all.
+csproc_get_blob() then refuses to look the blob up --
+
+    if ((p->p_csflags & CS_SIGNED) == 0) return NULL;
+
+-- csproc_get_platform_binary() answers 0, csops(CS_OPS_STATUS) reports a
+process with no signature, and launchd kills the boot:
+
+    unexpected exec of non-platform binary: /usr/sbin/syslogd
+
+So the clearing moves inside the branch that already decided the failure
+matters. Where enforcement applies, the load has just been failed anyway and
+the bit is cleared exactly as before; where it does not, the process keeps
+the signing state its blob gave it.
+
+This is a concession to a missing dependency, not a position on code signing,
+and it should not outlive it. Once corecrypto is built in the check means
+something again, every page either validates or genuinely does not, and
+leaving this in place would be a real hole. Delete the patch then.
+
+Note that cs_invalid_page() still clears CS_VALID on the process at fault
+time, and still will. That is correct and it is harmless here: it leaves
+CS_SIGNED alone, which is the bit csproc_get_blob() actually asks for.
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -1098,8 +1098,40 @@
+ 							if (cs_process_global_enforcement() ||
+ 							    (result->csflags & (CS_HARD | CS_KILL | CS_ENFORCEMENT))) {
+ 								ret = LOAD_FAILURE;
++								/*
++								 * CS_VALID is cleared only where it
++								 * still means something. This kernel
++								 * has no corecrypto, so the digest
++								 * that would hash the page returns
++								 * zeros and EVERY page fails here --
++								 * see cs_validate_page()'s
++								 * "actual [0x0 0x0 0x0 0x0 0x0]".
++								 * Clearing the bit on a verdict that
++								 * is the same for every binary tells
++								 * nothing apart, and it is not free:
++								 * exec_mach_imgact() gates the whole
++								 * flag handover on it,
++								 *
++								 *   if (load_result.csflags & CS_VALID)
++								 *           imgp->ip_csflags |= ... CS_SIGNED ...
++								 *
++								 * so one cleared bit also costs
++								 * CS_SIGNED, and without CS_SIGNED
++								 * csproc_get_blob() will not look at
++								 * the blob at all.
++								 *
++								 * Where enforcement does apply the
++								 * load has just been failed anyway,
++								 * so the bit is cleared as before.
++								 *
++								 * Delete this whole patch when
++								 * corecrypto is built in: the check
++								 * will mean something again, and
++								 * leaving it weakened would then be
++								 * a real hole.
++								 */
++								result->csflags &= ~CS_VALID;
+ 							}
+-							result->csflags &= ~CS_VALID;
+ 						}
+ 						off += PAGE_SIZE;
+ 					}
