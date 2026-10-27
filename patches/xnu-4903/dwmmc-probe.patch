@@ -110,9 +110,28 @@ None of those fired, and all 128 words were there. A transfer that completes
 has completed, whatever the controller made of the host's timing along the
 way.
 
-So HTO is out of the fatal mask and printed as a warning instead. It is worth
-keeping in view: one late sector at boot costs nothing, and a host that is
-habitually late will matter a great deal once this is serving a filesystem.
+So HTO is out of the fatal mask and printed as a warning instead. That got
+one step further and stopped again:
+
+    dwmmc:   all 128 words arrived but the transfer never closed
+    dwmmc:   at the end: RINTSTS 0x00000424 HTO
+
+A whole sector, no corruption bits, and no DTO. The missing DTO follows from
+HTO rather than being a second fault: once HTO fires the DesignWare core
+abandons the data phase, so it never says the transfer is over.
+
+What is left unexplained is why HTO fires at all. Not the host's timing: it
+was raised identically whether the drain sat behind a framebuffer printf or
+ran in a tight spin, which is a hundredfold difference in latency for no
+difference in outcome. Two candidates remain -- the TMOUT write not taking
+effect, and the SMU that this controller's device tree says is in its data
+path -- and TMOUT is now read back and printed so the first can be settled
+from the console.
+
+Meanwhile the read is treated as having succeeded, because by the thing it
+was written to test it has: a complete sector with none of the bits that
+mean it is wrong. The bytes settle it in a way no status register can. A
+sector that ends 55 aa came off the card; one that does not did not.
 
 Nothing is written, ever. There is no code here that can modify the card,
 which on the phone's own storage is the only responsible way to start. The
@@ -140,7 +159,7 @@ insert there, they both apply after this one, and three patches editing the
 same six lines is a merge conflict waiting for the next person.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,588 @@
+@@ -0,0 +1,601 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -532,22 +551,35 @@ same six lines is a merge conflict waiting for the next person.
 +		dwmmc_print_errors("at the end", sts);
 +		return -1;
 +	}
-+	if (!(sts & DWMMC_INT_DTO)) {
-+		printf("dwmmc:   all %d words arrived but the transfer never "
-+		    "closed\n", words);
-+		dwmmc_print_errors("at the end", sts);
-+		return -1;
-+	}
-+
++	/*
++	 * A whole sector, and none of the bits that mean it is wrong. That is
++	 * the thing being tested, so it counts as success even when the
++	 * controller never says DTO.
++	 *
++	 * It does not say DTO, every time, and the reason is not the host's
++	 * timing: HTO was raised identically whether the drain was behind a
++	 * framebuffer printf or in a tight spin, which is a hundredfold
++	 * difference in latency and no difference in outcome. Once HTO fires
++	 * the DesignWare core abandons the data phase, so the missing DTO
++	 * follows from it rather than being a second fault. What makes HTO
++	 * fire at all is still open -- the TMOUT write not taking, or the SMU
++	 * in this controller's data path, are the two candidates -- and
++	 * TMOUT is read back below so that the first of them can be ruled in
++	 * or out from the console.
++	 *
++	 * The bytes decide it either way. A sector that ends 55 aa came off
++	 * the card; one that does not did not.
++	 */
 +	if (sts & DWMMC_INT_HTO) {
-+		printf("dwmmc:   HTO was raised and the sector arrived "
-+		    "anyway: the host was late to the FIFO, which costs "
-+		    "nothing for one read and will matter for a filesystem\n");
++		printf("dwmmc:   HTO raised, no DTO, sector complete anyway\n");
 +	}
 +
 +	printf("dwmmc:   CMD17 done: RESP0 0x%08x (state %u%s), "
-+	    "RINTSTS 0x%08x\n", resp, (resp >> 9) & 0xf,
-+	    ((resp >> 9) & 0xf) == 4 ? " = tran" : "", sts);
++	    "RINTSTS 0x%08x, STATUS 0x%08x\n", resp, (resp >> 9) & 0xf,
++	    ((resp >> 9) & 0xf) == 4 ? " = tran" : "", sts,
++	    dwmmc_read(regs, DWMMC_STATUS));
++	printf("dwmmc:   TMOUT reads back 0x%08x (wrote 0xffffff40)\n",
++	    dwmmc_read(regs, DWMMC_TMOUT));
 +	return 0;
 +
 +cmd_failed:
