@@ -1,4 +1,4 @@
-Probe the storage controller, and nothing else yet.
+Talk to the storage controller: probe it, then read a sector.
 
 The root filesystem is an 18 MiB RAM disk with 44 files in it, and that is a
 ceiling rather than a choice: the shim carries it inside the Android BOOT
@@ -17,15 +17,19 @@ here so that rd=md0 works -- is a plain bdevsw with a strategy routine. A
 storage driver in that shape needs no IOKit at all; strategy() does real
 transfers where memdev does a memcpy.
 
-This patch does none of that. It reads VERID and HCON and prints them.
+This patch is the two steps before that, in the order that makes each one
+answerable on its own.
 
-That is the point. Bringing up a card means a clock setup, a controller
+    dwmmc_probe=<mask>              read the identity registers (default: 1)
+    dwmmc_read=<n> dwmmc_lba=<m>    send CMD17 n times from sector m (default: 0)
+
+First, the identity registers. Bringing up a card means a clock setup, a
 reset, CMD0/CMD1/CMD2/CMD3/CMD7, FIFO handling and timeouts, and when the
 result of all that is silence there is no way to tell which step was wrong --
-or whether the register block was ever mapped in the first place. VERID and
-HCON are read-only identity registers. A plausible value out of them proves
-the mapping, the bus and the controller's clock together, in one line, before
-there is a single card command to be wrong about.
+or whether the register block was ever mapped. VERID and HCON are read-only.
+A plausible value out of them proves the mapping, the bus and the clock
+together, in one line, before there is a single card command to be wrong
+about.
 
 The addresses are Samsung's own. The stock boot image carries four device
 trees, one per board revision, and all four agree:
@@ -42,6 +46,40 @@ slot's clocks -- Android would have, from the CMU, and Android is not here.
 Reading an ungated SFR block on Exynos does not return zero, it hangs the
 bus. So dwmmc2 sits behind dwmmc_probe=2, and a boot that stops dead after
 naming it has answered the question it was asked.
+
+Second, the read -- and the probe is what made it this small. What came back
+was not an idle controller but a working one:
+
+    CLKENA 0x00000001   the card clock is running
+    CLKDIV 0x00000001   divided by two, not the 400 kHz of an init
+    CTYPE  0x00010000   bit 16: card 0 is on an 8-bit bus
+    BLKSIZ 0x00000200   512-byte blocks, already set
+    STATUS 0x00000906   bit 8: the card is driving DAT3; FIFO empty, not busy
+    CTRL   0x00000010   interrupts on, DMA and IDMAC off -- S-Boot used PIO
+    HCON   0x0be42541   bit 23: the hold register is implemented
+    VERID  0x5342270a   revision 0x270a, so the FIFO is at 0x200, not 0x100
+
+S-Boot left all of it behind. The card has already been through CMD0, CMD1,
+CMD2, CMD3 and CMD7; it is selected and in the transfer state. So this sends
+CMD17 and nothing else. READ_SINGLE_BLOCK goes to whichever card is selected,
+needs no RCA, and needs to know nothing about what S-Boot did. If the card is
+not in fact selected the controller answers with a response timeout, which
+gets printed and named; that is a cheap way to be wrong.
+
+Two values from the probe are used rather than assumed: HCON's hold-register
+bit decides whether commands carry USE_HOLD_REG, and VERID's revision is what
+puts the FIFO at 0x200.
+
+The FIFO is drained while the transfer is running, not after it. It is 64
+words deep and a sector is 128, so waiting for the data-transfer-over
+interrupt first would stall the controller half way with a full FIFO and look
+exactly like a dead card.
+
+Nothing is written, ever. There is no code here that can modify the card,
+which on the phone's own storage is the only responsible way to start. The
+controller is not reset either: CTRL_RESET would discard the clock, the bus
+width and the card selection that all of this depends on, so only the FIFO is
+cleared.
 
 The register offsets in the new file are the DesignWare layout, written out
 rather than taken from anywhere. They are facts about the hardware, but the
@@ -63,7 +101,7 @@ insert there, they both apply after this one, and three patches editing the
 same six lines is a merge conflict waiting for the next person.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,572 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -122,6 +160,44 @@ same six lines is a merge conflict waiting for the next person.
 + * before that controller can be read from; the card slot does not have it,
 + * which is one of several reasons the root volume is headed for an SD card
 + * and not a partition of the phone's own storage.
++ *
++ *
++ * Reading a sector, and why there is no card bring-up here
++ *
++ * The probe answered more than it was asked. What came back was not an idle
++ * controller but a working one:
++ *
++ *     CLKENA 0x00000001   the card clock is running
++ *     CLKDIV 0x00000001   divided by two, not the 400 kHz of an init
++ *     CTYPE  0x00010000   bit 16: card 0 is on an 8-bit bus
++ *     BLKSIZ 0x00000200   512-byte blocks, already set
++ *     STATUS 0x00000906   bit 8: the card is driving DAT3; FIFO empty, not busy
++ *     CTRL   0x00000010   interrupts on, DMA and IDMAC off -- S-Boot used PIO
++ *
++ * S-Boot reads the boot image off this eMMC, and it left every bit of that
++ * behind. The card has already been through CMD0, CMD1, CMD2, CMD3 and CMD7;
++ * it is selected and in the transfer state. None of that has to be done
++ * again, and doing it anyway would mean writing the part of a storage driver
++ * that is hardest to debug blind -- clock programming and a state machine
++ * with no output -- in order to arrive back at the state already in the
++ * registers.
++ *
++ * So this sends CMD17 and nothing else. READ_SINGLE_BLOCK is addressed to
++ * whichever card is selected, so it needs no RCA and no knowledge of what
++ * S-Boot did. If the card is not in fact selected the controller answers with
++ * a response timeout, which this prints; that is a cheap way to be wrong.
++ *
++ * Two details from the probe are used rather than assumed. HCON bit 23 is
++ * set, so the hold register exists and commands must carry USE_HOLD_REG.
++ * VERID's revision is 0x270A, which is past 0x240A, so the FIFO is at 0x200
++ * rather than the 0x100 of the older IP.
++ *
++ * The FIFO is drained by polling, not by interrupt. There is no interrupt
++ * handler here and there should not be one yet: a polled read is the version
++ * whose failure modes are all visible in RINTSTS afterwards.
++ *
++ * Nothing is written, ever. This file has no code that can modify the card,
++ * which on the phone's own eMMC is the only responsible way to start.
 + */
 +
 +#include <sys/param.h>
@@ -137,6 +213,7 @@ same six lines is a merge conflict waiting for the next person.
 + * reaching an osfmk routine from BSD.
 + */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void delay(int usec);
 +
 +/* Register offsets, from the controller. */
 +#define DWMMC_CTRL              0x000
@@ -179,6 +256,61 @@ same six lines is a merge conflict waiting for the next person.
 + */
 +#define DWMMC_VERID_REV(v)      ((v) & 0xffff)
 +
++/* CTRL */
++#define DWMMC_CTRL_RESET        (1u << 0)
++#define DWMMC_CTRL_FIFO_RESET   (1u << 1)
++#define DWMMC_CTRL_DMA_RESET    (1u << 2)
++
++/* HCON: bit 23 says the hold register is implemented. */
++#define DWMMC_HCON_HOLD_REG     (1u << 23)
++
++/* CMD */
++#define DWMMC_CMD_INDEX(i)      ((i) & 0x3f)
++#define DWMMC_CMD_RESP_EXP      (1u << 6)
++#define DWMMC_CMD_RESP_LONG     (1u << 7)
++#define DWMMC_CMD_CHECK_CRC     (1u << 8)
++#define DWMMC_CMD_DATA_EXP      (1u << 9)
++#define DWMMC_CMD_WRITE         (1u << 10)
++#define DWMMC_CMD_PRV_DAT_WAIT  (1u << 13)
++#define DWMMC_CMD_USE_HOLD_REG  (1u << 29)
++#define DWMMC_CMD_START         (1u << 31)
++
++/* RINTSTS / INTMASK */
++#define DWMMC_INT_RE            (1u << 1)       /* response error */
++#define DWMMC_INT_CMD_DONE      (1u << 2)
++#define DWMMC_INT_DTO           (1u << 3)       /* data transfer over */
++#define DWMMC_INT_RCRC          (1u << 6)       /* response CRC */
++#define DWMMC_INT_DCRC          (1u << 7)       /* data CRC */
++#define DWMMC_INT_RTO           (1u << 8)       /* response timeout */
++#define DWMMC_INT_DRTO          (1u << 9)       /* data read timeout */
++#define DWMMC_INT_HTO           (1u << 10)
++#define DWMMC_INT_FRUN          (1u << 11)
++#define DWMMC_INT_HLE           (1u << 12)      /* hardware locked write */
++#define DWMMC_INT_SBE           (1u << 13)
++#define DWMMC_INT_EBE           (1u << 15)
++#define DWMMC_INT_ALL           0xffffffffu
++
++#define DWMMC_INT_CMD_ERR       (DWMMC_INT_RE | DWMMC_INT_RTO | \
++	                         DWMMC_INT_RCRC | DWMMC_INT_HLE)
++#define DWMMC_INT_DATA_ERR      (DWMMC_INT_DCRC | DWMMC_INT_DRTO | \
++	                         DWMMC_INT_HTO | DWMMC_INT_FRUN | \
++	                         DWMMC_INT_SBE | DWMMC_INT_EBE)
++
++/* STATUS: the FIFO occupancy, in words. */
++#define DWMMC_STATUS_FIFO_COUNT(s)      (((s) >> 17) & 0x1fff)
++
++/* MMC command indices used here. */
++#define MMC_READ_SINGLE_BLOCK   17
++
++#define DWMMC_SECTOR            512
++
++/*
++ * How long to wait for each step, in microseconds. Generous: a read that is
++ * going to work finishes in well under a millisecond at this clock, and the
++ * only cost of a long limit is how long a dead controller takes to say so.
++ */
++#define DWMMC_TIMEOUT_US        500000
++
 +struct dwmmc_unit {
 +	const char      *name;
 +	vm_offset_t     base;           /* physical */
@@ -190,10 +322,229 @@ same six lines is a merge conflict waiting for the next person.
 +	{ "dwmmc2 (microSD slot)",  0x13560000, 2 },
 +};
 +
++/* dwmmc_read=<sectors> and dwmmc_lba=<first>; see dwmmc_probe(). */
++static uint32_t dwmmc_read_count = 0;
++static uint32_t dwmmc_read_lba = 0;
++
++#define DWMMC_READ_MAX          4
++
 +static uint32_t
 +dwmmc_read(vm_offset_t regs, uint32_t off)
 +{
 +	return *(volatile uint32_t *)(regs + off);
++}
++
++static void
++dwmmc_write(vm_offset_t regs, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(regs + off) = val;
++}
++
++/* Name the bits of RINTSTS that mean something went wrong. */
++static void
++dwmmc_print_errors(const char *what, uint32_t sts)
++{
++	printf("dwmmc:   %s: RINTSTS 0x%08x%s%s%s%s%s%s%s%s%s\n", what, sts,
++	    (sts & DWMMC_INT_RE)   ? " RE" : "",
++	    (sts & DWMMC_INT_RTO)  ? " RTO(response timeout)" : "",
++	    (sts & DWMMC_INT_RCRC) ? " RCRC" : "",
++	    (sts & DWMMC_INT_HLE)  ? " HLE" : "",
++	    (sts & DWMMC_INT_DCRC) ? " DCRC" : "",
++	    (sts & DWMMC_INT_DRTO) ? " DRTO(data timeout)" : "",
++	    (sts & DWMMC_INT_HTO)  ? " HTO" : "",
++	    (sts & DWMMC_INT_SBE)  ? " SBE" : "",
++	    (sts & DWMMC_INT_EBE)  ? " EBE" : "");
++}
++
++/* Wait until the controller has taken the command in CMD. */
++static int
++dwmmc_wait_cmd_taken(vm_offset_t regs)
++{
++	int us;
++
++	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
++		if (!(dwmmc_read(regs, DWMMC_CMD) & DWMMC_CMD_START)) {
++			return 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++/* Wait for any of mask in RINTSTS. Returns the status either way. */
++static int
++dwmmc_wait_int(vm_offset_t regs, uint32_t mask, uint32_t *out)
++{
++	int us;
++
++	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
++		uint32_t sts = dwmmc_read(regs, DWMMC_RINTSTS);
++		if (sts & mask) {
++			*out = sts;
++			return 0;
++		}
++		delay(1);
++	}
++	*out = dwmmc_read(regs, DWMMC_RINTSTS);
++	return -1;
++}
++
++/*
++ * One 512-byte sector, by CMD17, using whatever state the bootloader left.
++ *
++ * buf is 128 words. The FIFO is drained as it fills rather than after the
++ * transfer: it is 64 words deep and a sector is 128, so waiting for DTO
++ * first would stall the controller half way with a full FIFO and look
++ * exactly like a dead card.
++ */
++static int
++dwmmc_read_block(vm_offset_t regs, uint32_t hcon, uint32_t lba, uint32_t *buf)
++{
++	const int words = DWMMC_SECTOR / 4;
++	uint32_t cmd, sts;
++	int got = 0;
++	int us;
++
++	/*
++	 * A clean FIFO and a clean status, and nothing else. CTRL_RESET would
++	 * discard the clock, bus width and card selection that this depends
++	 * on, so the controller itself is not reset.
++	 */
++	dwmmc_write(regs, DWMMC_CTRL,
++	    dwmmc_read(regs, DWMMC_CTRL) | DWMMC_CTRL_FIFO_RESET);
++	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
++		if (!(dwmmc_read(regs, DWMMC_CTRL) & DWMMC_CTRL_FIFO_RESET)) {
++			break;
++		}
++		delay(1);
++	}
++	if (us == DWMMC_TIMEOUT_US) {
++		printf("dwmmc:   FIFO reset never completed\n");
++		return -1;
++	}
++
++	dwmmc_write(regs, DWMMC_RINTSTS, DWMMC_INT_ALL);
++	dwmmc_write(regs, DWMMC_BLKSIZ, DWMMC_SECTOR);
++	dwmmc_write(regs, DWMMC_BYTCNT, DWMMC_SECTOR);
++
++	/*
++	 * Block addressing, not byte. Every eMMC larger than 2 GiB uses it,
++	 * and this one is 16.
++	 */
++	dwmmc_write(regs, DWMMC_CMDARG, lba);
++
++	cmd = DWMMC_CMD_INDEX(MMC_READ_SINGLE_BLOCK)
++	    | DWMMC_CMD_RESP_EXP | DWMMC_CMD_CHECK_CRC
++	    | DWMMC_CMD_DATA_EXP | DWMMC_CMD_PRV_DAT_WAIT
++	    | DWMMC_CMD_START;
++	if (hcon & DWMMC_HCON_HOLD_REG) {
++		cmd |= DWMMC_CMD_USE_HOLD_REG;
++	}
++
++	dwmmc_write(regs, DWMMC_CMD, cmd);
++
++	if (dwmmc_wait_cmd_taken(regs) != 0) {
++		printf("dwmmc:   the controller never took the command "
++		    "(CMD 0x%08x)\n", dwmmc_read(regs, DWMMC_CMD));
++		return -1;
++	}
++
++	if (dwmmc_wait_int(regs, DWMMC_INT_CMD_DONE | DWMMC_INT_CMD_ERR,
++	    &sts) != 0) {
++		dwmmc_print_errors("no response at all", sts);
++		return -1;
++	}
++	if (sts & DWMMC_INT_CMD_ERR) {
++		dwmmc_print_errors("command rejected", sts);
++		if (sts & DWMMC_INT_RTO) {
++			printf("dwmmc:   a response timeout here means the "
++			    "card is not selected; it needs a full "
++			    "CMD0..CMD7 bring-up after all\n");
++		}
++		return -1;
++	}
++
++	printf("dwmmc:   CMD17 accepted, RESP0 0x%08x\n",
++	    dwmmc_read(regs, DWMMC_RESP0));
++
++	for (us = 0; us < DWMMC_TIMEOUT_US && got < words;) {
++		uint32_t avail =
++		    DWMMC_STATUS_FIFO_COUNT(dwmmc_read(regs, DWMMC_STATUS));
++
++		if (avail == 0) {
++			uint32_t now = dwmmc_read(regs, DWMMC_RINTSTS);
++
++			if (now & DWMMC_INT_DATA_ERR) {
++				dwmmc_print_errors("data error", now);
++				return -1;
++			}
++			if (now & DWMMC_INT_DTO) {
++				break;  /* nothing more is coming */
++			}
++			delay(1);
++			us++;
++			continue;
++		}
++
++		while (avail-- > 0 && got < words) {
++			buf[got++] = dwmmc_read(regs, DWMMC_DATA);
++		}
++	}
++
++	if (got < words) {
++		printf("dwmmc:   short read: %d of %d words\n", got, words);
++		dwmmc_print_errors("at the end", dwmmc_read(regs,
++		    DWMMC_RINTSTS));
++		return -1;
++	}
++
++	if (dwmmc_wait_int(regs, DWMMC_INT_DTO | DWMMC_INT_DATA_ERR,
++	    &sts) != 0) {
++		dwmmc_print_errors("transfer never finished", sts);
++		return -1;
++	}
++	if (sts & DWMMC_INT_DATA_ERR) {
++		dwmmc_print_errors("data error", sts);
++		return -1;
++	}
++
++	return 0;
++}
++
++/*
++ * The first 64 bytes, and whatever the sector announces itself to be.
++ *
++ * On a Samsung handset LBA 0 is a protective MBR, so the 0x55AA at offset
++ * 510 is the thing to look for: finding it means the bytes came off the card
++ * and arrived in the right order, which no amount of plausible-looking hex
++ * can establish on its own.
++ */
++static void
++dwmmc_dump_sector(uint32_t lba, const uint32_t *buf)
++{
++	const unsigned char *b = (const unsigned char *)buf;
++	int row;
++
++	printf("dwmmc:   LBA %u:\n", lba);
++	for (row = 0; row < 4; row++) {
++		const unsigned char *p = b + row * 16;
++
++		printf("dwmmc:     %03x  %02x %02x %02x %02x %02x %02x %02x "
++		    "%02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    row * 16,
++		    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
++		    p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
++	}
++
++	if (b[510] == 0x55 && b[511] == 0xaa) {
++		printf("dwmmc:     ends 55 aa -- a partition table signature\n");
++	} else if (b[0] == 'E' && b[1] == 'F' && b[2] == 'I' && b[3] == ' '
++	    && b[4] == 'P' && b[5] == 'A' && b[6] == 'R' && b[7] == 'T') {
++		printf("dwmmc:     starts \"EFI PART\" -- a GPT header\n");
++	} else {
++		printf("dwmmc:     no signature here (bytes 510-511 are "
++		    "%02x %02x)\n", b[510], b[511]);
++	}
 +}
 +
 +static void
@@ -260,6 +611,26 @@ same six lines is a merge conflict waiting for the next person.
 +	} else {
 +		printf("dwmmc:   alive: mapping, bus and clock all work\n");
 +	}
++
++	/*
++	 * Reading is asked for rather than assumed. The probe is safe on any
++	 * controller; a command is not, and this one is the phone's own
++	 * storage.
++	 */
++	if (dwmmc_read_count > 0) {
++		uint32_t buf[DWMMC_SECTOR / 4];
++		uint32_t n;
++
++		for (n = 0; n < dwmmc_read_count; n++) {
++			if (dwmmc_read_block(regs, hcon,
++			    dwmmc_read_lba + n, buf) != 0) {
++				printf("dwmmc:   read of LBA %u failed\n",
++				    dwmmc_read_lba + n);
++				break;
++			}
++			dwmmc_dump_sector(dwmmc_read_lba + n, buf);
++		}
++	}
 +}
 +
 +/*
@@ -269,6 +640,11 @@ same six lines is a merge conflict waiting for the next person.
 + *
 + * dwmmc_probe=<mask>: bit 0 is dwmmc0, bit 1 is dwmmc2. Default 1. See the
 + * header on why dwmmc2 is not probed unless it is asked for.
++ *
++ * dwmmc_read=<sectors>, dwmmc_lba=<first>: send CMD17 that many times, from
++ * that sector, and print what comes back. Default 0, which sends no command
++ * at all -- the probe only reads identity registers, and that is safe on any
++ * controller, whereas a command is not.
 + */
 +void dwmmc_probe(void);
 +
@@ -279,6 +655,15 @@ same six lines is a merge conflict waiting for the next person.
 +	unsigned int i;
 +
 +	(void)PE_parse_boot_argn("dwmmc_probe", &mask, sizeof(mask));
++	(void)PE_parse_boot_argn("dwmmc_read", &dwmmc_read_count,
++	    sizeof(dwmmc_read_count));
++	(void)PE_parse_boot_argn("dwmmc_lba", &dwmmc_read_lba,
++	    sizeof(dwmmc_read_lba));
++
++	if (dwmmc_read_count > DWMMC_READ_MAX) {
++		dwmmc_read_count = DWMMC_READ_MAX;
++	}
++
 +	if (mask == 0) {
 +		return;
 +	}
