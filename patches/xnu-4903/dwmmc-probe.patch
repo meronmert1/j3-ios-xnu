@@ -90,10 +90,29 @@ into a 720x1280 framebuffer: milliseconds, against a FIFO the card fills in
 microseconds.
 
 So command completion and the drain are now a single loop with no printf and
-no delay in it, and everything worth saying is saved and said afterwards. The
+no delay in it -- not even a wait for the controller to accept the command in
+front of it -- and everything worth saying is saved and said afterwards. The
 data timeout in TMOUT is also set generously before the command rather than
 inheriting whatever S-Boot tuned for its own loader, since that register is
 what decides when HTO fires.
+
+That fixed the transfer and exposed a second mistake, this one in judgement
+rather than in code. The next attempt said:
+
+    dwmmc:   data error: RINTSTS 0x00000424 HTO
+    dwmmc:   128 of 128 words had arrived
+
+All the data arrived. HTO was still latched, and this treated it as fatal, so
+the sector was thrown away unread. But HTO is not a data error: it means the
+host was late to the FIFO. The bits that say the data is wrong are DCRC, SBE
+and EBE; DRTO says the card never sent it and FRUN says the FIFO ran under.
+None of those fired, and all 128 words were there. A transfer that completes
+has completed, whatever the controller made of the host's timing along the
+way.
+
+So HTO is out of the fatal mask and printed as a warning instead. It is worth
+keeping in view: one late sector at boot costs nothing, and a host that is
+habitually late will matter a great deal once this is serving a filesystem.
 
 Nothing is written, ever. There is no code here that can modify the card,
 which on the phone's own storage is the only responsible way to start. The
@@ -121,7 +140,7 @@ insert there, they both apply after this one, and three patches editing the
 same six lines is a merge conflict waiting for the next person.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,604 @@
+@@ -0,0 +1,588 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -312,9 +331,23 @@ same six lines is a merge conflict waiting for the next person.
 +
 +#define DWMMC_INT_CMD_ERR       (DWMMC_INT_RE | DWMMC_INT_RTO | \
 +	                         DWMMC_INT_RCRC | DWMMC_INT_HLE)
-+#define DWMMC_INT_DATA_ERR      (DWMMC_INT_DCRC | DWMMC_INT_DRTO | \
-+	                         DWMMC_INT_HTO | DWMMC_INT_FRUN | \
-+	                         DWMMC_INT_SBE | DWMMC_INT_EBE)
++/*
++ * HTO is deliberately not in here.
++ *
++ * It means the host was late to the FIFO -- flow control, not corruption.
++ * The bits that say the data is wrong are DCRC, SBE and EBE; DRTO says the
++ * card never sent it and FRUN says the FIFO ran under. HTO on its own is
++ * survivable, and on this kernel it has been survived: the first working
++ * read raised HTO and still delivered all 128 words with no CRC error. A
++ * transfer that completes is a transfer that completes, whatever the
++ * controller thought of the host's timing on the way.
++ *
++ * It is still worth printing, because once this drives a filesystem rather
++ * than one sector at boot, a host that is habitually late is a real problem.
++ */
++#define DWMMC_INT_DATA_FATAL    (DWMMC_INT_DCRC | DWMMC_INT_DRTO | \
++	                         DWMMC_INT_FRUN | DWMMC_INT_SBE | \
++	                         DWMMC_INT_EBE)
 +
 +/* STATUS: the FIFO occupancy, in words. */
 +#define DWMMC_STATUS_FIFO_COUNT(s)      (((s) >> 17) & 0x1fff)
@@ -385,39 +418,6 @@ same six lines is a merge conflict waiting for the next person.
 +	    (sts & DWMMC_INT_EBE)  ? " EBE" : "");
 +}
 +
-+/* Wait until the controller has taken the command in CMD. */
-+static int
-+dwmmc_wait_cmd_taken(vm_offset_t regs)
-+{
-+	int us;
-+
-+	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
-+		if (!(dwmmc_read(regs, DWMMC_CMD) & DWMMC_CMD_START)) {
-+			return 0;
-+		}
-+		delay(1);
-+	}
-+	return -1;
-+}
-+
-+/* Wait for any of mask in RINTSTS. Returns the status either way. */
-+static int
-+dwmmc_wait_int(vm_offset_t regs, uint32_t mask, uint32_t *out)
-+{
-+	int us;
-+
-+	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
-+		uint32_t sts = dwmmc_read(regs, DWMMC_RINTSTS);
-+		if (sts & mask) {
-+			*out = sts;
-+			return 0;
-+		}
-+		delay(1);
-+	}
-+	*out = dwmmc_read(regs, DWMMC_RINTSTS);
-+	return -1;
-+}
-+
 +/*
 + * One 512-byte sector, by CMD17, using whatever state the bootloader left.
 + *
@@ -481,12 +481,6 @@ same six lines is a merge conflict waiting for the next person.
 +
 +	dwmmc_write(regs, DWMMC_CMD, cmd);
 +
-+	if (dwmmc_wait_cmd_taken(regs) != 0) {
-+		printf("dwmmc:   the controller never took the command "
-+		    "(CMD 0x%08x)\n", dwmmc_read(regs, DWMMC_CMD));
-+		return -1;
-+	}
-+
 +	/*
 +	 * From here to the end of the transfer there is no printf and no
 +	 * delay, and that is the whole design of this loop.
@@ -500,8 +494,11 @@ same six lines is a merge conflict waiting for the next person.
 +	 * data ready, host timeout. The data had arrived and nobody came for
 +	 * it.
 +	 *
-+	 * So command completion and the drain are one loop. Anything worth
-+	 * saying is saved and said afterwards.
++	 * So command completion and the drain are one loop, and there is not
++	 * even a wait for the controller to accept the command in front of
++	 * it: the first thing that happens after the command is written is a
++	 * look at the FIFO. Anything worth saying is saved and said
++	 * afterwards.
 +	 */
 +	for (us = 0; us < DWMMC_SPINS; us++) {
 +		uint32_t now = dwmmc_read(regs, DWMMC_RINTSTS);
@@ -517,7 +514,7 @@ same six lines is a merge conflict waiting for the next person.
 +			buf[got++] = dwmmc_read(regs, DWMMC_DATA);
 +		}
 +
-+		if (now & DWMMC_INT_DATA_ERR) {
++		if (now & DWMMC_INT_DATA_FATAL) {
 +			sts = now;
 +			goto data_failed;
 +		}
@@ -540,6 +537,12 @@ same six lines is a merge conflict waiting for the next person.
 +		    "closed\n", words);
 +		dwmmc_print_errors("at the end", sts);
 +		return -1;
++	}
++
++	if (sts & DWMMC_INT_HTO) {
++		printf("dwmmc:   HTO was raised and the sector arrived "
++		    "anyway: the host was late to the FIFO, which costs "
++		    "nothing for one read and will matter for a filesystem\n");
 +	}
 +
 +	printf("dwmmc:   CMD17 done: RESP0 0x%08x (state %u%s), "
