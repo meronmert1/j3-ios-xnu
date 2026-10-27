@@ -75,6 +75,26 @@ words deep and a sector is 128, so waiting for the data-transfer-over
 interrupt first would stall the controller half way with a full FIFO and look
 exactly like a dead card.
 
+That is not a hypothetical. The first version of this read got as far as
+
+    dwmmc:   CMD17 accepted, RESP0 0x00000900
+    dwmmc:   data error: RINTSTS 0x00000424 HTO
+
+which is a complete account of what went wrong. RESP0 0x900 is the card's R1
+status: CURRENT_STATE 4, tran, and READY_FOR_DATA set -- so the card was
+selected and the command path worked end to end. RINTSTS 0x424 is command
+done, receive-FIFO data ready, and HTO, data starvation by the host. The data
+arrived and nobody came for it, because that printf sat between the command
+and the drain, and writing one line to this console means rendering glyphs
+into a 720x1280 framebuffer: milliseconds, against a FIFO the card fills in
+microseconds.
+
+So command completion and the drain are now a single loop with no printf and
+no delay in it, and everything worth saying is saved and said afterwards. The
+data timeout in TMOUT is also set generously before the command rather than
+inheriting whatever S-Boot tuned for its own loader, since that register is
+what decides when HTO fires.
+
 Nothing is written, ever. There is no code here that can modify the card,
 which on the phone's own storage is the only responsible way to start. The
 controller is not reset either: CTRL_RESET would discard the clock, the bus
@@ -101,7 +121,7 @@ insert there, they both apply after this one, and three patches editing the
 same six lines is a merge conflict waiting for the next person.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,572 @@
+@@ -0,0 +1,604 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -311,6 +331,15 @@ same six lines is a merge conflict waiting for the next person.
 + */
 +#define DWMMC_TIMEOUT_US        500000
 +
++/*
++ * The data phase spins instead of sleeping: a sector at this clock is over
++ * in well under a millisecond, and a delay(1) between polls is long enough
++ * for the FIFO to fill and the controller to give up on us. This is the
++ * iteration budget for that spin -- large enough to be no limit in practice,
++ * small enough that a dead transfer still ends.
++ */
++#define DWMMC_SPINS             2000000
++
 +struct dwmmc_unit {
 +	const char      *name;
 +	vm_offset_t     base;           /* physical */
@@ -401,7 +430,7 @@ same six lines is a merge conflict waiting for the next person.
 +dwmmc_read_block(vm_offset_t regs, uint32_t hcon, uint32_t lba, uint32_t *buf)
 +{
 +	const int words = DWMMC_SECTOR / 4;
-+	uint32_t cmd, sts;
++	uint32_t cmd, sts, resp;
 +	int got = 0;
 +	int us;
 +
@@ -428,6 +457,15 @@ same six lines is a merge conflict waiting for the next person.
 +	dwmmc_write(regs, DWMMC_BYTCNT, DWMMC_SECTOR);
 +
 +	/*
++	 * A generous data timeout. The upper 24 bits are counted in card
++	 * clock cycles and bound how long the controller will wait for the
++	 * host to service the FIFO before raising HTO. Whatever S-Boot left
++	 * here was tuned for its own loader, and the first attempt at this
++	 * read died on exactly that -- HTO with the receive FIFO full.
++	 */
++	dwmmc_write(regs, DWMMC_TMOUT, 0xffffff40u);
++
++	/*
 +	 * Block addressing, not byte. Every eMMC larger than 2 GiB uses it,
 +	 * and this one is 16.
 +	 */
@@ -449,66 +487,80 @@ same six lines is a merge conflict waiting for the next person.
 +		return -1;
 +	}
 +
-+	if (dwmmc_wait_int(regs, DWMMC_INT_CMD_DONE | DWMMC_INT_CMD_ERR,
-+	    &sts) != 0) {
-+		dwmmc_print_errors("no response at all", sts);
-+		return -1;
-+	}
-+	if (sts & DWMMC_INT_CMD_ERR) {
-+		dwmmc_print_errors("command rejected", sts);
-+		if (sts & DWMMC_INT_RTO) {
-+			printf("dwmmc:   a response timeout here means the "
-+			    "card is not selected; it needs a full "
-+			    "CMD0..CMD7 bring-up after all\n");
-+		}
-+		return -1;
-+	}
++	/*
++	 * From here to the end of the transfer there is no printf and no
++	 * delay, and that is the whole design of this loop.
++	 *
++	 * The first version printed the card's response between the command
++	 * and the drain. Writing one line to this console means rendering
++	 * glyphs into a 720x1280 framebuffer, which takes milliseconds; the
++	 * card fills the 64-word FIFO in microseconds. The controller raised
++	 * HTO -- data starvation by the host -- while the kernel was still
++	 * drawing text, and reported RINTSTS 0x424: command done, receive
++	 * data ready, host timeout. The data had arrived and nobody came for
++	 * it.
++	 *
++	 * So command completion and the drain are one loop. Anything worth
++	 * saying is saved and said afterwards.
++	 */
++	for (us = 0; us < DWMMC_SPINS; us++) {
++		uint32_t now = dwmmc_read(regs, DWMMC_RINTSTS);
++		uint32_t avail;
 +
-+	printf("dwmmc:   CMD17 accepted, RESP0 0x%08x\n",
-+	    dwmmc_read(regs, DWMMC_RESP0));
-+
-+	for (us = 0; us < DWMMC_TIMEOUT_US && got < words;) {
-+		uint32_t avail =
-+		    DWMMC_STATUS_FIFO_COUNT(dwmmc_read(regs, DWMMC_STATUS));
-+
-+		if (avail == 0) {
-+			uint32_t now = dwmmc_read(regs, DWMMC_RINTSTS);
-+
-+			if (now & DWMMC_INT_DATA_ERR) {
-+				dwmmc_print_errors("data error", now);
-+				return -1;
-+			}
-+			if (now & DWMMC_INT_DTO) {
-+				break;  /* nothing more is coming */
-+			}
-+			delay(1);
-+			us++;
-+			continue;
++		if (now & DWMMC_INT_CMD_ERR) {
++			sts = now;
++			goto cmd_failed;
 +		}
 +
++		avail = DWMMC_STATUS_FIFO_COUNT(dwmmc_read(regs, DWMMC_STATUS));
 +		while (avail-- > 0 && got < words) {
 +			buf[got++] = dwmmc_read(regs, DWMMC_DATA);
 +		}
++
++		if (now & DWMMC_INT_DATA_ERR) {
++			sts = now;
++			goto data_failed;
++		}
++		if (got == words && (now & DWMMC_INT_DTO)) {
++			break;
++		}
 +	}
++
++	sts = dwmmc_read(regs, DWMMC_RINTSTS);
++	resp = dwmmc_read(regs, DWMMC_RESP0);
 +
 +	if (got < words) {
-+		printf("dwmmc:   short read: %d of %d words\n", got, words);
-+		dwmmc_print_errors("at the end", dwmmc_read(regs,
-+		    DWMMC_RINTSTS));
++		printf("dwmmc:   short read: %d of %d words, RESP0 0x%08x\n",
++		    got, words, resp);
++		dwmmc_print_errors("at the end", sts);
++		return -1;
++	}
++	if (!(sts & DWMMC_INT_DTO)) {
++		printf("dwmmc:   all %d words arrived but the transfer never "
++		    "closed\n", words);
++		dwmmc_print_errors("at the end", sts);
 +		return -1;
 +	}
 +
-+	if (dwmmc_wait_int(regs, DWMMC_INT_DTO | DWMMC_INT_DATA_ERR,
-+	    &sts) != 0) {
-+		dwmmc_print_errors("transfer never finished", sts);
-+		return -1;
-+	}
-+	if (sts & DWMMC_INT_DATA_ERR) {
-+		dwmmc_print_errors("data error", sts);
-+		return -1;
-+	}
-+
++	printf("dwmmc:   CMD17 done: RESP0 0x%08x (state %u%s), "
++	    "RINTSTS 0x%08x\n", resp, (resp >> 9) & 0xf,
++	    ((resp >> 9) & 0xf) == 4 ? " = tran" : "", sts);
 +	return 0;
++
++cmd_failed:
++	resp = dwmmc_read(regs, DWMMC_RESP0);
++	dwmmc_print_errors("command rejected", sts);
++	if (sts & DWMMC_INT_RTO) {
++		printf("dwmmc:   a response timeout here means the card is "
++		    "not selected; it needs a full CMD0..CMD7 bring-up after "
++		    "all\n");
++	}
++	return -1;
++
++data_failed:
++	dwmmc_print_errors("data error", sts);
++	printf("dwmmc:   %d of %d words had arrived\n", got, words);
++	return -1;
 +}
 +
 +/*
