@@ -1,0 +1,330 @@
+Probe the storage controller, and nothing else yet.
+
+The root filesystem is an 18 MiB RAM disk with 44 files in it, and that is a
+ceiling rather than a choice: the shim carries it inside the Android BOOT
+partition, which is 32 MiB, and the kernel takes fourteen of those. The real
+iOS 12 userland does not fit and never will -- nearly every binary it runs is
+resolved out of dyld_shared_cache_arm64, 1.19 GiB on its own. Until the
+kernel can read a storage device there is nothing for launchd to start, so
+this is the next thing.
+
+The shape it is headed for is a BSD block device, not an IOKit one. An
+IOBlockStorageDevice under IOBlockStorageDriver is how a real handset gets
+its IOMedia, but IOStorageFamily is a separate kext and is not in this tree,
+so that route begins by building another kext into the kernel. It is not
+needed. The root device is a dev_t, and bsd/dev/memdev.c -- already patched
+here so that rd=md0 works -- is a plain bdevsw with a strategy routine. A
+storage driver in that shape needs no IOKit at all; strategy() does real
+transfers where memdev does a memcpy.
+
+This patch does none of that. It reads VERID and HCON and prints them.
+
+That is the point. Bringing up a card means a clock setup, a controller
+reset, CMD0/CMD1/CMD2/CMD3/CMD7, FIFO handling and timeouts, and when the
+result of all that is silence there is no way to tell which step was wrong --
+or whether the register block was ever mapped in the first place. VERID and
+HCON are read-only identity registers. A plausible value out of them proves
+the mapping, the bus and the controller's clock together, in one line, before
+there is a single card command to be wrong about.
+
+The addresses are Samsung's own. The stock boot image carries four device
+trees, one per board revision, and all four agree:
+
+    dwmmc0@13540000   SPI 245   non-removable, 8-bit, HS400, use-smu
+    dwmmc2@13560000   SPI 247   microSD slot, 4-bit, bypass-smu
+
+so this handset's revision does not have to be identified to use them.
+
+Only dwmmc0 is probed by default, and the reason is not caution for its own
+sake. S-Boot reads the boot image off the internal eMMC, so dwmmc0 is powered
+and clocked by the time this kernel runs. Nothing has brought up the SD
+slot's clocks -- Android would have, from the CMU, and Android is not here.
+Reading an ungated SFR block on Exynos does not return zero, it hangs the
+bus. So dwmmc2 sits behind dwmmc_probe=2, and a boot that stops dead after
+naming it has answered the question it was asked.
+
+The register offsets in the new file are the DesignWare layout, written out
+rather than taken from anywhere. They are facts about the hardware, but the
+readable descriptions of this controller are in Linux and U-Boot, which are
+GPL, and this tree is APSL.
+
+One thing found on the way, recorded here because it decides where the root
+volume is going to live: dwmmc0's tree says use-smu and dwmmc2's says
+bypass-smu. The SMU is Samsung's inline encryption unit and it sits in the
+internal eMMC's data path. Between that, and not having to find a free
+partition on the phone's own storage, and being able to rewrite the root
+volume with dd instead of a flash cycle, the SD card is the better target --
+once the controller has been proven on the one that is already running.
+
+The probe is called from bsd_init() straight after bsd_autoconf(), which is
+late enough for printf to reach the console. The call site is deliberately
+not next to inittodr(): hfs-filesystem-builtin and memdev-ramdisk-root both
+insert there, they both apply after this one, and three patches editing the
+same six lines is a merge conflict waiting for the next person.
+--- /dev/null
++++ b/bsd/dev/dwmmc.c
+@@ -0,0 +1,225 @@
++/*
++ * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
++ * on Exynos 7570.
++ *
++ * Why this exists. The root filesystem is a RAM disk the shim carries inside
++ * the Android BOOT partition, and that partition is 32 MiB. Fourteen of those
++ * megabytes are the kernel, so the root volume has a hard ceiling of 18 MiB
++ * and currently holds 44 files. The real iOS 12 userland does not fit in that
++ * and never will: almost every binary is resolved out of
++ * dyld_shared_cache_arm64, which is 1.19 GiB on its own. Until the kernel can
++ * read a real storage device, there is nothing for launchd to start.
++ *
++ * Why a BSD block device rather than an IOKit one. The obvious shape would be
++ * an IOBlockStorageDevice under IOBlockStorageDriver, which is how a real
++ * device gets its IOMedia. But IOStorageFamily is a separate kext and is not
++ * in this tree, so that road starts with building another kext into the
++ * kernel. It is not needed: the root device is a dev_t, and bsd/dev/memdev.c
++ * -- already patched here to make rd=md0 work -- is a plain bdevsw with a
++ * strategy routine. A storage driver in that shape needs no IOKit at all;
++ * strategy() does real transfers instead of a memcpy. That is where this is
++ * going.
++ *
++ * What this file does today: nothing but read the controller's identity
++ * registers and print them. That is deliberate. Talking to a card means a
++ * clock setup, a reset, the CMD0/CMD1/CMD2/CMD3/CMD7 sequence, FIFO handling
++ * and timeouts, and if the result is silence there is no way to tell which of
++ * those was wrong -- or whether the register block was even mapped. VERID and
++ * HCON answer that one question by themselves: they are read-only identity
++ * registers, so a plausible value proves the mapping, the bus and the
++ * controller's clock in a single line of output, before a single card command
++ * exists to be wrong.
++ *
++ * Where the addresses come from. The stock Samsung boot image carries four
++ * device trees, one per board revision; all four agree, which is what makes
++ * it safe not to care which revision this handset is:
++ *
++ *     dwmmc0@13540000   SPI 245   non-removable, 8-bit, HS400, use-smu
++ *     dwmmc2@13560000   SPI 247   microSD slot, 4-bit, bypass-smu
++ *
++ * dwmmc0 is the internal eMMC and dwmmc2 is the card slot. The probe defaults
++ * to dwmmc0 alone, for a reason worth stating: S-Boot reads the boot image
++ * off the eMMC, so that controller is powered and clocked by the time this
++ * kernel runs. The SD slot may not be -- Android would have brought its
++ * clocks up from the CMU, and nothing has. Reading the registers of an
++ * ungated block on Exynos does not return zero; it hangs the bus. So dwmmc2
++ * is behind dwmmc_probe=2, and a boot that stops dead after asking for it has
++ * answered the question.
++ *
++ * The register offsets below are the DesignWare layout. They are facts about
++ * the hardware and are written out here rather than copied from anywhere:
++ * the readable descriptions of this controller are in Linux and U-Boot, both
++ * GPL, and this file is APSL.
++ *
++ * The SMU in dwmmc0's device tree is Samsung's inline encryption unit. It
++ * sits in the data path of the internal eMMC and will have to be dealt with
++ * before that controller can be read from; the card slot does not have it,
++ * which is one of several reasons the root volume is headed for an SD card
++ * and not a partition of the phone's own storage.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <mach/vm_types.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++
++/*
++ * Declared here rather than included. No file under bsd/ includes
++ * <arm/machine_routines.h>, and this should not be the first: bsd/kern/
++ * kern_exit.c declares delay() the same way, which is the house pattern for
++ * reaching an osfmk routine from BSD.
++ */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/* Register offsets, from the controller. */
++#define DWMMC_CTRL              0x000
++#define DWMMC_PWREN             0x004
++#define DWMMC_CLKDIV            0x008
++#define DWMMC_CLKSRC            0x00c
++#define DWMMC_CLKENA            0x010
++#define DWMMC_TMOUT             0x014
++#define DWMMC_CTYPE             0x018
++#define DWMMC_BLKSIZ            0x01c
++#define DWMMC_BYTCNT            0x020
++#define DWMMC_INTMASK           0x024
++#define DWMMC_CMDARG            0x028
++#define DWMMC_CMD               0x02c
++#define DWMMC_RESP0             0x030
++#define DWMMC_RESP1             0x034
++#define DWMMC_RESP2             0x038
++#define DWMMC_RESP3             0x03c
++#define DWMMC_MINTSTS           0x040
++#define DWMMC_RINTSTS           0x044
++#define DWMMC_STATUS            0x048
++#define DWMMC_FIFOTH            0x04c
++#define DWMMC_CDETECT           0x050
++#define DWMMC_WRTPRT            0x054
++#define DWMMC_USRID             0x068
++#define DWMMC_VERID             0x06c
++#define DWMMC_HCON              0x070
++#define DWMMC_UHS_REG           0x074
++#define DWMMC_BMOD              0x080
++#define DWMMC_DATA              0x200
++
++/* One 4 KiB page covers the whole block; the device tree asks for 0x2000. */
++#define DWMMC_REGS_SIZE         0x2000
++
++/*
++ * The low half of VERID is the IP revision, and every member of this family
++ * reads as 0x2xxA -- 0x240A and 0x270A are the ones commonly seen. It is not
++ * a value a dead or unmapped block produces, which is the whole point of
++ * looking at it.
++ */
++#define DWMMC_VERID_REV(v)      ((v) & 0xffff)
++
++struct dwmmc_unit {
++	const char      *name;
++	vm_offset_t     base;           /* physical */
++	uint32_t        bit;            /* in the dwmmc_probe boot argument */
++};
++
++static const struct dwmmc_unit dwmmc_units[] = {
++	{ "dwmmc0 (internal eMMC)", 0x13540000, 1 },
++	{ "dwmmc2 (microSD slot)",  0x13560000, 2 },
++};
++
++static uint32_t
++dwmmc_read(vm_offset_t regs, uint32_t off)
++{
++	return *(volatile uint32_t *)(regs + off);
++}
++
++static void
++dwmmc_probe_one(const struct dwmmc_unit *unit)
++{
++	vm_offset_t regs;
++	uint32_t verid, hcon, usrid, ctrl, status, cdetect;
++	uint32_t clkena, clkdiv, ctype, blksiz, fifoth, bmod;
++
++	regs = ml_io_map(unit->base, DWMMC_REGS_SIZE);
++	if (regs == 0) {
++		printf("dwmmc: %s: ml_io_map(0x%lx) failed\n",
++		    unit->name, (unsigned long)unit->base);
++		return;
++	}
++
++	printf("dwmmc: %s at 0x%lx, mapped\n",
++	    unit->name, (unsigned long)unit->base);
++
++	/*
++	 * VERID first and on its own line. If the block is not there, this is
++	 * where the boot stops, and the line above will be the last thing on
++	 * the screen -- which says exactly as much as a value would have.
++	 */
++	verid = dwmmc_read(regs, DWMMC_VERID);
++	hcon = dwmmc_read(regs, DWMMC_HCON);
++	usrid = dwmmc_read(regs, DWMMC_USRID);
++
++	printf("dwmmc:   VERID 0x%08x (rev 0x%04x)  HCON 0x%08x  USRID 0x%08x\n",
++	    verid, DWMMC_VERID_REV(verid), hcon, usrid);
++
++	ctrl = dwmmc_read(regs, DWMMC_CTRL);
++	status = dwmmc_read(regs, DWMMC_STATUS);
++	cdetect = dwmmc_read(regs, DWMMC_CDETECT);
++	bmod = dwmmc_read(regs, DWMMC_BMOD);
++
++	printf("dwmmc:   CTRL 0x%08x  STATUS 0x%08x  CDETECT 0x%08x  "
++	    "BMOD 0x%08x\n", ctrl, status, cdetect, bmod);
++
++	clkena = dwmmc_read(regs, DWMMC_CLKENA);
++	clkdiv = dwmmc_read(regs, DWMMC_CLKDIV);
++	ctype = dwmmc_read(regs, DWMMC_CTYPE);
++	blksiz = dwmmc_read(regs, DWMMC_BLKSIZ);
++	fifoth = dwmmc_read(regs, DWMMC_FIFOTH);
++
++	printf("dwmmc:   CLKENA 0x%08x  CLKDIV 0x%08x  CTYPE 0x%08x  "
++	    "BLKSIZ 0x%08x  FIFOTH 0x%08x\n",
++	    clkena, clkdiv, ctype, blksiz, fifoth);
++
++	/*
++	 * The verdict, so that a photograph of the screen does not have to be
++	 * read against a datasheet.
++	 *
++	 * CDETECT is reported but deliberately not judged: bit 0 is low when a
++	 * card is present, and dwmmc0's tree says broken-card-detect, so on
++	 * the eMMC the bit means nothing at all.
++	 */
++	if (verid == 0 || verid == 0xffffffff) {
++		printf("dwmmc:   VERID reads as 0x%08x -- the block is not "
++		    "responding\n", verid);
++	} else if ((DWMMC_VERID_REV(verid) & 0xf000) != 0x2000) {
++		printf("dwmmc:   revision 0x%04x is not one this family "
++		    "produces; check the address\n", DWMMC_VERID_REV(verid));
++	} else {
++		printf("dwmmc:   alive: mapping, bus and clock all work\n");
++	}
++}
++
++/*
++ * Called from bsd_init() after bsd_autoconf(), which is late enough for
++ * printf to reach the console and early enough to be before the root mount
++ * this is eventually meant to serve.
++ *
++ * dwmmc_probe=<mask>: bit 0 is dwmmc0, bit 1 is dwmmc2. Default 1. See the
++ * header on why dwmmc2 is not probed unless it is asked for.
++ */
++void dwmmc_probe(void);
++
++void
++dwmmc_probe(void)
++{
++	uint32_t mask = 1;
++	unsigned int i;
++
++	(void)PE_parse_boot_argn("dwmmc_probe", &mask, sizeof(mask));
++	if (mask == 0) {
++		return;
++	}
++
++	for (i = 0; i < sizeof(dwmmc_units) / sizeof(dwmmc_units[0]); i++) {
++		if (mask & dwmmc_units[i].bit) {
++			dwmmc_probe_one(&dwmmc_units[i]);
++		}
++	}
++}
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -130,6 +130,7 @@
+ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
++bsd/dev/dwmmc.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -406,6 +406,12 @@
+ 
+ extern lck_mtx_t * execargs_cache_lock;
+ 
++/*
++ * bsd/dev/dwmmc.c. Reads the storage controller's identity registers and
++ * prints them; see that file for what it is a first step towards.
++ */
++extern void     dwmmc_probe(void);
++
+ /* hook called after root is mounted XXX temporary hack */
+ void (*mountroot_post_hook)(void);
+ void (*unmountroot_pre_hook)(void);
+@@ -852,6 +858,13 @@
+ 	bsd_init_kprintf("calling bsd_autoconf\n");
+ 	bsd_autoconf();
+ 
++	/*
++	 * Straight after autoconf, which is where devices come up, and a long
++	 * way before the root mount this is meant to end up serving.
++	 */
++	bsd_init_kprintf("calling dwmmc_probe\n");
++	dwmmc_probe();
++
+ 	bsd_init_kprintf("calling os_reason_init\n");
+ 	os_reason_init();
+ 
