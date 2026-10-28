@@ -289,9 +289,60 @@ The scan reads through dwmmc_read_block with its commentary off, for the
 reason the flag exists: a printf per sector would make this slower by orders
 of magnitude and, as this driver already learned once, would be a bug in the
 data path rather than merely slow.
+
+The scan answered it, and the answer closed a road:
+
+    dwmmc:   scanning 409600 sectors from LBA 6127616 (200 MiB)
+    dwmmc:   ... 65536 sectors so far, 0 with data
+    ...
+    dwmmc:   scan done: 0 signatures, 0 of 409600 sectors had data
+
+Every sector of CACHE is zero after a flash that reported the upload
+successful. The ext4 superblock that was there before is gone, so the erase
+lands; nothing replaced it, so the write does not. Raw image and Android
+sparse image behave identically, and in both cases the download session
+never receives its end-of-session confirmation while a BOOT flash in the
+same cable and the same protocol always does. Samsung's download firmware
+will erase a filesystem partition for us and will not write an image it did
+not produce.
+
+So the root volume goes on a microSD card, which is where the header of this
+file said it was going from the first probe, for reasons that have only
+accumulated: no SMU in the data path, no partition of the phone's own
+storage to find room in, no flash cycle to rewrite it, and now no bootloader
+in the way at all -- the card is written with dd from a PC.
+
+That needs the controller brought up, because unlike dwmmc0 it arrives with
+nothing done:
+
+    dwmmc0   CTRL 0x00000010  CLKENA 0x00000001  CLKDIV 0x00000001
+    dwmmc2   CTRL 0x00000000  CLKENA 0x00000000  CLKDIV 0x00000000
+
+VERID reads 0x5342270a on both, so dwmmc2 is mapped and its bus clock runs;
+S-Boot simply never had a reason to configure it. dwmmc_sd_init() is the
+standard sequence and nothing more: reset, clock, 74 idle clocks, CMD0,
+CMD8, ACMD41 until the card is up, CMD2, CMD3, CMD7, ACMD6 for four bits,
+CMD16 for a 512-byte block, then the clock goes up. It is behind dwmmc_sd=1
+because dwmmc0 must never be given it -- a CTRL_RESET there would discard
+the clock, bus width and card selection that the eMMC path depends on.
+
+The clock is four boot arguments rather than a constant because its input
+frequency is not known. The two controllers take separate dividers from the
+CMU and S-Boot configured only one of them, so dwmmc0's CLKDIV of 1 says
+nothing about dwmmc2. The defaults assume a 100 MHz input -- 125 to
+identify at 400 kHz, 2 to read at 25 MHz -- and if CMD0 fails that
+assumption is the first thing to move. CLKSEL is Samsung's own register,
+outside the DesignWare layout, carrying the sample and drive phase; zero is
+its reset value and is what the identification clock wants.
+
+Three outcomes from dwmmc_cmd() rather than two, which is the one piece of
+this that is not boilerplate. A card declining to answer is not a fault: it
+is how an SD 1.x card replies to CMD8 and how a card still powering up
+replies to ACMD41. Folding that into the error case would make a working
+card look broken on its first command.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,1117 @@
+@@ -0,0 +1,1562 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -439,6 +490,15 @@ data path rather than merely slow.
 +#define DWMMC_VERID             0x06c
 +#define DWMMC_HCON              0x070
 +#define DWMMC_UHS_REG           0x074
++
++/*
++ * Samsung's own register, not part of the DesignWare layout. It carries the
++ * sample and drive phase of the card clock and a further divider. Zero is
++ * the reset value and is what the identification clock wants; a card that
++ * answers CMD0 but fails later at speed is the symptom of needing something
++ * else here, which is why it is a boot argument.
++ */
++#define DWMMC_CLKSEL            0x09c
 +#define DWMMC_BMOD              0x080
 +
 +/*
@@ -473,6 +533,8 @@ data path rather than merely slow.
 +#define DWMMC_CTRL_RESET        (1u << 0)
 +#define DWMMC_CTRL_FIFO_RESET   (1u << 1)
 +#define DWMMC_CTRL_DMA_RESET    (1u << 2)
++#define DWMMC_CTRL_ALL_RESET    (DWMMC_CTRL_RESET | DWMMC_CTRL_FIFO_RESET | \
++	                         DWMMC_CTRL_DMA_RESET)
 +
 +/*
 + * HCON describes how this instance of the core was built.
@@ -505,6 +567,8 @@ data path rather than merely slow.
 +#define DWMMC_CMD_DATA_EXP      (1u << 9)
 +#define DWMMC_CMD_WRITE         (1u << 10)
 +#define DWMMC_CMD_PRV_DAT_WAIT  (1u << 13)
++#define DWMMC_CMD_SEND_INIT     (1u << 15)
++#define DWMMC_CMD_UPDATE_CLK    (1u << 21)
 +#define DWMMC_CMD_USE_HOLD_REG  (1u << 29)
 +#define DWMMC_CMD_START         (1u << 31)
 +
@@ -546,8 +610,31 @@ data path rather than merely slow.
 +/* STATUS: the FIFO occupancy, in words. */
 +#define DWMMC_STATUS_FIFO_COUNT(s)      (((s) >> 17) & 0x1fff)
 +
-+/* MMC command indices used here. */
++/*
++ * Command indices. The bring-up sequence is the standard one: idle the card,
++ * ask what it is, let it finish powering up, learn its address, select it.
++ * ACMD41 and ACMD6 are ordinary commands that must be preceded by CMD55.
++ */
++#define MMC_GO_IDLE_STATE       0
++#define MMC_ALL_SEND_CID        2
++#define SD_SEND_RELATIVE_ADDR   3
++#define SD_SET_BUS_WIDTH        6       /* ACMD6 */
++#define MMC_SELECT_CARD         7
++#define SD_SEND_IF_COND         8
++#define MMC_SET_BLOCKLEN        16
 +#define MMC_READ_SINGLE_BLOCK   17
++#define SD_APP_OP_COND          41      /* ACMD41 */
++#define MMC_APP_CMD             55
++
++/* OCR, as ACMD41 returns it. */
++#define SD_OCR_BUSY             0x80000000u     /* clear while powering up */
++#define SD_OCR_CCS              0x40000000u     /* block addressing */
++#define SD_OCR_VOLTAGE          0x00ff8000u     /* 2.7 V to 3.6 V */
++#define SD_OCR_HCS              0x40000000u     /* in the argument: SDHC ok */
++
++/* CMD8's argument and the pattern the card echoes back. */
++#define SD_IF_COND_ARG          0x1aau
++#define SD_IF_COND_PATTERN      0xaau
 +
 +#define DWMMC_SECTOR            512
 +
@@ -596,6 +683,20 @@ data path rather than merely slow.
 +static uint32_t dwmmc_scan_lba = 0;
 +static uint32_t dwmmc_scan_blocks = 0;
 +
++/* dwmmc_sd=1 and the clock it uses; see dwmmc_sd_init(). */
++static uint32_t dwmmc_sd_enable = 0;
++static uint32_t dwmmc_sd_div = 125;     /* CLKDIV while identifying */
++static uint32_t dwmmc_sd_div_hi = 2;    /* CLKDIV once the card is selected */
++static uint32_t dwmmc_sd_width = 4;
++static uint32_t dwmmc_sd_clksel = 0;
++
++/*
++ * Cards of 2 GiB and under take a byte offset where larger ones take a block
++ * number. The eMMC path never changes this: every eMMC this will meet is far
++ * past that line, and the one in this handset is 16 GB.
++ */
++static uint32_t dwmmc_block_addressed = 1;
++
 +#define DWMMC_READ_MAX          4
 +
 +/*
@@ -632,6 +733,369 @@ data path rather than merely slow.
 +	    (sts & DWMMC_INT_HTO)  ? " HTO" : "",
 +	    (sts & DWMMC_INT_SBE)  ? " SBE" : "",
 +	    (sts & DWMMC_INT_EBE)  ? " EBE" : "");
++}
++
++
++/* ----------------------------------------------------- card bring-up ---- */
++
++/*
++ * Everything from here to dwmmc_read_block() exists for one controller:
++ * dwmmc2, the microSD slot.
++ *
++ * dwmmc0 needs none of it. S-Boot reads the boot image off the internal
++ * eMMC, so by the time this kernel runs that controller has a clock, a bus
++ * width and a selected card, and CMD17 works against state someone else
++ * set up. The probe's register dump shows the difference plainly:
++ *
++ *     dwmmc0   CTRL 0x00000010  CLKENA 0x00000001  CLKDIV 0x00000001
++ *     dwmmc2   CTRL 0x00000000  CLKENA 0x00000000  CLKDIV 0x00000000
++ *
++ * The SD controller is mapped and its bus clock is running -- VERID reads
++ * 0x5342270a, which a gated block does not produce -- but nothing has
++ * configured it and no card has been identified. So this is the standard
++ * sequence, written out: reset, clock, 74 idle clocks, CMD0 to idle the
++ * card, CMD8 to ask whether it speaks SD 2.0, ACMD41 until it finishes
++ * powering up, CMD2 and CMD3 to learn who it is, CMD7 to select it, ACMD6
++ * for four-bit, CMD16 for a 512-byte block, then the clock goes up.
++ *
++ * Why the SD card at all, when reading the eMMC already works: because
++ * getting a root filesystem onto the eMMC does not. Samsung's download-mode
++ * firmware erases the target partition and then declines to write anything
++ * that is not one of its own images -- a scan of all 409600 sectors of
++ * CACHE after a flash that reported success found zero bytes of data -- and
++ * there is no other way in. A card in the slot is written with dd from a
++ * PC, which puts the bootloader out of the loop entirely. It also avoids
++ * the SMU in dwmmc0's data path, which dwmmc2's tree bypasses.
++ *
++ * The clock is a boot argument because its input frequency is not known.
++ * S-Boot left dwmmc0 at CLKDIV 1, but the two controllers take separate
++ * dividers from the CMU and one says nothing about the other. CLKDIV n
++ * divides by 2n (n = 0 means divide by one), identification wants 100-400
++ * kHz, and the defaults here assume a 100 MHz input: 125 gives 400 kHz to
++ * identify with and 2 gives 25 MHz to read at. If CMD0 fails, that
++ * assumption is where to look first.
++ */
++
++/*
++ * Clock changes do not take effect when written. The core applies them when
++ * it is given a command with UPDATE_CLOCK_REGS_ONLY set, which sends nothing
++ * to the card.
++ */
++static int
++dwmmc_update_clk(vm_offset_t regs)
++{
++	int us;
++
++	dwmmc_write(regs, DWMMC_CMDARG, 0);
++	dwmmc_write(regs, DWMMC_CMD, DWMMC_CMD_START | DWMMC_CMD_UPDATE_CLK
++	    | DWMMC_CMD_PRV_DAT_WAIT);
++
++	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
++		if (!(dwmmc_read(regs, DWMMC_CMD) & DWMMC_CMD_START)) {
++			return 0;
++		}
++		delay(1);
++	}
++
++	printf("dwmmc:   the clock update was never accepted\n");
++	return -1;
++}
++
++/*
++ * The clock has to be off while the divider changes, and each of the three
++ * writes needs its own update: disable, divide, enable.
++ */
++static int
++dwmmc_set_clock(vm_offset_t regs, uint32_t div)
++{
++	dwmmc_write(regs, DWMMC_CLKENA, 0);
++	if (dwmmc_update_clk(regs) != 0) {
++		return -1;
++	}
++
++	dwmmc_write(regs, DWMMC_CLKSRC, 0);
++	dwmmc_write(regs, DWMMC_CLKDIV, div);
++	if (dwmmc_update_clk(regs) != 0) {
++		return -1;
++	}
++
++	dwmmc_write(regs, DWMMC_CLKENA, 1);     /* card 0, low-power off */
++	return dwmmc_update_clk(regs);
++}
++
++/*
++ * One command with no data phase.
++ *
++ * Three outcomes rather than two. Zero is an answer; -1 is a fault worth
++ * reporting; 1 is the card declining to answer at all, which is a normal
++ * reply to CMD8 from an SD 1.x card and to ACMD41 from one that is still
++ * powering up. Folding that into the error case would make a working card
++ * look broken.
++ */
++static int
++dwmmc_cmd(vm_offset_t regs, uint32_t hcon, uint32_t index, uint32_t arg,
++    uint32_t flags, uint32_t *resp)
++{
++	uint32_t cmd, sts = 0;
++	int us;
++
++	dwmmc_write(regs, DWMMC_RINTSTS, DWMMC_INT_ALL);
++	dwmmc_write(regs, DWMMC_CMDARG, arg);
++
++	cmd = DWMMC_CMD_INDEX(index) | flags | DWMMC_CMD_START;
++	if (hcon & DWMMC_HCON_HOLD_REG) {
++		cmd |= DWMMC_CMD_USE_HOLD_REG;
++	}
++	dwmmc_write(regs, DWMMC_CMD, cmd);
++
++	/* The core clears START once it has taken the command into its queue. */
++	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
++		if (!(dwmmc_read(regs, DWMMC_CMD) & DWMMC_CMD_START)) {
++			break;
++		}
++		delay(1);
++	}
++	if (us == DWMMC_TIMEOUT_US) {
++		printf("dwmmc:   CMD%u was never taken by the core\n", index);
++		return -1;
++	}
++
++	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
++		sts = dwmmc_read(regs, DWMMC_RINTSTS);
++		if (sts & (DWMMC_INT_CMD_DONE | DWMMC_INT_CMD_ERR)) {
++			break;
++		}
++		delay(1);
++	}
++	if (us == DWMMC_TIMEOUT_US) {
++		printf("dwmmc:   CMD%u never finished (RINTSTS 0x%08x)\n",
++		    index, dwmmc_read(regs, DWMMC_RINTSTS));
++		return -1;
++	}
++
++	if (resp != NULL) {
++		resp[0] = dwmmc_read(regs, DWMMC_RESP0);
++		resp[1] = dwmmc_read(regs, DWMMC_RESP1);
++		resp[2] = dwmmc_read(regs, DWMMC_RESP2);
++		resp[3] = dwmmc_read(regs, DWMMC_RESP3);
++	}
++
++	if (sts & DWMMC_INT_RTO) {
++		return 1;
++	}
++	if (sts & DWMMC_INT_CMD_ERR) {
++		printf("dwmmc:   CMD%u error: RINTSTS 0x%08x%s%s%s\n",
++		    index, sts,
++		    (sts & DWMMC_INT_RE) ? " RE" : "",
++		    (sts & DWMMC_INT_RCRC) ? " RCRC" : "",
++		    (sts & DWMMC_INT_HLE) ? " HLE" : "");
++		return -1;
++	}
++	return 0;
++}
++
++/* The flags every short-response command here shares. */
++#define DWMMC_CMD_R1    (DWMMC_CMD_RESP_EXP | DWMMC_CMD_CHECK_CRC | \
++	                 DWMMC_CMD_PRV_DAT_WAIT)
++
++static int
++dwmmc_sd_init(vm_offset_t regs, uint32_t hcon)
++{
++	uint32_t resp[4];
++	uint32_t ocr = 0, rca, depth, fifoth;
++	int sd2 = 0, tries, rc, us;
++
++	printf("dwmmc:   card bring-up: CLKDIV %u to identify, %u to read, "
++	    "%u-bit, CLKSEL 0x%08x\n",
++	    dwmmc_sd_div, dwmmc_sd_div_hi, dwmmc_sd_width, dwmmc_sd_clksel);
++
++	/*
++	 * A full reset, which on this controller is safe and on dwmmc0 would
++	 * not be: there is no clock, bus width or card selection here to
++	 * destroy, because nothing has set any.
++	 */
++	dwmmc_write(regs, DWMMC_CTRL, DWMMC_CTRL_ALL_RESET);
++	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
++		if (!(dwmmc_read(regs, DWMMC_CTRL) & DWMMC_CTRL_ALL_RESET)) {
++			break;
++		}
++		delay(1);
++	}
++	if (us == DWMMC_TIMEOUT_US) {
++		printf("dwmmc:   the controller reset never completed\n");
++		return -1;
++	}
++
++	/*
++	 * FIFOTH is read before it is written: after a reset its RX watermark
++	 * field holds the FIFO depth the core was built with, which is the
++	 * only place that number is available. Here it reads 0x003f0000, so
++	 * the depth is 64 -- the same 64 entries of 8 bytes that make one
++	 * sector.
++	 */
++	fifoth = dwmmc_read(regs, DWMMC_FIFOTH);
++	depth = ((fifoth >> 16) & 0xfff) + 1;
++	if (depth < 8 || depth > 4096) {
++		printf("dwmmc:   FIFOTH 0x%08x gives a depth of %u, which is "
++		    "not believable; using 64\n", fifoth, depth);
++		depth = 64;
++	}
++
++	dwmmc_write(regs, DWMMC_RINTSTS, DWMMC_INT_ALL);
++	dwmmc_write(regs, DWMMC_INTMASK, 0);
++	dwmmc_write(regs, DWMMC_TMOUT, 0xffffff40u);
++	dwmmc_write(regs, DWMMC_BLKSIZ, DWMMC_SECTOR);
++	dwmmc_write(regs, DWMMC_CTYPE, 0);      /* one bit until ACMD6 */
++	dwmmc_write(regs, DWMMC_PWREN, 1);
++	dwmmc_write(regs, DWMMC_CLKSEL, dwmmc_sd_clksel);
++	dwmmc_write(regs, DWMMC_FIFOTH,
++	    (((depth / 2) - 1) << 16) | (depth / 2));
++
++	if (dwmmc_set_clock(regs, dwmmc_sd_div) != 0) {
++		return -1;
++	}
++
++	/*
++	 * The card wants 74 clocks of nothing before its first command. Two
++	 * milliseconds is far more than that at any identification clock, and
++	 * the cost of being generous is two milliseconds.
++	 */
++	delay(2000);
++
++	/*
++	 * CMD0 with SEND_INITIALIZATION, which makes the core send the idle
++	 * clocks itself. No response: the card does not answer this one.
++	 *
++	 * This is the command that tests the assumption behind everything
++	 * else. If the card interface clock is not actually running, this is
++	 * where it shows.
++	 */
++	if (dwmmc_cmd(regs, hcon, MMC_GO_IDLE_STATE, 0,
++	    DWMMC_CMD_SEND_INIT | DWMMC_CMD_PRV_DAT_WAIT, NULL) < 0) {
++		printf("dwmmc:   CMD0 did not complete -- either no card is "
++		    "in the slot or the card clock is not running\n");
++		return -1;
++	}
++	delay(2000);
++
++	/*
++	 * CMD8 asks whether the card understands SD 2.0 voltage signalling.
++	 * The argument carries a voltage range and a check pattern; a card
++	 * that understands it echoes the pattern back. Silence means SD 1.x,
++	 * which is not a failure, and changes only the HCS bit in ACMD41.
++	 */
++	rc = dwmmc_cmd(regs, hcon, SD_SEND_IF_COND, SD_IF_COND_ARG,
++	    DWMMC_CMD_R1, resp);
++	if (rc < 0) {
++		return -1;
++	}
++	if (rc == 0 && (resp[0] & 0xff) == SD_IF_COND_PATTERN) {
++		sd2 = 1;
++	}
++	printf("dwmmc:   CMD8: %s\n",
++	    sd2 ? "SD 2.0 or later" : "no answer, treating it as SD 1.x");
++
++	/*
++	 * ACMD41 until the card says it has finished powering up. Each one is
++	 * a CMD55 followed by CMD41; R3 carries no CRC, so asking the core to
++	 * check one would fail every single time.
++	 *
++	 * A card that does not answer is retried rather than given up on: a
++	 * card still bringing its internal supply up may ignore a command
++	 * outright, and the loop already has a bound and a clear thing to say
++	 * when it runs out. Only a real fault -- a CRC or a hardware-locked
++	 * write -- ends it early.
++	 */
++	for (tries = 0; tries < 1000; tries++) {
++		if (dwmmc_cmd(regs, hcon, MMC_APP_CMD, 0,
++		    DWMMC_CMD_R1, resp) < 0) {
++			printf("dwmmc:   CMD55 failed on try %d\n", tries);
++			return -1;
++		}
++		if (dwmmc_cmd(regs, hcon, SD_APP_OP_COND,
++		    (sd2 ? SD_OCR_HCS : 0u) | SD_OCR_VOLTAGE,
++		    DWMMC_CMD_RESP_EXP | DWMMC_CMD_PRV_DAT_WAIT, resp) < 0) {
++			printf("dwmmc:   ACMD41 failed on try %d\n", tries);
++			return -1;
++		}
++		ocr = resp[0];
++		if (ocr & SD_OCR_BUSY) {
++			break;
++		}
++		delay(1000);
++	}
++	if (!(ocr & SD_OCR_BUSY)) {
++		printf("dwmmc:   the card never finished powering up "
++		    "(OCR 0x%08x)\n", ocr);
++		return -1;
++	}
++
++	dwmmc_block_addressed = (ocr & SD_OCR_CCS) ? 1 : 0;
++	printf("dwmmc:   OCR 0x%08x after %d tries: %s addressing\n",
++	    ocr, tries + 1,
++	    dwmmc_block_addressed ? "block, SDHC or larger" : "byte, SDSC");
++
++	if (dwmmc_cmd(regs, hcon, MMC_ALL_SEND_CID, 0,
++	    DWMMC_CMD_RESP_EXP | DWMMC_CMD_RESP_LONG | DWMMC_CMD_CHECK_CRC
++	    | DWMMC_CMD_PRV_DAT_WAIT, resp) != 0) {
++		printf("dwmmc:   CMD2 failed\n");
++		return -1;
++	}
++	printf("dwmmc:   CID %08x %08x %08x %08x\n",
++	    resp[3], resp[2], resp[1], resp[0]);
++
++	if (dwmmc_cmd(regs, hcon, SD_SEND_RELATIVE_ADDR, 0,
++	    DWMMC_CMD_R1, resp) != 0) {
++		printf("dwmmc:   CMD3 failed\n");
++		return -1;
++	}
++	rca = resp[0] >> 16;
++	printf("dwmmc:   the card took RCA 0x%04x\n", rca);
++
++	if (dwmmc_cmd(regs, hcon, MMC_SELECT_CARD, rca << 16,
++	    DWMMC_CMD_R1, resp) != 0) {
++		printf("dwmmc:   CMD7 failed\n");
++		return -1;
++	}
++
++	/*
++	 * Four bits if asked for, and one if the card refuses. A refusal here
++	 * is not worth failing the whole bring-up over: a 1-bit card is four
++	 * times slower and entirely usable.
++	 */
++	if (dwmmc_sd_width == 4) {
++		if (dwmmc_cmd(regs, hcon, MMC_APP_CMD, rca << 16,
++		    DWMMC_CMD_R1, resp) == 0 &&
++		    dwmmc_cmd(regs, hcon, SD_SET_BUS_WIDTH, 2,
++		    DWMMC_CMD_R1, resp) == 0) {
++			dwmmc_write(regs, DWMMC_CTYPE, 1);
++			printf("dwmmc:   bus width is now 4 bits\n");
++		} else {
++			printf("dwmmc:   ACMD6 refused; staying at 1 bit\n");
++		}
++	}
++
++	/*
++	 * 512 bytes a block. An SDHC card is fixed at that and ignores this;
++	 * an SDSC card is not, and this is what makes the two behave alike
++	 * everywhere above.
++	 */
++	if (dwmmc_cmd(regs, hcon, MMC_SET_BLOCKLEN, DWMMC_SECTOR,
++	    DWMMC_CMD_R1, resp) != 0) {
++		printf("dwmmc:   CMD16 failed\n");
++		return -1;
++	}
++
++	if (dwmmc_set_clock(regs, dwmmc_sd_div_hi) != 0) {
++		return -1;
++	}
++	delay(1000);
++
++	printf("dwmmc:   card ready: CLKENA 0x%08x CLKDIV 0x%08x "
++	    "CTYPE 0x%08x STATUS 0x%08x\n",
++	    dwmmc_read(regs, DWMMC_CLKENA), dwmmc_read(regs, DWMMC_CLKDIV),
++	    dwmmc_read(regs, DWMMC_CTYPE), dwmmc_read(regs, DWMMC_STATUS));
++	return 0;
 +}
 +
 +/*
@@ -692,10 +1156,12 @@ data path rather than merely slow.
 +	dwmmc_write(regs, DWMMC_TMOUT, 0xffffff40u);
 +
 +	/*
-+	 * Block addressing, not byte. Every eMMC larger than 2 GiB uses it,
-+	 * and this one is 16.
++	 * Block addressing unless the card said otherwise. Every eMMC uses
++	 * it and so does every SD card past 2 GiB; dwmmc_sd_init() clears
++	 * this for the small ones, which take a byte offset instead.
 +	 */
-+	dwmmc_write(regs, DWMMC_CMDARG, lba);
++	dwmmc_write(regs, DWMMC_CMDARG,
++	    dwmmc_block_addressed ? lba : lba * DWMMC_SECTOR);
 +
 +	cmd = DWMMC_CMD_INDEX(MMC_READ_SINGLE_BLOCK)
 +	    | DWMMC_CMD_RESP_EXP | DWMMC_CMD_CHECK_CRC
@@ -1018,6 +1484,19 @@ data path rather than merely slow.
 +	}
 +
 +	/*
++	 * dwmmc2 needs its card brought up before any of the rest means
++	 * anything; dwmmc0 arrives already configured by S-Boot and must not
++	 * be reset. See dwmmc_sd_init().
++	 */
++	if (alive && dwmmc_sd_enable && (unit->bit & 2) != 0) {
++		if (dwmmc_sd_init(regs, hcon) != 0) {
++			printf("dwmmc:   card bring-up failed; nothing "
++			    "further on this controller\n");
++			return;
++		}
++	}
++
++	/*
 +	 * Reading is asked for rather than assumed. The probe is safe on any
 +	 * controller; a command is not, and this one is the phone's own
 +	 * storage.
@@ -1064,6 +1543,13 @@ data path rather than merely slow.
 + * at all -- the probe only reads identity registers, and that is safe on any
 + * controller, whereas a command is not.
 + *
++ * dwmmc_sd=1: bring the card in the microSD slot up before reading, which
++ * dwmmc2 needs and dwmmc0 must not be given. dwmmc_sd_div=<n> and
++ * dwmmc_sd_div_hi=<n> are the CLKDIV used to identify the card and to read
++ * it (divide by 2n; 0 divides by one), dwmmc_sd_width=<1|4> the bus width,
++ * and dwmmc_sd_clksel=<hex> Samsung's phase register. See dwmmc_sd_init()
++ * for why the clock is not simply known.
++ *
 + * dwmmc_scan_lba=<first>, dwmmc_scan_blocks=<count>: read that whole range
 + * and print every filesystem signature in it, plus the first sector that is
 + * not all zeroes. Default 0 blocks, which scans nothing. Use it when a
@@ -1089,6 +1575,16 @@ data path rather than merely slow.
 +	    sizeof(dwmmc_read_count));
 +	(void)PE_parse_boot_argn("dwmmc_lba", &dwmmc_read_lba,
 +	    sizeof(dwmmc_read_lba));
++	(void)PE_parse_boot_argn("dwmmc_sd", &dwmmc_sd_enable,
++	    sizeof(dwmmc_sd_enable));
++	(void)PE_parse_boot_argn("dwmmc_sd_div", &dwmmc_sd_div,
++	    sizeof(dwmmc_sd_div));
++	(void)PE_parse_boot_argn("dwmmc_sd_div_hi", &dwmmc_sd_div_hi,
++	    sizeof(dwmmc_sd_div_hi));
++	(void)PE_parse_boot_argn("dwmmc_sd_width", &dwmmc_sd_width,
++	    sizeof(dwmmc_sd_width));
++	(void)PE_parse_boot_argn("dwmmc_sd_clksel", &dwmmc_sd_clksel,
++	    sizeof(dwmmc_sd_clksel));
 +	(void)PE_parse_boot_argn("dwmmc_scan_lba", &dwmmc_scan_lba,
 +	    sizeof(dwmmc_scan_lba));
 +	(void)PE_parse_boot_argn("dwmmc_scan_blocks", &dwmmc_scan_blocks,
