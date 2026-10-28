@@ -1,4 +1,4 @@
-Talk to the storage controller: probe it, then read a sector.
+Probe the storage controller, and nothing else yet.
 
 The root filesystem is an 18 MiB RAM disk with 44 files in it, and that is a
 ceiling rather than a choice: the shim carries it inside the Android BOOT
@@ -17,19 +17,15 @@ here so that rd=md0 works -- is a plain bdevsw with a strategy routine. A
 storage driver in that shape needs no IOKit at all; strategy() does real
 transfers where memdev does a memcpy.
 
-This patch is the two steps before that, in the order that makes each one
-answerable on its own.
+This patch does none of that. It reads VERID and HCON and prints them.
 
-    dwmmc_probe=<mask>              read the identity registers (default: 1)
-    dwmmc_read=<n> dwmmc_lba=<m>    send CMD17 n times from sector m (default: 0)
-
-First, the identity registers. Bringing up a card means a clock setup, a
+That is the point. Bringing up a card means a clock setup, a controller
 reset, CMD0/CMD1/CMD2/CMD3/CMD7, FIFO handling and timeouts, and when the
 result of all that is silence there is no way to tell which step was wrong --
-or whether the register block was ever mapped. VERID and HCON are read-only.
-A plausible value out of them proves the mapping, the bus and the clock
-together, in one line, before there is a single card command to be wrong
-about.
+or whether the register block was ever mapped in the first place. VERID and
+HCON are read-only identity registers. A plausible value out of them proves
+the mapping, the bus and the controller's clock together, in one line, before
+there is a single card command to be wrong about.
 
 The addresses are Samsung's own. The stock boot image carries four device
 trees, one per board revision, and all four agree:
@@ -46,144 +42,6 @@ slot's clocks -- Android would have, from the CMU, and Android is not here.
 Reading an ungated SFR block on Exynos does not return zero, it hangs the
 bus. So dwmmc2 sits behind dwmmc_probe=2, and a boot that stops dead after
 naming it has answered the question it was asked.
-
-Second, the read -- and the probe is what made it this small. What came back
-was not an idle controller but a working one:
-
-    CLKENA 0x00000001   the card clock is running
-    CLKDIV 0x00000001   divided by two, not the 400 kHz of an init
-    CTYPE  0x00010000   bit 16: card 0 is on an 8-bit bus
-    BLKSIZ 0x00000200   512-byte blocks, already set
-    STATUS 0x00000906   bit 8: the card is driving DAT3; FIFO empty, not busy
-    CTRL   0x00000010   interrupts on, DMA and IDMAC off -- S-Boot used PIO
-    HCON   0x0be42541   bit 23: the hold register is implemented
-    VERID  0x5342270a   revision 0x270a, so the FIFO is at 0x200, not 0x100
-
-S-Boot left all of it behind. The card has already been through CMD0, CMD1,
-CMD2, CMD3 and CMD7; it is selected and in the transfer state. So this sends
-CMD17 and nothing else. READ_SINGLE_BLOCK goes to whichever card is selected,
-needs no RCA, and needs to know nothing about what S-Boot did. If the card is
-not in fact selected the controller answers with a response timeout, which
-gets printed and named; that is a cheap way to be wrong.
-
-Two values from the probe are used rather than assumed: HCON's hold-register
-bit decides whether commands carry USE_HOLD_REG, and VERID's revision is what
-puts the FIFO at 0x200.
-
-The FIFO is drained while the transfer is running, not after it. It is 64
-words deep and a sector is 128, so waiting for the data-transfer-over
-interrupt first would stall the controller half way with a full FIFO and look
-exactly like a dead card.
-
-That is not a hypothetical. The first version of this read got as far as
-
-    dwmmc:   CMD17 accepted, RESP0 0x00000900
-    dwmmc:   data error: RINTSTS 0x00000424 HTO
-
-which is a complete account of what went wrong. RESP0 0x900 is the card's R1
-status: CURRENT_STATE 4, tran, and READY_FOR_DATA set -- so the card was
-selected and the command path worked end to end. RINTSTS 0x424 is command
-done, receive-FIFO data ready, and HTO, data starvation by the host. The data
-arrived and nobody came for it, because that printf sat between the command
-and the drain, and writing one line to this console means rendering glyphs
-into a 720x1280 framebuffer: milliseconds, against a FIFO the card fills in
-microseconds.
-
-So command completion and the drain are now a single loop with no printf and
-no delay in it -- not even a wait for the controller to accept the command in
-front of it -- and everything worth saying is saved and said afterwards. The
-data timeout in TMOUT is also set generously before the command rather than
-inheriting whatever S-Boot tuned for its own loader, since that register is
-what decides when HTO fires.
-
-That fixed the transfer and exposed a second mistake, this one in judgement
-rather than in code. The next attempt said:
-
-    dwmmc:   data error: RINTSTS 0x00000424 HTO
-    dwmmc:   128 of 128 words had arrived
-
-All the data arrived. HTO was still latched, and this treated it as fatal, so
-the sector was thrown away unread. But HTO is not a data error: it means the
-host was late to the FIFO. The bits that say the data is wrong are DCRC, SBE
-and EBE; DRTO says the card never sent it and FRUN says the FIFO ran under.
-None of those fired, and all 128 words were there. A transfer that completes
-has completed, whatever the controller made of the host's timing along the
-way.
-
-So HTO is out of the fatal mask and printed as a warning instead. That got
-one step further and stopped again:
-
-    dwmmc:   all 128 words arrived but the transfer never closed
-    dwmmc:   at the end: RINTSTS 0x00000424 HTO
-
-A whole sector, no corruption bits, and no DTO. The missing DTO follows from
-HTO rather than being a second fault: once HTO fires the DesignWare core
-abandons the data phase, so it never says the transfer is over.
-
-What is left unexplained is why HTO fires at all. Not the host's timing: it
-was raised identically whether the drain sat behind a framebuffer printf or
-ran in a tight spin, which is a hundredfold difference in latency for no
-difference in outcome. Two candidates remain -- the TMOUT write not taking
-effect, and the SMU that this controller's device tree says is in its data
-path -- and TMOUT is now read back and printed so the first can be settled
-from the console.
-
-Meanwhile the read is treated as having succeeded, because by the thing it
-was written to test it has: a complete sector with none of the bits that
-mean it is wrong. The bytes settle it in a way no status register can.
-
-The bytes settled it:
-
-    dwmmc:   TMOUT reads back 0xffffff40 (wrote 0xffffff40)
-    dwmmc:   LBA 1:
-    dwmmc:     000  45 46 49 20 45 46 49 20  45 46 49 20 45 46 49 20
-    dwmmc:     010  45 46 49 20 45 46 49 20  45 46 49 20 45 46 49 20
-    ...
-    dwmmc:   CMD17 done: ... STATUS 0x00808d09
-
-45 46 49 20 is "EFI ". LBA 1 was asked for and the first word of the GPT
-header came back, so the card is being read and the data path works. But the
-same word came back 128 times, TMOUT had taken effect so the timeout was not
-the problem, and STATUS reported FIFO_COUNT = (0x808d09 >> 17) & 0x1fff = 64
--- the FIFO completely full and never emptied.
-
-HCON had been printing the answer since the very first probe. Bits 9:7 are
-H_DATA_WIDTH: 0 is a 16-bit FIFO, 1 is 32 and 2 is 64. HCON here is
-0x0be42541, so bits 9:7 are 0b010 and this core's FIFO is 64 bits wide. A
-32-bit read of it returns the low half and does not consume the entry. Hence
-one word forever, a FIFO that never drains, a controller that gives up on the
-host -- and an HTO that was never about the host's speed at all, which is
-why making the drain a hundred times faster changed nothing.
-
-The device tree agrees in hindsight: fifo-depth 64, at 8 bytes an entry, is
-512 bytes, exactly one sector.
-
-So the FIFO is read in the width HCON reports. That was necessary and not
-sufficient: a single 64-bit load did not consume the entry either, and the
-console said so in the same words as before, now with "FIFO 8 bytes wide"
-printed beside them.
-
-What it needs is two 32-bit reads: the low half at DWMMC_DATA, then the high
-half at DWMMC_DATA + 4. Reading the second half is what consumes the entry.
-Reading only the first leaves it in place -- which was the first attempt --
-and a 64-bit access is not permitted by this core at all, which was the
-second.
-
-This is not peculiar to this handset. Linux carries DW_MMC_QUIRK_FIFO64_32
-for precisely this, and the hardware its commit message names is Exynos7870:
-the sibling of the Exynos7570 here, same generation, same core. The sector
-buffer stays uint64_t so the pair of halves lands aligned.
-
-Three symptoms, one cause, and all of them visible from the first probe if
-HCON had been read properly: the repeated word, the FIFO that stayed full at
-64 entries, and an HTO that never had anything to do with how fast the host
-was.
-
-Nothing is written, ever. There is no code here that can modify the card,
-which on the phone's own storage is the only responsible way to start. The
-controller is not reset either: CTRL_RESET would discard the clock, the bus
-width and the card selection that all of this depends on, so only the FIFO is
-cleared.
 
 The register offsets in the new file are the DesignWare layout, written out
 rather than taken from anywhere. They are facts about the hardware, but the
@@ -203,66 +61,9 @@ late enough for printf to reach the console. The call site is deliberately
 not next to inittodr(): hfs-filesystem-builtin and memdev-ramdisk-root both
 insert there, they both apply after this one, and three patches editing the
 same six lines is a merge conflict waiting for the next person.
-
-The read works, so this adds the thing it was for: /dev/mmc0, a block device
-the filesystem layer can mount.
-
-    dwmmc_part_lba=<first> dwmmc_part_blocks=<count>    publish the window
-    rd=mmc0                                             root on it
-
-It is a bdevsw and not an IOKit storage stack, for the reason given at the
-top: IOStorageFamily is a separate kext and is not in this tree, while the
-root device is only ever a dev_t. bsd/dev/memdev.c is the same shape and is
-already patched here, so this is that shape with CMD17 where memdev has a
-bcopy. IOFindBSDRoot() gets a case for rd=mmc0 beside its existing one for
-rd=mdX, which exists because a memory device has no IOMedia to match either.
-
-Read-only, and not as a precaution that could be relaxed: there is no code
-here that can write to the card. This is the phone's own eMMC with Android's
-partitions on it. Nothing is given up by that -- vfs_subr.c:1022 sets
-MNT_RDONLY | MNT_ROOTFS on the root mount before trying any filesystem, so
-the root is read-only whatever the device could do.
-
-One controller, one request at a time. The transfer is polled, so a second
-thread arriving mid-transfer would read another's FIFO; a mutex makes that
-impossible rather than merely unlikely. Sectors land in a bounce buffer and
-are copied, because the FIFO is read 32 bits at a time and a transfer's
-pages are not guaranteed to be aligned for that -- one 512-byte copy against
-128 uncached register reads is not worth finding out where that assumption
-fails.
-
-The per-read commentary is now behind a flag that only the probe sets. A
-filesystem asks for thousands of sectors a second, and a printf in the data
-path is the bug this driver was already bitten by once.
-
-The window is two boot arguments rather than a partition table reader. There
-is no need for one yet: heimdall print-pit says where the partitions are and
-those numbers do not move. On this handset CACHE is 6127616 + 409600 and
-SYSTEM is 491520 + 5636096, which is 200 MiB and 2752 MiB -- the first small
-enough to flash in seconds for a first root on real storage, the second the
-size of the iOS 12 root filesystem.
-
-rd=mmc0 then resolved and the root mount died anyway:
-
-    BSD root: mmc0, major 2, minor 0
-    bsd_init: vfs_mountroot
-    panic(...): "bdevvp failed: open"
-
-The cause was several layers from the panic. spec_open()'s VBLK path reads
-the device's block size, sets it to 512, reads the block count, and then
-sets the size back:
-
-    if (VNOP_IOCTL(vp, DKIOCSETBLOCKSIZE, &blksize, FWRITE, ctx))
-            error = ENXIO;    /* "If it doesn't set back, we can't recover" */
-
-This answered DKIOCGETBLOCKSIZE, which is what makes that block run at all,
-and did not answer DKIOCSETBLOCKSIZE, so the restoring call failed and the
-open was refused. A device that reports a block size has to be able to set
-one. Both of spec_open()'s calls ask for 512 here, because 512 is what this
-reports; anything else is refused rather than quietly accepted.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,988 @@
+@@ -0,0 +1,225 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -321,57 +122,12 @@ reports; anything else is refused rather than quietly accepted.
 + * before that controller can be read from; the card slot does not have it,
 + * which is one of several reasons the root volume is headed for an SD card
 + * and not a partition of the phone's own storage.
-+ *
-+ *
-+ * Reading a sector, and why there is no card bring-up here
-+ *
-+ * The probe answered more than it was asked. What came back was not an idle
-+ * controller but a working one:
-+ *
-+ *     CLKENA 0x00000001   the card clock is running
-+ *     CLKDIV 0x00000001   divided by two, not the 400 kHz of an init
-+ *     CTYPE  0x00010000   bit 16: card 0 is on an 8-bit bus
-+ *     BLKSIZ 0x00000200   512-byte blocks, already set
-+ *     STATUS 0x00000906   bit 8: the card is driving DAT3; FIFO empty, not busy
-+ *     CTRL   0x00000010   interrupts on, DMA and IDMAC off -- S-Boot used PIO
-+ *
-+ * S-Boot reads the boot image off this eMMC, and it left every bit of that
-+ * behind. The card has already been through CMD0, CMD1, CMD2, CMD3 and CMD7;
-+ * it is selected and in the transfer state. None of that has to be done
-+ * again, and doing it anyway would mean writing the part of a storage driver
-+ * that is hardest to debug blind -- clock programming and a state machine
-+ * with no output -- in order to arrive back at the state already in the
-+ * registers.
-+ *
-+ * So this sends CMD17 and nothing else. READ_SINGLE_BLOCK is addressed to
-+ * whichever card is selected, so it needs no RCA and no knowledge of what
-+ * S-Boot did. If the card is not in fact selected the controller answers with
-+ * a response timeout, which this prints; that is a cheap way to be wrong.
-+ *
-+ * Two details from the probe are used rather than assumed. HCON bit 23 is
-+ * set, so the hold register exists and commands must carry USE_HOLD_REG.
-+ * VERID's revision is 0x270A, which is past 0x240A, so the FIFO is at 0x200
-+ * rather than the 0x100 of the older IP.
-+ *
-+ * The FIFO is drained by polling, not by interrupt. There is no interrupt
-+ * handler here and there should not be one yet: a polled read is the version
-+ * whose failure modes are all visible in RINTSTS afterwards.
-+ *
-+ * Nothing is written, ever. This file has no code that can modify the card,
-+ * which on the phone's own eMMC is the only responsible way to start.
 + */
 +
 +#include <sys/param.h>
 +#include <sys/systm.h>
-+#include <sys/buf.h>
-+#include <sys/conf.h>
-+#include <sys/disk.h>
-+#include <sys/proc.h>
-+#include <sys/uio.h>
 +#include <mach/vm_types.h>
-+#include <kern/locks.h>
 +#include <libkern/libkern.h>
-+#include <miscfs/devfs/devfs.h>
 +#include <pexpert/pexpert.h>
 +
 +/*
@@ -381,7 +137,6 @@ reports; anything else is refused rather than quietly accepted.
 + * reaching an osfmk routine from BSD.
 + */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-+extern void delay(int usec);
 +
 +/* Register offsets, from the controller. */
 +#define DWMMC_CTRL              0x000
@@ -411,22 +166,6 @@ reports; anything else is refused rather than quietly accepted.
 +#define DWMMC_HCON              0x070
 +#define DWMMC_UHS_REG           0x074
 +#define DWMMC_BMOD              0x080
-+
-+/*
-+ * The FIFO. 0x200 is where it sits on this IP revision; the older cores,
-+ * before 0x240A, put it at 0x100.
-+ *
-+ * Reading it is where two attempts went wrong, so it is worth writing down.
-+ * This core's FIFO is 64 bits wide (see DWMMC_HCON_DATA_WIDTH), and a 64-bit
-+ * access to it is not allowed -- the entry is consumed by reading the low
-+ * half at DWMMC_DATA and then the high half at DWMMC_DATA + 4. Reading only
-+ * the low half leaves the entry in place, and so does a single 64-bit load:
-+ * either way the same word comes back forever and the FIFO never empties.
-+ *
-+ * This is not peculiar to this board. Linux carries DW_MMC_QUIRK_FIFO64_32
-+ * for exactly it, and the hardware its commit message names is Exynos7870 --
-+ * the sibling of the Exynos7570 here, same generation, same core.
-+ */
 +#define DWMMC_DATA              0x200
 +
 +/* One 4 KiB page covers the whole block; the device tree asks for 0x2000. */
@@ -440,104 +179,6 @@ reports; anything else is refused rather than quietly accepted.
 + */
 +#define DWMMC_VERID_REV(v)      ((v) & 0xffff)
 +
-+/* CTRL */
-+#define DWMMC_CTRL_RESET        (1u << 0)
-+#define DWMMC_CTRL_FIFO_RESET   (1u << 1)
-+#define DWMMC_CTRL_DMA_RESET    (1u << 2)
-+
-+/*
-+ * HCON describes how this instance of the core was built.
-+ *
-+ * Bits 9:7 are H_DATA_WIDTH and they are the whole story of this driver's
-+ * first real bug: 0 means the FIFO is 16 bits wide, 1 means 32 and 2 means
-+ * 64. This controller reads 0x0be42541, so bits 9:7 are 0b010 and the FIFO
-+ * is 64 bits wide. A 32-bit read of a 64-bit FIFO returns the low half and
-+ * does not consume the entry, so the same word comes back forever, the FIFO
-+ * never empties, and the controller eventually gives up on the host -- which
-+ * is exactly what was seen: "EFI " repeated 128 times, STATUS reporting the
-+ * FIFO still full at 64 entries, and HTO raised no matter how fast the drain
-+ * loop ran.
-+ *
-+ * The device tree's fifo-depth of 64 agrees: 64 entries of 8 bytes is 512,
-+ * one whole sector.
-+ *
-+ * Bit 22 is IMPLEMENT_HOLD_REG. This part sets both 22 and 23, so whichever
-+ * of the two the documentation means, commands here carry USE_HOLD_REG
-+ * either way and nothing about this board turns on getting it right.
-+ */
-+#define DWMMC_HCON_DATA_WIDTH(h)        (((h) >> 7) & 0x7)
-+#define DWMMC_HCON_HOLD_REG             (1u << 22)
-+
-+/* CMD */
-+#define DWMMC_CMD_INDEX(i)      ((i) & 0x3f)
-+#define DWMMC_CMD_RESP_EXP      (1u << 6)
-+#define DWMMC_CMD_RESP_LONG     (1u << 7)
-+#define DWMMC_CMD_CHECK_CRC     (1u << 8)
-+#define DWMMC_CMD_DATA_EXP      (1u << 9)
-+#define DWMMC_CMD_WRITE         (1u << 10)
-+#define DWMMC_CMD_PRV_DAT_WAIT  (1u << 13)
-+#define DWMMC_CMD_USE_HOLD_REG  (1u << 29)
-+#define DWMMC_CMD_START         (1u << 31)
-+
-+/* RINTSTS / INTMASK */
-+#define DWMMC_INT_RE            (1u << 1)       /* response error */
-+#define DWMMC_INT_CMD_DONE      (1u << 2)
-+#define DWMMC_INT_DTO           (1u << 3)       /* data transfer over */
-+#define DWMMC_INT_RCRC          (1u << 6)       /* response CRC */
-+#define DWMMC_INT_DCRC          (1u << 7)       /* data CRC */
-+#define DWMMC_INT_RTO           (1u << 8)       /* response timeout */
-+#define DWMMC_INT_DRTO          (1u << 9)       /* data read timeout */
-+#define DWMMC_INT_HTO           (1u << 10)
-+#define DWMMC_INT_FRUN          (1u << 11)
-+#define DWMMC_INT_HLE           (1u << 12)      /* hardware locked write */
-+#define DWMMC_INT_SBE           (1u << 13)
-+#define DWMMC_INT_EBE           (1u << 15)
-+#define DWMMC_INT_ALL           0xffffffffu
-+
-+#define DWMMC_INT_CMD_ERR       (DWMMC_INT_RE | DWMMC_INT_RTO | \
-+	                         DWMMC_INT_RCRC | DWMMC_INT_HLE)
-+/*
-+ * HTO is deliberately not in here.
-+ *
-+ * It means the host was late to the FIFO -- flow control, not corruption.
-+ * The bits that say the data is wrong are DCRC, SBE and EBE; DRTO says the
-+ * card never sent it and FRUN says the FIFO ran under. HTO on its own is
-+ * survivable, and on this kernel it has been survived: the first working
-+ * read raised HTO and still delivered all 128 words with no CRC error. A
-+ * transfer that completes is a transfer that completes, whatever the
-+ * controller thought of the host's timing on the way.
-+ *
-+ * It is still worth printing, because once this drives a filesystem rather
-+ * than one sector at boot, a host that is habitually late is a real problem.
-+ */
-+#define DWMMC_INT_DATA_FATAL    (DWMMC_INT_DCRC | DWMMC_INT_DRTO | \
-+	                         DWMMC_INT_FRUN | DWMMC_INT_SBE | \
-+	                         DWMMC_INT_EBE)
-+
-+/* STATUS: the FIFO occupancy, in words. */
-+#define DWMMC_STATUS_FIFO_COUNT(s)      (((s) >> 17) & 0x1fff)
-+
-+/* MMC command indices used here. */
-+#define MMC_READ_SINGLE_BLOCK   17
-+
-+#define DWMMC_SECTOR            512
-+
-+/*
-+ * How long to wait for each step, in microseconds. Generous: a read that is
-+ * going to work finishes in well under a millisecond at this clock, and the
-+ * only cost of a long limit is how long a dead controller takes to say so.
-+ */
-+#define DWMMC_TIMEOUT_US        500000
-+
-+/*
-+ * The data phase spins instead of sleeping: a sector at this clock is over
-+ * in well under a millisecond, and a delay(1) between polls is long enough
-+ * for the FIFO to fill and the controller to give up on us. This is the
-+ * iteration budget for that spin -- large enough to be no limit in practice,
-+ * small enough that a dead transfer still ends.
-+ */
-+#define DWMMC_SPINS             2000000
-+
 +struct dwmmc_unit {
 +	const char      *name;
 +	vm_offset_t     base;           /* physical */
@@ -549,261 +190,10 @@ reports; anything else is refused rather than quietly accepted.
 +	{ "dwmmc2 (microSD slot)",  0x13560000, 2 },
 +};
 +
-+static void dwmmc_blockdev_init(vm_offset_t regs, uint32_t hcon);
-+
-+/* dwmmc_read=<sectors> and dwmmc_lba=<first>; see dwmmc_probe(). */
-+static uint32_t dwmmc_read_count = 0;
-+static uint32_t dwmmc_read_lba = 0;
-+
-+/*
-+ * The window /dev/mmc0 shows, and whether it has been published yet. Set
-+ * from boot arguments; see dwmmc_probe() and the block device at the end.
-+ */
-+static uint32_t dwmmc_part_lba = 0;     /* first sector of the window */
-+static uint32_t dwmmc_part_blocks = 0;  /* its length, in sectors */
-+static int      dwmmc_bmajor = -1;
-+
-+#define DWMMC_READ_MAX          4
-+
 +static uint32_t
 +dwmmc_read(vm_offset_t regs, uint32_t off)
 +{
 +	return *(volatile uint32_t *)(regs + off);
-+}
-+
-+static void
-+dwmmc_write(vm_offset_t regs, uint32_t off, uint32_t val)
-+{
-+	*(volatile uint32_t *)(regs + off) = val;
-+}
-+
-+/* Name the bits of RINTSTS that mean something went wrong. */
-+static void
-+dwmmc_print_errors(const char *what, uint32_t sts)
-+{
-+	printf("dwmmc:   %s: RINTSTS 0x%08x%s%s%s%s%s%s%s%s%s\n", what, sts,
-+	    (sts & DWMMC_INT_RE)   ? " RE" : "",
-+	    (sts & DWMMC_INT_RTO)  ? " RTO(response timeout)" : "",
-+	    (sts & DWMMC_INT_RCRC) ? " RCRC" : "",
-+	    (sts & DWMMC_INT_HLE)  ? " HLE" : "",
-+	    (sts & DWMMC_INT_DCRC) ? " DCRC" : "",
-+	    (sts & DWMMC_INT_DRTO) ? " DRTO(data timeout)" : "",
-+	    (sts & DWMMC_INT_HTO)  ? " HTO" : "",
-+	    (sts & DWMMC_INT_SBE)  ? " SBE" : "",
-+	    (sts & DWMMC_INT_EBE)  ? " EBE" : "");
-+}
-+
-+/*
-+ * One 512-byte sector, by CMD17, using whatever state the bootloader left.
-+ *
-+ * buf is 128 words. The FIFO is drained as it fills rather than after the
-+ * transfer: it is 64 words deep and a sector is 128, so waiting for DTO
-+ * first would stall the controller half way with a full FIFO and look
-+ * exactly like a dead card.
-+ */
-+static int
-+dwmmc_read_block(vm_offset_t regs, uint32_t hcon, uint32_t lba, void *buf,
-+    int verbose)
-+{
-+	/*
-+	 * The FIFO is read in the width the core was built with, which is
-+	 * what HCON says and not what is convenient. See DWMMC_HCON_DATA_WIDTH.
-+	 */
-+	const uint32_t fifo_bytes = 2u << DWMMC_HCON_DATA_WIDTH(hcon);
-+	uint8_t *out = buf;
-+	uint32_t cmd, sts, resp;
-+	uint32_t got = 0;               /* bytes */
-+	int us;
-+
-+	if (fifo_bytes != 4 && fifo_bytes != 8) {
-+		printf("dwmmc:   HCON says the FIFO is %u bytes wide, which "
-+		    "this does not know how to read\n", fifo_bytes);
-+		return -1;
-+	}
-+
-+	/*
-+	 * A clean FIFO and a clean status, and nothing else. CTRL_RESET would
-+	 * discard the clock, bus width and card selection that this depends
-+	 * on, so the controller itself is not reset.
-+	 */
-+	dwmmc_write(regs, DWMMC_CTRL,
-+	    dwmmc_read(regs, DWMMC_CTRL) | DWMMC_CTRL_FIFO_RESET);
-+	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
-+		if (!(dwmmc_read(regs, DWMMC_CTRL) & DWMMC_CTRL_FIFO_RESET)) {
-+			break;
-+		}
-+		delay(1);
-+	}
-+	if (us == DWMMC_TIMEOUT_US) {
-+		printf("dwmmc:   FIFO reset never completed\n");
-+		return -1;
-+	}
-+
-+	dwmmc_write(regs, DWMMC_RINTSTS, DWMMC_INT_ALL);
-+	dwmmc_write(regs, DWMMC_BLKSIZ, DWMMC_SECTOR);
-+	dwmmc_write(regs, DWMMC_BYTCNT, DWMMC_SECTOR);
-+
-+	/*
-+	 * A generous data timeout. The upper 24 bits are counted in card
-+	 * clock cycles and bound how long the controller will wait for the
-+	 * host to service the FIFO before raising HTO.
-+	 */
-+	dwmmc_write(regs, DWMMC_TMOUT, 0xffffff40u);
-+
-+	/*
-+	 * Block addressing, not byte. Every eMMC larger than 2 GiB uses it,
-+	 * and this one is 16.
-+	 */
-+	dwmmc_write(regs, DWMMC_CMDARG, lba);
-+
-+	cmd = DWMMC_CMD_INDEX(MMC_READ_SINGLE_BLOCK)
-+	    | DWMMC_CMD_RESP_EXP | DWMMC_CMD_CHECK_CRC
-+	    | DWMMC_CMD_DATA_EXP | DWMMC_CMD_PRV_DAT_WAIT
-+	    | DWMMC_CMD_START;
-+	if (hcon & DWMMC_HCON_HOLD_REG) {
-+		cmd |= DWMMC_CMD_USE_HOLD_REG;
-+	}
-+
-+	dwmmc_write(regs, DWMMC_CMD, cmd);
-+
-+	/*
-+	 * From here to the end of the transfer there is no printf and no
-+	 * delay, and that is deliberate.
-+	 *
-+	 * An earlier version printed the card's response between the command
-+	 * and the drain. Writing one line to this console means rendering
-+	 * glyphs into a 720x1280 framebuffer, which takes milliseconds; the
-+	 * card fills the FIFO in microseconds. So command completion and the
-+	 * drain are one loop, with not even a wait for the controller to
-+	 * accept the command in front of it, and anything worth saying is
-+	 * saved and said afterwards.
-+	 */
-+	for (us = 0; us < DWMMC_SPINS; us++) {
-+		uint32_t now = dwmmc_read(regs, DWMMC_RINTSTS);
-+		uint32_t avail;
-+
-+		if (now & DWMMC_INT_CMD_ERR) {
-+			sts = now;
-+			goto cmd_failed;
-+		}
-+
-+		/* FIFO_COUNT is in entries, and an entry is fifo_bytes wide. */
-+		avail = DWMMC_STATUS_FIFO_COUNT(dwmmc_read(regs, DWMMC_STATUS));
-+		while (avail-- > 0 && got < DWMMC_SECTOR) {
-+			/*
-+			 * A 64-bit entry is taken as two 32-bit reads, low
-+			 * half then high half. Not a convenience: this core
-+			 * does not allow a 64-bit access to the FIFO at all,
-+			 * and what consumes the entry is reading the second
-+			 * half. See the note above DWMMC_DATA.
-+			 */
-+			*(uint32_t *)(void *)(out + got) =
-+			    dwmmc_read(regs, DWMMC_DATA);
-+			if (fifo_bytes == 8) {
-+				*(uint32_t *)(void *)(out + got + 4) =
-+				    dwmmc_read(regs, DWMMC_DATA + 4);
-+			}
-+			got += fifo_bytes;
-+		}
-+
-+		if (now & DWMMC_INT_DATA_FATAL) {
-+			sts = now;
-+			goto data_failed;
-+		}
-+		if (got == DWMMC_SECTOR && (now & DWMMC_INT_DTO)) {
-+			break;
-+		}
-+	}
-+
-+	sts = dwmmc_read(regs, DWMMC_RINTSTS);
-+	resp = dwmmc_read(regs, DWMMC_RESP0);
-+
-+	if (got < DWMMC_SECTOR) {
-+		printf("dwmmc:   short read: %u of %u bytes, RESP0 0x%08x\n",
-+		    got, (uint32_t)DWMMC_SECTOR, resp);
-+		dwmmc_print_errors("at the end", sts);
-+		return -1;
-+	}
-+
-+	/*
-+	 * A whole sector and none of the bits that mean it is wrong. HTO and
-+	 * a missing DTO are reported but not treated as failure: HTO means
-+	 * the host was late to the FIFO, and once it fires the core abandons
-+	 * the data phase, so the absent DTO follows from it. With the FIFO
-+	 * read at its real width neither should appear again, and if they do
-+	 * the bytes below are still the thing that settles it.
-+	 */
-+	/*
-+	 * Only the probe says anything. Once this is answering a filesystem
-+	 * there are thousands of these a second, and a printf in the data
-+	 * path is the bug this driver has already been bitten by once.
-+	 */
-+	if (verbose) {
-+		if (sts & (DWMMC_INT_HTO | DWMMC_INT_DTO)) {
-+			printf("dwmmc:   %s, %s\n",
-+			    (sts & DWMMC_INT_HTO) ? "HTO raised" : "no HTO",
-+			    (sts & DWMMC_INT_DTO) ? "transfer closed"
-+			    : "no DTO");
-+		}
-+		printf("dwmmc:   CMD17 done: RESP0 0x%08x (state %u%s), "
-+		    "RINTSTS 0x%08x, STATUS 0x%08x, FIFO %u bytes wide\n",
-+		    resp, (resp >> 9) & 0xf,
-+		    ((resp >> 9) & 0xf) == 4 ? " = tran" : "", sts,
-+		    dwmmc_read(regs, DWMMC_STATUS), fifo_bytes);
-+	}
-+	return 0;
-+
-+cmd_failed:
-+	resp = dwmmc_read(regs, DWMMC_RESP0);
-+	dwmmc_print_errors("command rejected", sts);
-+	if (sts & DWMMC_INT_RTO) {
-+		printf("dwmmc:   a response timeout here means the card is "
-+		    "not selected; it needs a full CMD0..CMD7 bring-up after "
-+		    "all\n");
-+	}
-+	return -1;
-+
-+data_failed:
-+	dwmmc_print_errors("data error", sts);
-+	printf("dwmmc:   %u of %u bytes had arrived\n", got,
-+	    (uint32_t)DWMMC_SECTOR);
-+	return -1;
-+}
-+
-+/*
-+ * The first 64 bytes, and whatever the sector announces itself to be.
-+ *
-+ * On a Samsung handset LBA 0 is a protective MBR, so the 0x55AA at offset
-+ * 510 is the thing to look for: finding it means the bytes came off the card
-+ * and arrived in the right order, which no amount of plausible-looking hex
-+ * can establish on its own.
-+ */
-+static void
-+dwmmc_dump_sector(uint32_t lba, const void *buf)
-+{
-+	const unsigned char *b = (const unsigned char *)buf;
-+	int row;
-+
-+	printf("dwmmc:   LBA %u:\n", lba);
-+	for (row = 0; row < 4; row++) {
-+		const unsigned char *p = b + row * 16;
-+
-+		printf("dwmmc:     %03x  %02x %02x %02x %02x %02x %02x %02x "
-+		    "%02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
-+		    row * 16,
-+		    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
-+		    p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
-+	}
-+
-+	if (b[510] == 0x55 && b[511] == 0xaa) {
-+		printf("dwmmc:     ends 55 aa -- a partition table signature\n");
-+	} else if (b[0] == 'E' && b[1] == 'F' && b[2] == 'I' && b[3] == ' '
-+	    && b[4] == 'P' && b[5] == 'A' && b[6] == 'R' && b[7] == 'T') {
-+		printf("dwmmc:     starts \"EFI PART\" -- a GPT header\n");
-+	} else {
-+		printf("dwmmc:     no signature here (bytes 510-511 are "
-+		    "%02x %02x)\n", b[510], b[511]);
-+	}
 +}
 +
 +static void
@@ -812,7 +202,6 @@ reports; anything else is refused rather than quietly accepted.
 +	vm_offset_t regs;
 +	uint32_t verid, hcon, usrid, ctrl, status, cdetect;
 +	uint32_t clkena, clkdiv, ctype, blksiz, fifoth, bmod;
-+	int alive = 0;
 +
 +	regs = ml_io_map(unit->base, DWMMC_REGS_SIZE);
 +	if (regs == 0) {
@@ -870,36 +259,6 @@ reports; anything else is refused rather than quietly accepted.
 +		    "produces; check the address\n", DWMMC_VERID_REV(verid));
 +	} else {
 +		printf("dwmmc:   alive: mapping, bus and clock all work\n");
-+		alive = 1;
-+	}
-+
-+	/*
-+	 * Reading is asked for rather than assumed. The probe is safe on any
-+	 * controller; a command is not, and this one is the phone's own
-+	 * storage.
-+	 */
-+	if (dwmmc_read_count > 0) {
-+		/* uint64_t, so a 64-bit FIFO read lands aligned. */
-+		uint64_t buf[DWMMC_SECTOR / 8];
-+		uint32_t n;
-+
-+		for (n = 0; n < dwmmc_read_count; n++) {
-+			if (dwmmc_read_block(regs, hcon,
-+			    dwmmc_read_lba + n, buf, 1) != 0) {
-+				printf("dwmmc:   read of LBA %u failed\n",
-+				    dwmmc_read_lba + n);
-+				break;
-+			}
-+			dwmmc_dump_sector(dwmmc_read_lba + n, buf);
-+		}
-+	}
-+
-+	/*
-+	 * Publish the device only once, and only on a controller that
-+	 * answered. dwmmc_part_blocks is what asks for it at all.
-+	 */
-+	if (alive && dwmmc_part_blocks != 0 && dwmmc_bmajor < 0) {
-+		dwmmc_blockdev_init(regs, hcon);
 +	}
 +}
 +
@@ -910,17 +269,6 @@ reports; anything else is refused rather than quietly accepted.
 + *
 + * dwmmc_probe=<mask>: bit 0 is dwmmc0, bit 1 is dwmmc2. Default 1. See the
 + * header on why dwmmc2 is not probed unless it is asked for.
-+ *
-+ * dwmmc_read=<sectors>, dwmmc_lba=<first>: send CMD17 that many times, from
-+ * that sector, and print what comes back. Default 0, which sends no command
-+ * at all -- the probe only reads identity registers, and that is safe on any
-+ * controller, whereas a command is not.
-+ *
-+ * dwmmc_part_lba=<first>, dwmmc_part_blocks=<count>: publish /dev/mmc0 as a
-+ * read-only window onto that range of the card, so that rd=mmc0 can root on
-+ * it. Default 0 blocks, which publishes nothing. The numbers come from the
-+ * PIT; on this handset CACHE is 6127616 + 409600 and SYSTEM is 491520 +
-+ * 5636096.
 + */
 +void dwmmc_probe(void);
 +
@@ -931,19 +279,6 @@ reports; anything else is refused rather than quietly accepted.
 +	unsigned int i;
 +
 +	(void)PE_parse_boot_argn("dwmmc_probe", &mask, sizeof(mask));
-+	(void)PE_parse_boot_argn("dwmmc_read", &dwmmc_read_count,
-+	    sizeof(dwmmc_read_count));
-+	(void)PE_parse_boot_argn("dwmmc_lba", &dwmmc_read_lba,
-+	    sizeof(dwmmc_read_lba));
-+	(void)PE_parse_boot_argn("dwmmc_part_lba", &dwmmc_part_lba,
-+	    sizeof(dwmmc_part_lba));
-+	(void)PE_parse_boot_argn("dwmmc_part_blocks", &dwmmc_part_blocks,
-+	    sizeof(dwmmc_part_blocks));
-+
-+	if (dwmmc_read_count > DWMMC_READ_MAX) {
-+		dwmmc_read_count = DWMMC_READ_MAX;
-+	}
-+
 +	if (mask == 0) {
 +		return;
 +	}
@@ -953,303 +288,6 @@ reports; anything else is refused rather than quietly accepted.
 +			dwmmc_probe_one(&dwmmc_units[i]);
 +		}
 +	}
-+}
-+
-+/* ------------------------------------------------------- block device ---- */
-+
-+/*
-+ * The same controller, as something the filesystem layer can mount.
-+ *
-+ * This is a bdevsw, not an IOKit storage stack. The root device is a dev_t;
-+ * IOBlockStorageDevice under IOBlockStorageDriver is how a real handset
-+ * arrives at one, but IOStorageFamily is a separate kext and is not in this
-+ * tree, so that road starts by building another kext into the kernel.
-+ * bsd/dev/memdev.c -- already patched here so that rd=md0 works -- shows the
-+ * smaller shape: a strategy routine and two devfs nodes. This is that, with
-+ * CMD17 where memdev has a bcopy.
-+ *
-+ * Read-only, and not as a precaution that could be relaxed later: there is
-+ * no code here that can write to the card at all. This is the phone's own
-+ * eMMC, with Android's partitions on it, and the kernel that is learning to
-+ * talk to it is three days old. vfs_subr.c:1022 sets MNT_RDONLY | MNT_ROOTFS
-+ * on the root mount before trying any filesystem, so nothing is given up:
-+ * the root is mounted read-only whatever the device could do.
-+ *
-+ * One controller, one request at a time. Transfers are polled, so a second
-+ * thread arriving mid-transfer would read another's FIFO; the mutex is what
-+ * makes that impossible rather than merely unlikely.
-+ *
-+ * A sector is read into a bounce buffer and copied, rather than straight
-+ * into the caller's pages. The FIFO is read 32 bits at a time and the buffer
-+ * a transfer lands in is not guaranteed to be aligned for that; one 512-byte
-+ * copy against 128 uncached register reads is not a cost worth the risk of
-+ * finding out where that assumption fails.
-+ *
-+ * dwmmc_part_lba and dwmmc_part_blocks are a window onto the card, so that
-+ * the device is a partition rather than the whole disk. They come from boot
-+ * arguments because there is no partition table reader here yet and, for a
-+ * first root filesystem on real storage, there does not need to be: the PIT
-+ * says where CACHE and SYSTEM start, and those numbers do not change.
-+ */
-+
-+static lck_grp_t        *dwmmc_lck_grp;
-+static lck_mtx_t        *dwmmc_lock;
-+
-+static vm_offset_t      dwmmc_dev_regs;         /* the controller, mapped */
-+static uint32_t         dwmmc_dev_hcon;
-+static int              dwmmc_cmajor = -1;
-+static dev_t            dwmmc_bdev = NODEV;
-+static void             *dwmmc_bdevb;
-+static void             *dwmmc_cdevb;
-+
-+static uint64_t         dwmmc_bounce[DWMMC_SECTOR / 8];
-+
-+static int
-+dwmmc_open(__unused dev_t dev, __unused int flags, __unused int devtype,
-+    __unused struct proc *p)
-+{
-+	return (dwmmc_part_blocks != 0) ? 0 : ENXIO;
-+}
-+
-+static int
-+dwmmc_close(__unused dev_t dev, __unused int flags, __unused int devtype,
-+    __unused struct proc *p)
-+{
-+	return 0;
-+}
-+
-+static int
-+dwmmc_size(__unused dev_t dev)
-+{
-+	return (dwmmc_part_blocks != 0) ? DWMMC_SECTOR : -1;
-+}
-+
-+static void
-+dwmmc_strategy(struct buf *bp)
-+{
-+	caddr_t dst;
-+	uint64_t offset, length;
-+	uint32_t sectors, i;
-+	int error = 0;
-+
-+	if (dwmmc_part_blocks == 0) {
-+		buf_seterror(bp, ENXIO);
-+		buf_biodone(bp);
-+		return;
-+	}
-+
-+	if (!(buf_flags(bp) & B_READ)) {
-+		buf_seterror(bp, EROFS);
-+		buf_biodone(bp);
-+		return;
-+	}
-+
-+	buf_setresid(bp, buf_count(bp));
-+
-+	offset = (uint64_t)buf_blkno(bp) * DWMMC_SECTOR;
-+	length = (uint64_t)dwmmc_part_blocks * DWMMC_SECTOR;
-+
-+	/*
-+	 * Reading at the end is end-of-file and leaves resid == count;
-+	 * reading past it is an error. memdev draws the line in the same
-+	 * place and the filesystem layer expects it there.
-+	 */
-+	if (offset >= length) {
-+		if (offset != length) {
-+			buf_seterror(bp, EINVAL);
-+		}
-+		buf_biodone(bp);
-+		return;
-+	}
-+	if (offset + buf_count(bp) > length) {
-+		buf_setcount(bp, (uint32_t)(length - offset));
-+	}
-+
-+	if (buf_count(bp) % DWMMC_SECTOR) {
-+		buf_seterror(bp, EINVAL);
-+		buf_biodone(bp);
-+		return;
-+	}
-+
-+	if (buf_map(bp, &dst)) {
-+		buf_seterror(bp, ENOMEM);
-+		buf_biodone(bp);
-+		return;
-+	}
-+
-+	sectors = buf_count(bp) / DWMMC_SECTOR;
-+
-+	lck_mtx_lock(dwmmc_lock);
-+	for (i = 0; i < sectors; i++) {
-+		error = dwmmc_read_block(dwmmc_dev_regs, dwmmc_dev_hcon,
-+		    dwmmc_part_lba + (uint32_t)(offset / DWMMC_SECTOR) + i,
-+		    dwmmc_bounce, 0);
-+		if (error != 0) {
-+			break;
-+		}
-+		memcpy(dst + (size_t)i * DWMMC_SECTOR, dwmmc_bounce,
-+		    DWMMC_SECTOR);
-+	}
-+	lck_mtx_unlock(dwmmc_lock);
-+
-+	if (error != 0) {
-+		buf_seterror(bp, EIO);
-+		buf_setresid(bp, buf_count(bp) - (uint32_t)i * DWMMC_SECTOR);
-+	} else {
-+		buf_setresid(bp, 0);
-+	}
-+
-+	buf_unmap(bp);
-+	buf_biodone(bp);
-+}
-+
-+static int
-+dwmmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
-+    struct proc *p)
-+{
-+	int error;
-+
-+	error = proc_suser(p);
-+	if (error) {
-+		return error;
-+	}
-+
-+	switch (cmd) {
-+	case DKIOCGETBLOCKSIZE:
-+		*(uint32_t *)(void *)data = DWMMC_SECTOR;
-+		break;
-+
-+	/*
-+	 * Answering this is not optional once DKIOCGETBLOCKSIZE is answered,
-+	 * and the first attempt at this driver learned it the hard way:
-+	 * spec_open()'s VBLK path reads the block size, sets it to 512,
-+	 * reads the block count, and then sets the size back --
-+	 *
-+	 *     if (VNOP_IOCTL(vp, DKIOCSETBLOCKSIZE, &blksize, FWRITE, ctx))
-+	 *             error = ENXIO;    "If it doesn't set back, we can't recover"
-+	 *
-+	 * -- so a driver that reports a size but refuses to set one cannot be
-+	 * opened at all. The root mount died in bdevvp() with "open", several
-+	 * layers away from the ioctl that caused it.
-+	 *
-+	 * 512 is the only size on offer, and both of spec_open()'s calls ask
-+	 * for it, since 512 is what this reports. Anything else is refused
-+	 * rather than silently ignored.
-+	 */
-+	case DKIOCSETBLOCKSIZE:
-+		if (*(uint32_t *)(void *)data != DWMMC_SECTOR) {
-+			return EINVAL;
-+		}
-+		break;
-+	case DKIOCGETBLOCKCOUNT:
-+		*(uint64_t *)(void *)data = dwmmc_part_blocks;
-+		break;
-+	case DKIOCISWRITABLE:
-+		*(uint32_t *)(void *)data = 0;
-+		break;
-+	case DKIOCGETMAXBLOCKCOUNTREAD:
-+	case DKIOCGETMAXSEGMENTCOUNTREAD:
-+		*(uint64_t *)(void *)data = 32;
-+		break;
-+	default:
-+		return ENOTTY;
-+	}
-+	return 0;
-+}
-+
-+static int
-+dwmmc_rw(dev_t dev, struct uio *uio, __unused int ioflag)
-+{
-+	if (uio_rw(uio) != UIO_READ) {
-+		return EROFS;
-+	}
-+	return physio(dwmmc_strategy, NULL, dev, B_READ, minphys, uio,
-+	           DWMMC_SECTOR);
-+}
-+
-+static struct bdevsw dwmmc_bdevsw = {
-+	/* open */ dwmmc_open,
-+	/* close */ dwmmc_close,
-+	/* strategy */ dwmmc_strategy,
-+	/* ioctl */ dwmmc_ioctl,
-+	/* dump */ eno_dump,
-+	/* psize */ dwmmc_size,
-+	/* flags */ D_DISK,
-+};
-+
-+static struct cdevsw dwmmc_cdevsw = {
-+	/* open */ dwmmc_open,
-+	/* close */ dwmmc_close,
-+	/* read */ dwmmc_rw,
-+	/* write */ dwmmc_rw,
-+	/* ioctl */ dwmmc_ioctl,
-+	/* stop */ eno_stop,
-+	/* reset */ eno_reset,
-+	/* ttys */ NULL,
-+	/* select */ eno_select,
-+	/* mmap */ eno_mmap,
-+	/* strategy */ eno_strat,
-+	/* getc */ eno_getc,
-+	/* putc */ eno_putc,
-+	/* flags */ D_DISK,
-+};
-+
-+/*
-+ * IOFindBSDRoot() resolves rd=mdX by calling mdevlookup() before it tries
-+ * any IOKit matching, because a memory device has no IOMedia to match
-+ * against. Neither does this, for the same reason, so rd=mmc0 is answered
-+ * the same way.
-+ */
-+dev_t dwmmc_lookup(void);
-+
-+dev_t
-+dwmmc_lookup(void)
-+{
-+	return (dwmmc_part_blocks != 0) ? dwmmc_bdev : (dev_t)NODEV;
-+}
-+
-+static void
-+dwmmc_blockdev_init(vm_offset_t regs, uint32_t hcon)
-+{
-+	dwmmc_dev_regs = regs;
-+	dwmmc_dev_hcon = hcon;
-+
-+	dwmmc_lck_grp = lck_grp_alloc_init("dwmmc", LCK_GRP_ATTR_NULL);
-+	if (dwmmc_lck_grp == NULL) {
-+		printf("dwmmc: no lock group\n");
-+		return;
-+	}
-+	dwmmc_lock = lck_mtx_alloc_init(dwmmc_lck_grp, LCK_ATTR_NULL);
-+	if (dwmmc_lock == NULL) {
-+		printf("dwmmc: no lock\n");
-+		return;
-+	}
-+
-+	dwmmc_bmajor = bdevsw_add(-1, &dwmmc_bdevsw);
-+	if (dwmmc_bmajor < 0) {
-+		printf("dwmmc: bdevsw_add failed: %d\n", dwmmc_bmajor);
-+		return;
-+	}
-+	dwmmc_cmajor = cdevsw_add_with_bdev(-1, &dwmmc_cdevsw, dwmmc_bmajor);
-+	if (dwmmc_cmajor < 0) {
-+		printf("dwmmc: cdevsw_add failed: %d\n", dwmmc_cmajor);
-+		return;
-+	}
-+
-+	dwmmc_bdev = makedev(dwmmc_bmajor, 0);
-+	dwmmc_bdevb = devfs_make_node(dwmmc_bdev, DEVFS_BLOCK,
-+	    UID_ROOT, GID_OPERATOR, 0600, "mmc0");
-+	dwmmc_cdevb = devfs_make_node(makedev(dwmmc_cmajor, 0), DEVFS_CHAR,
-+	    UID_ROOT, GID_OPERATOR, 0600, "rmmc0");
-+	if (dwmmc_bdevb == NULL || dwmmc_cdevb == NULL) {
-+		printf("dwmmc: devfs_make_node failed\n");
-+		return;
-+	}
-+
-+	printf("dwmmc: mmc0 is major %d, minor 0: LBA %u + %u sectors "
-+	    "(%u MiB), read-only\n", dwmmc_bmajor, dwmmc_part_lba,
-+	    dwmmc_part_blocks, dwmmc_part_blocks / 2048);
-+	printf("dwmmc: boot with rd=mmc0 to use it as the root device\n");
 +}
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
@@ -1290,46 +328,3 @@ reports; anything else is refused rather than quietly accepted.
  	bsd_init_kprintf("calling os_reason_init\n");
  	os_reason_init();
  
---- a/iokit/bsddev/IOKitBSDInit.cpp
-+++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -55,6 +55,12 @@
- extern dev_t mdevlookup(int devid);
- extern void mdevremoveall(void);
- extern int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
-+
-+/*
-+ * bsd/dev/dwmmc.c. The storage controller's block device, looked up the same
-+ * way a memory device is and for the same reason; see below.
-+ */
-+extern dev_t dwmmc_lookup(void);
- extern void di_root_ramfile(IORegistryEntry * entry);
- 
- #if CONFIG_EMBEDDED
-@@ -547,6 +553,27 @@
- 		}
- 	}
- 
-+//
-+//	Or on the storage controller's own block device.
-+//
-+//	Everything past this point resolves a root by matching an IOMedia,
-+//	and bsd/dev/dwmmc.c has none to match: it is a bdevsw, because
-+//	IOStorageFamily is a separate kext and is not in this tree. A memory
-+//	device is in exactly the same position, which is why the case above
-+//	exists at all, so this follows it rather than inventing a mechanism.
-+//
-+	if (strncmp(rdBootVar, "mmc0", sizeof("mmc0")) == 0) {
-+		*root = dwmmc_lookup();                                                         /* Ask the driver for its dev_t */
-+		if (*root != (dev_t) - 1) {
-+			strlcpy(rootName, "mmc0", rootNameSize);
-+			IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
-+			*oflags = 0;                                                                    /* Show that this is not network */
-+			goto iofrootx;                                                                  /* Join common exit... */
-+		}
-+		panic("IOFindBSDRoot: rd=mmc0, but the dwmmc block device was not published; "
-+		    "dwmmc_part_blocks must name a window onto the card\n");
-+	}
-+
- 	if ((!matching) && rdBootVar[0]) {
- 		// by BSD name
- 		look = rdBootVar;
