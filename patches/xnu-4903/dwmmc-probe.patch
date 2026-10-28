@@ -367,9 +367,49 @@ Writing that turned up a real bug, which is what the second pair of eyes was
 for: the FIFO depth is only legible in FIFOTH's reset value, and
 dwmmc_sd_prepare() writes FIFOTH. One bring-up never noticed. Twelve in a
 row read a depth of 4 from the eleventh onwards. It is latched now.
+
+Every divider was silent, and the STATUS column said why it was not the
+clock:
+
+    CLKDIV    8: ... STATUS 0x00000206      command FSM idle
+    CLKDIV  125: ... STATUS 0x00000226      FSM 2, sending the start bit
+    CLKDIV 1000: ... STATUS 0x00000276      FSM 7, awaiting the response
+
+Bits 7:4 are the command state machine and it is clocked by the card
+interface clock. A machine that advances to "transmitting the command" and
+then to "waiting for the response start bit" has a clock, has a command, and
+is being ignored. The CMU does not need touching.
+
+What was left was the pins, and the device tree is unambiguous:
+
+    sd2-clk            gpr4-0                  function 2
+    sd2-cmd            gpr4-1                  function 2
+    sd2-bus-width1     gpr4-2                  function 2
+    sd2-bus-width4     gpr4-3 gpr4-4 gpr4-5    function 2
+    dwmmc2_tflash_en   gpa0-3                  function 1, value 1
+
+S-Boot configures the pins for the eMMC because it boots from it, and leaves
+the card slot's as GPIOs. The last line is the half that is easy to miss:
+the slot's supply is behind a GPIO that Linux raises before touching the
+controller, and nothing here was raising it. The card may have had no power
+through every attempt so far, which would explain a silence that no clock
+could fix.
+
+The bank offsets are not in the device tree. Exynos7870 is this part's
+sibling and its FSYS banks are gpr0 at 0x000, gpr1 at 0x020, gpr2 at 0x040,
+gpr3 at 0x060 and gpr4 at 0x080, with six pins in gpr4 and eight in gpr1 --
+exactly the six the tree names for the card slot and exactly the eight of
+the eMMC's data bus. That agreement is the evidence, and gpr1's function
+register is printed as the proof: S-Boot set those eight to function 2, so
+it must read 0x22222222 before anything here is believed.
+
+Only the function and the pull are written. The tree asks for a drive
+strength of 4 on gpa0-3, which does not fit the two bits a pull field has,
+so that field's width is not established and the default is left alone. It
+is a centimetre of trace to a socket.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,1668 @@
+@@ -0,0 +1,1848 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -549,6 +589,70 @@ row read a depth of 4 from the eleventh onwards. It is latched now.
 +#define DWMMC_REGS_SIZE         0x2000
 +
 +/*
++ * The pin controllers.
++ *
++ * A DesignWare controller with a perfect clock and a perfect command
++ * sequence talks to nothing at all if its signals are not routed to the
++ * socket, and on this handset they are not: S-Boot configures the pins for
++ * the internal eMMC, because it boots from it, and leaves the card slot's
++ * alone. The pins come up as GPIOs and the card never hears a thing.
++ *
++ * Exynos pin controllers are a set of banks, four registers each -- function
++ * (four bits a pin), data, pull (two bits a pin), drive strength. The device
++ * tree names which pins and which function:
++ *
++ *     sd2-clk            gpr4-0                  function 2
++ *     sd2-cmd            gpr4-1                  function 2
++ *     sd2-bus-width1     gpr4-2                  function 2
++ *     sd2-bus-width4     gpr4-3 gpr4-4 gpr4-5    function 2
++ *     dwmmc2_cd_ext_irq  gpa0-1                  function 15
++ *     dwmmc2_tflash_en   gpa0-3                  function 1, value 1
++ *
++ * The last line is the other half of the problem and is easy to miss: the
++ * card's supply is behind a GPIO, and Linux raises it before touching the
++ * controller. Nothing here was raising it, so the slot may have had no power
++ * at all through every attempt so far.
++ *
++ * Where the banks are. The device tree gives the blocks and their order --
++ * pinctrl3 is 0x13750000 and holds gpr0, gpr1 and gpr4 -- and the bank
++ * offsets within a block are not in the tree; they are in the pin controller
++ * itself. Exynos7870 is this part's sibling, same generation, and its banks
++ * are gpr0 at 0x000, gpr1 at 0x020, gpr2 at 0x040, gpr3 at 0x060 and gpr4 at
++ * 0x080, with six pins in gpr4 -- exactly the six the tree names above, and
++ * eight in gpr1, exactly the internal eMMC's data bus. That agreement is
++ * what makes 0x080 a fact rather than a guess, and gpr1's function register
++ * is printed as the proof: S-Boot set those eight pins to function 2, so it
++ * must read 0x22222222. If it does not, the base address is wrong and
++ * nothing else here should be believed.
++ *
++ * gpa0 is in the ALIVE block, whose banks run etc0, etc1, gpa0, gpa1, gpa2,
++ * gpq0. At 0x20 a bank that puts gpa0 at 0x040, which is less certain than
++ * gpr4 -- the etc banks need not be the same size -- so it is a boot
++ * argument and the whole block is dumped beside it.
++ */
++#define EXYNOS_PINCTRL_FSYS     0x13750000
++#define EXYNOS_PINCTRL_ALIVE    0x139f0000
++#define EXYNOS_PINCTRL_SIZE     0x1000
++
++#define EXYNOS_PIN_CON          0x00    /* 4 bits a pin: the function */
++#define EXYNOS_PIN_DAT          0x04    /* 1 bit a pin */
++#define EXYNOS_PIN_PUD          0x08    /* 2 bits a pin: 0 none, 1 down, 3 up */
++
++#define EXYNOS_GPR1             0x020
++#define EXYNOS_GPR4             0x080
++
++/* gpr4-0 through gpr4-5, all at function 2. */
++#define GPR4_CON_MASK           0x00ffffffu
++#define GPR4_CON_SD             0x00222222u
++
++/* No pull on the clock, pull-up on the command and the four data lines. */
++#define GPR4_PUD_MASK           0x00000fffu
++#define GPR4_PUD_SD             0x00000ffcu
++
++/* gpa0-3, the card's supply: function 1 is output, and it wants to be high. */
++#define GPA0_TFLASH_EN_PIN      3
++
++/*
 + * The low half of VERID is the IP revision, and every member of this family
 + * reads as 0x2xxA -- 0x240A and 0x270A are the ones commonly seen. It is not
 + * a value a dead or unmapped block produces, which is the whole point of
@@ -709,6 +813,10 @@ row read a depth of 4 from the eleventh onwards. It is latched now.
 +/* dwmmc_scan_lba=<first> and dwmmc_scan_blocks=<count>; see dwmmc_scan(). */
 +static uint32_t dwmmc_scan_lba = 0;
 +static uint32_t dwmmc_scan_blocks = 0;
++
++/* dwmmc_pin=0 leaves the pins alone; see dwmmc_sd_pins(). */
++static uint32_t dwmmc_pin = 1;
++static uint32_t dwmmc_gpa0 = 0x040;
 +
 +/* dwmmc_sd=1 and the clock it uses; see dwmmc_sd_init(). */
 +static uint32_t dwmmc_sd_enable = 0;
@@ -935,6 +1043,102 @@ row read a depth of 4 from the eleventh onwards. It is latched now.
 +#define DWMMC_CMD_R1    (DWMMC_CMD_RESP_EXP | DWMMC_CMD_CHECK_CRC | \
 +	                 DWMMC_CMD_PRV_DAT_WAIT)
 +
++
++/*
++ * Route the card slot's signals to the card slot, and turn its supply on.
++ *
++ * Read before written, and printed either way, because this writes to a pin
++ * controller shared with the rest of the board: gpr4 is the card slot and
++ * nothing else, but a wrong base address would be writing function codes
++ * into whatever is actually there. gpr1's function register is the check --
++ * see the comment on EXYNOS_PINCTRL_FSYS for why it must read 0x22222222 --
++ * and it is printed first so that a bad base is visible before the writes
++ * rather than after.
++ *
++ * Only the function and the pull are written. Drive strength is left as it
++ * is: the tree asks for 2 on these pins and 4 on gpa0-3, and a field that
++ * has to hold 4 is not the two bits a pull field has, so its width is not
++ * established here. The default drive is enough to talk to a card in a
++ * socket a centimetre away, and a wrong guess at a field width is a way to
++ * configure six pins into nonsense.
++ */
++static void
++dwmmc_sd_pins(void)
++{
++	vm_offset_t fsys, alive;
++	uint32_t con, pud;
++	unsigned int i;
++
++	fsys = ml_io_map(EXYNOS_PINCTRL_FSYS, EXYNOS_PINCTRL_SIZE);
++	if (fsys == 0) {
++		printf("dwmmc:   pinctrl at 0x%x could not be mapped\n",
++		    EXYNOS_PINCTRL_FSYS);
++		return;
++	}
++
++	con = dwmmc_read(fsys, EXYNOS_GPR1 + EXYNOS_PIN_CON);
++	printf("dwmmc:   gpr1 CON 0x%08x %s\n", con,
++	    con == 0x22222222u ? "-- the eMMC's eight pins, as expected" :
++	    "-- EXPECTED 0x22222222; the base address may be wrong");
++
++	con = dwmmc_read(fsys, EXYNOS_GPR4 + EXYNOS_PIN_CON);
++	pud = dwmmc_read(fsys, EXYNOS_GPR4 + EXYNOS_PIN_PUD);
++	printf("dwmmc:   gpr4 before: CON 0x%08x  PUD 0x%08x\n", con, pud);
++
++	dwmmc_write(fsys, EXYNOS_GPR4 + EXYNOS_PIN_CON,
++	    (con & ~GPR4_CON_MASK) | GPR4_CON_SD);
++	dwmmc_write(fsys, EXYNOS_GPR4 + EXYNOS_PIN_PUD,
++	    (pud & ~GPR4_PUD_MASK) | GPR4_PUD_SD);
++
++	printf("dwmmc:   gpr4 after:  CON 0x%08x  PUD 0x%08x\n",
++	    dwmmc_read(fsys, EXYNOS_GPR4 + EXYNOS_PIN_CON),
++	    dwmmc_read(fsys, EXYNOS_GPR4 + EXYNOS_PIN_PUD));
++
++	alive = ml_io_map(EXYNOS_PINCTRL_ALIVE, EXYNOS_PINCTRL_SIZE);
++	if (alive == 0) {
++		printf("dwmmc:   pinctrl at 0x%x could not be mapped\n",
++		    EXYNOS_PINCTRL_ALIVE);
++		return;
++	}
++
++	/*
++	 * The first six banks of the ALIVE block, so that gpa0 can be found
++	 * if 0x040 turns out to be the wrong one. The tree's order is etc0,
++	 * etc1, gpa0, gpa1, gpa2, gpq0.
++	 */
++	for (i = 0; i < 6; i++) {
++		uint32_t off = i * 0x20;
++
++		printf("dwmmc:   alive +0x%03x: CON 0x%08x  DAT 0x%08x  "
++		    "PUD 0x%08x\n", off,
++		    dwmmc_read(alive, off + EXYNOS_PIN_CON),
++		    dwmmc_read(alive, off + EXYNOS_PIN_DAT),
++		    dwmmc_read(alive, off + EXYNOS_PIN_PUD));
++	}
++
++	if (dwmmc_gpa0 == 0xffffffffu) {
++		printf("dwmmc:   leaving the card supply alone as asked\n");
++		return;
++	}
++
++	con = dwmmc_read(alive, dwmmc_gpa0 + EXYNOS_PIN_CON);
++	con &= ~(0xfu << (GPA0_TFLASH_EN_PIN * 4));
++	con |= 1u << (GPA0_TFLASH_EN_PIN * 4);          /* output */
++	dwmmc_write(alive, dwmmc_gpa0 + EXYNOS_PIN_CON, con);
++
++	dwmmc_write(alive, dwmmc_gpa0 + EXYNOS_PIN_DAT,
++	    dwmmc_read(alive, dwmmc_gpa0 + EXYNOS_PIN_DAT)
++	    | (1u << GPA0_TFLASH_EN_PIN));
++
++	printf("dwmmc:   card supply on: gpa0 (+0x%x) CON 0x%08x DAT 0x%08x\n",
++	    dwmmc_gpa0,
++	    dwmmc_read(alive, dwmmc_gpa0 + EXYNOS_PIN_CON),
++	    dwmmc_read(alive, dwmmc_gpa0 + EXYNOS_PIN_DAT));
++
++	/* The supply needs a moment before the card is worth talking to. */
++	delay(10000);
++}
++
 +/*
 + * Reset the controller, set the registers that do not depend on the card,
 + * start the clock at the given divider, and idle the card with CMD0.
@@ -1052,6 +1256,10 @@ row read a depth of 4 from the eleventh onwards. It is latched now.
 +	uint32_t resp8[4], resp41[4];
 +	unsigned int i;
 +
++	if (dwmmc_pin) {
++		dwmmc_sd_pins();
++	}
++
 +	printf("dwmmc:   sweeping the clock. CLKDIV n divides by 2n, except "
 +	    "0, which divides by 1\n");
 +
@@ -1099,6 +1307,10 @@ row read a depth of 4 from the eleventh onwards. It is latched now.
 +	printf("dwmmc:   card bring-up: CLKDIV %u to identify, %u to read, "
 +	    "%u-bit, CLKSEL 0x%08x\n",
 +	    dwmmc_sd_div, dwmmc_sd_div_hi, dwmmc_sd_width, dwmmc_sd_clksel);
++
++	if (dwmmc_pin) {
++		dwmmc_sd_pins();
++	}
 +
 +	if (dwmmc_sd_prepare(regs, hcon, dwmmc_sd_div) != 0) {
 +		return -1;
@@ -1683,6 +1895,11 @@ row read a depth of 4 from the eleventh onwards. It is latched now.
 + * and dwmmc_sd_clksel=<hex> Samsung's phase register. See dwmmc_sd_init()
 + * for why the clock is not simply known.
 + *
++ * dwmmc_pin=0: do not touch the pin controller. On by default, because the
++ * card slot's pins come up as GPIOs and its supply comes up off; see
++ * dwmmc_sd_pins(). dwmmc_gpa0=<offset> moves the ALIVE bank that carries
++ * the supply GPIO, and 0xffffffff leaves the supply alone.
++ *
 + * dwmmc_scan_lba=<first>, dwmmc_scan_blocks=<count>: read that whole range
 + * and print every filesystem signature in it, plus the first sector that is
 + * not all zeroes. Default 0 blocks, which scans nothing. Use it when a
@@ -1708,6 +1925,9 @@ row read a depth of 4 from the eleventh onwards. It is latched now.
 +	    sizeof(dwmmc_read_count));
 +	(void)PE_parse_boot_argn("dwmmc_lba", &dwmmc_read_lba,
 +	    sizeof(dwmmc_read_lba));
++	(void)PE_parse_boot_argn("dwmmc_pin", &dwmmc_pin, sizeof(dwmmc_pin));
++	(void)PE_parse_boot_argn("dwmmc_gpa0", &dwmmc_gpa0,
++	    sizeof(dwmmc_gpa0));
 +	(void)PE_parse_boot_argn("dwmmc_sd", &dwmmc_sd_enable,
 +	    sizeof(dwmmc_sd_enable));
 +	(void)PE_parse_boot_argn("dwmmc_sd_div", &dwmmc_sd_div,
