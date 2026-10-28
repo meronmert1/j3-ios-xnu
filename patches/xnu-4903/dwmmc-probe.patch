@@ -158,9 +158,26 @@ why making the drain a hundred times faster changed nothing.
 The device tree agrees in hindsight: fifo-depth 64, at 8 bytes an entry, is
 512 bytes, exactly one sector.
 
-So the FIFO is now read in the width HCON reports, 64 bits here and 32 where
-a core says so, and the sector buffer is declared as uint64_t so that the
-wider access lands aligned.
+So the FIFO is read in the width HCON reports. That was necessary and not
+sufficient: a single 64-bit load did not consume the entry either, and the
+console said so in the same words as before, now with "FIFO 8 bytes wide"
+printed beside them.
+
+What it needs is two 32-bit reads: the low half at DWMMC_DATA, then the high
+half at DWMMC_DATA + 4. Reading the second half is what consumes the entry.
+Reading only the first leaves it in place -- which was the first attempt --
+and a 64-bit access is not permitted by this core at all, which was the
+second.
+
+This is not peculiar to this handset. Linux carries DW_MMC_QUIRK_FIFO64_32
+for precisely this, and the hardware its commit message names is Exynos7870:
+the sibling of the Exynos7570 here, same generation, same core. The sector
+buffer stays uint64_t so the pair of halves lands aligned.
+
+Three symptoms, one cause, and all of them visible from the first probe if
+HCON had been read properly: the repeated word, the FIFO that stayed full at
+64 entries, and an HTO that never had anything to do with how fast the host
+was.
 
 Nothing is written, ever. There is no code here that can modify the card,
 which on the phone's own storage is the only responsible way to start. The
@@ -188,7 +205,7 @@ insert there, they both apply after this one, and three patches editing the
 same six lines is a merge conflict waiting for the next person.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,624 @@
+@@ -0,0 +1,646 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -330,6 +347,22 @@ same six lines is a merge conflict waiting for the next person.
 +#define DWMMC_HCON              0x070
 +#define DWMMC_UHS_REG           0x074
 +#define DWMMC_BMOD              0x080
++
++/*
++ * The FIFO. 0x200 is where it sits on this IP revision; the older cores,
++ * before 0x240A, put it at 0x100.
++ *
++ * Reading it is where two attempts went wrong, so it is worth writing down.
++ * This core's FIFO is 64 bits wide (see DWMMC_HCON_DATA_WIDTH), and a 64-bit
++ * access to it is not allowed -- the entry is consumed by reading the low
++ * half at DWMMC_DATA and then the high half at DWMMC_DATA + 4. Reading only
++ * the low half leaves the entry in place, and so does a single 64-bit load:
++ * either way the same word comes back forever and the FIFO never empties.
++ *
++ * This is not peculiar to this board. Linux carries DW_MMC_QUIRK_FIFO64_32
++ * for exactly it, and the hardware its commit message names is Exynos7870 --
++ * the sibling of the Exynos7570 here, same generation, same core.
++ */
 +#define DWMMC_DATA              0x200
 +
 +/* One 4 KiB page covers the whole block; the device tree asks for 0x2000. */
@@ -582,12 +615,18 @@ same six lines is a merge conflict waiting for the next person.
 +		/* FIFO_COUNT is in entries, and an entry is fifo_bytes wide. */
 +		avail = DWMMC_STATUS_FIFO_COUNT(dwmmc_read(regs, DWMMC_STATUS));
 +		while (avail-- > 0 && got < DWMMC_SECTOR) {
++			/*
++			 * A 64-bit entry is taken as two 32-bit reads, low
++			 * half then high half. Not a convenience: this core
++			 * does not allow a 64-bit access to the FIFO at all,
++			 * and what consumes the entry is reading the second
++			 * half. See the note above DWMMC_DATA.
++			 */
++			*(uint32_t *)(void *)(out + got) =
++			    dwmmc_read(regs, DWMMC_DATA);
 +			if (fifo_bytes == 8) {
-+				*(uint64_t *)(void *)(out + got) =
-+				    *(volatile uint64_t *)(regs + DWMMC_DATA);
-+			} else {
-+				*(uint32_t *)(void *)(out + got) =
-+				    *(volatile uint32_t *)(regs + DWMMC_DATA);
++				*(uint32_t *)(void *)(out + got + 4) =
++				    dwmmc_read(regs, DWMMC_DATA + 4);
 +			}
 +			got += fifo_bytes;
 +		}
