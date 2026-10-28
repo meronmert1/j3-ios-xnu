@@ -241,9 +241,28 @@ those numbers do not move. On this handset CACHE is 6127616 + 409600 and
 SYSTEM is 491520 + 5636096, which is 200 MiB and 2752 MiB -- the first small
 enough to flash in seconds for a first root on real storage, the second the
 size of the iOS 12 root filesystem.
+
+rd=mmc0 then resolved and the root mount died anyway:
+
+    BSD root: mmc0, major 2, minor 0
+    bsd_init: vfs_mountroot
+    panic(...): "bdevvp failed: open"
+
+The cause was several layers from the panic. spec_open()'s VBLK path reads
+the device's block size, sets it to 512, reads the block count, and then
+sets the size back:
+
+    if (VNOP_IOCTL(vp, DKIOCSETBLOCKSIZE, &blksize, FWRITE, ctx))
+            error = ENXIO;    /* "If it doesn't set back, we can't recover" */
+
+This answered DKIOCGETBLOCKSIZE, which is what makes that block run at all,
+and did not answer DKIOCSETBLOCKSIZE, so the restoring call failed and the
+open was refused. A device that reports a block size has to be able to set
+one. Both of spec_open()'s calls ask for 512 here, because 512 is what this
+reports; anything else is refused rather than quietly accepted.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,965 @@
+@@ -0,0 +1,988 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -1098,6 +1117,29 @@ size of the iOS 12 root filesystem.
 +	switch (cmd) {
 +	case DKIOCGETBLOCKSIZE:
 +		*(uint32_t *)(void *)data = DWMMC_SECTOR;
++		break;
++
++	/*
++	 * Answering this is not optional once DKIOCGETBLOCKSIZE is answered,
++	 * and the first attempt at this driver learned it the hard way:
++	 * spec_open()'s VBLK path reads the block size, sets it to 512,
++	 * reads the block count, and then sets the size back --
++	 *
++	 *     if (VNOP_IOCTL(vp, DKIOCSETBLOCKSIZE, &blksize, FWRITE, ctx))
++	 *             error = ENXIO;    "If it doesn't set back, we can't recover"
++	 *
++	 * -- so a driver that reports a size but refuses to set one cannot be
++	 * opened at all. The root mount died in bdevvp() with "open", several
++	 * layers away from the ioctl that caused it.
++	 *
++	 * 512 is the only size on offer, and both of spec_open()'s calls ask
++	 * for it, since 512 is what this reports. Anything else is refused
++	 * rather than silently ignored.
++	 */
++	case DKIOCSETBLOCKSIZE:
++		if (*(uint32_t *)(void *)data != DWMMC_SECTOR) {
++			return EINVAL;
++		}
 +		break;
 +	case DKIOCGETBLOCKCOUNT:
 +		*(uint64_t *)(void *)data = dwmmc_part_blocks;
