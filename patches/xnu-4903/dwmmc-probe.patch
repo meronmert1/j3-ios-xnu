@@ -340,9 +340,36 @@ this that is not boilerplate. A card declining to answer is not a fault: it
 is how an SD 1.x card replies to CMD8 and how a card still powering up
 replies to ACMD41. Folding that into the error case would make a working
 card look broken on its first command.
+
+The card answered nothing:
+
+    dwmmc:   CMD8: no answer, treating it as SD 1.x
+    dwmmc:   the card never finished powering up (OCR 0x00000000)
+
+CMD0 completing says only that the core accepted a command; CMD0 has no
+response, so nothing in that line involves the card. Every command that does
+expect an answer timed out.
+
+Three things can produce that, and only one of them is cheap to rule out.
+The clock could be outside the 100-400 kHz window identification needs: the
+divider here assumes a 100 MHz input and nothing establishes that, because
+S-Boot configured dwmmc0 and left this controller alone, and the two take
+separate dividers from the CMU. The pins could still be GPIOs rather than
+MMC signals. Or the card's supply could be off.
+
+dwmmc_sd=2 settles the first by trying all of them in one boot -- eleven
+dividers from 1 to 2000, CMD8 and ACMD41 at each. A divider at which either
+answers is the right order of magnitude; silence at all of them means the
+clock is not what is wrong, and the answer is in the pin controller or the
+regulator.
+
+Writing that turned up a real bug, which is what the second pair of eyes was
+for: the FIFO depth is only legible in FIFOTH's reset value, and
+dwmmc_sd_prepare() writes FIFOTH. One bring-up never noticed. Twelve in a
+row read a depth of 4 from the eleventh onwards. It is latched now.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,1562 @@
+@@ -0,0 +1,1668 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -697,6 +724,16 @@ card look broken on its first command.
 + */
 +static uint32_t dwmmc_block_addressed = 1;
 +
++/*
++ * The FIFO depth, latched the first time it is read.
++ *
++ * It is only legible in FIFOTH's reset value, so once that register has
++ * been written the number is gone -- and dwmmc_sd_prepare() writes it, and
++ * the clock sweep calls dwmmc_sd_prepare() twelve times. Reading it afresh
++ * each time gave a depth of 4 on the second pass and every pass after.
++ */
++static uint32_t dwmmc_fifo_depth = 0;
++
 +#define DWMMC_READ_MAX          4
 +
 +/*
@@ -898,16 +935,19 @@ card look broken on its first command.
 +#define DWMMC_CMD_R1    (DWMMC_CMD_RESP_EXP | DWMMC_CMD_CHECK_CRC | \
 +	                 DWMMC_CMD_PRV_DAT_WAIT)
 +
++/*
++ * Reset the controller, set the registers that do not depend on the card,
++ * start the clock at the given divider, and idle the card with CMD0.
++ *
++ * Separate from the rest because the sweep below runs it once per candidate
++ * divider, and a sweep that prepared the controller even slightly
++ * differently from the real bring-up would be measuring the wrong thing.
++ */
 +static int
-+dwmmc_sd_init(vm_offset_t regs, uint32_t hcon)
++dwmmc_sd_prepare(vm_offset_t regs, uint32_t hcon, uint32_t div)
 +{
-+	uint32_t resp[4];
-+	uint32_t ocr = 0, rca, depth, fifoth;
-+	int sd2 = 0, tries, rc, us;
-+
-+	printf("dwmmc:   card bring-up: CLKDIV %u to identify, %u to read, "
-+	    "%u-bit, CLKSEL 0x%08x\n",
-+	    dwmmc_sd_div, dwmmc_sd_div_hi, dwmmc_sd_width, dwmmc_sd_clksel);
++	uint32_t depth, fifoth;
++	int us;
 +
 +	/*
 +	 * A full reset, which on this controller is safe and on dwmmc0 would
@@ -927,19 +967,24 @@ card look broken on its first command.
 +	}
 +
 +	/*
-+	 * FIFOTH is read before it is written: after a reset its RX watermark
-+	 * field holds the FIFO depth the core was built with, which is the
-+	 * only place that number is available. Here it reads 0x003f0000, so
-+	 * the depth is 64 -- the same 64 entries of 8 bytes that make one
-+	 * sector.
++	 * FIFOTH is read before it is written, and only once ever: its RX
++	 * watermark field holds the FIFO depth the core was built with until
++	 * something writes the register, and that is the only place the
++	 * number appears. Here it reads 0x003f0000, so the depth is 64 --
++	 * the same 64 entries of 8 bytes that make one sector.
 +	 */
-+	fifoth = dwmmc_read(regs, DWMMC_FIFOTH);
-+	depth = ((fifoth >> 16) & 0xfff) + 1;
-+	if (depth < 8 || depth > 4096) {
-+		printf("dwmmc:   FIFOTH 0x%08x gives a depth of %u, which is "
-+		    "not believable; using 64\n", fifoth, depth);
-+		depth = 64;
++	if (dwmmc_fifo_depth == 0) {
++		fifoth = dwmmc_read(regs, DWMMC_FIFOTH);
++		depth = ((fifoth >> 16) & 0xfff) + 1;
++		if (depth < 8 || depth > 4096) {
++			printf("dwmmc:   FIFOTH 0x%08x gives a depth of %u, "
++			    "which is not believable; using 64\n",
++			    fifoth, depth);
++			depth = 64;
++		}
++		dwmmc_fifo_depth = depth;
 +	}
++	depth = dwmmc_fifo_depth;
 +
 +	dwmmc_write(regs, DWMMC_RINTSTS, DWMMC_INT_ALL);
 +	dwmmc_write(regs, DWMMC_INTMASK, 0);
@@ -951,7 +996,7 @@ card look broken on its first command.
 +	dwmmc_write(regs, DWMMC_FIFOTH,
 +	    (((depth / 2) - 1) << 16) | (depth / 2));
 +
-+	if (dwmmc_set_clock(regs, dwmmc_sd_div) != 0) {
++	if (dwmmc_set_clock(regs, div) != 0) {
 +		return -1;
 +	}
 +
@@ -964,19 +1009,100 @@ card look broken on its first command.
 +
 +	/*
 +	 * CMD0 with SEND_INITIALIZATION, which makes the core send the idle
-+	 * clocks itself. No response: the card does not answer this one.
-+	 *
-+	 * This is the command that tests the assumption behind everything
-+	 * else. If the card interface clock is not actually running, this is
-+	 * where it shows.
++	 * clocks itself. No response: the card does not answer this one, so
++	 * this says only that the core took the command -- not that anything
++	 * is listening.
 +	 */
 +	if (dwmmc_cmd(regs, hcon, MMC_GO_IDLE_STATE, 0,
 +	    DWMMC_CMD_SEND_INIT | DWMMC_CMD_PRV_DAT_WAIT, NULL) < 0) {
-+		printf("dwmmc:   CMD0 did not complete -- either no card is "
-+		    "in the slot or the card clock is not running\n");
++		printf("dwmmc:   CMD0 did not complete -- the core is not "
++		    "accepting commands at all\n");
 +		return -1;
 +	}
 +	delay(2000);
++	return 0;
++}
++
++/*
++ * Try every plausible clock divider and report which, if any, the card
++ * answers at.
++ *
++ * This exists because the card interface clock's input frequency is not
++ * known and cannot be derived from anything on hand. S-Boot configured
++ * dwmmc0 and left dwmmc2 untouched, and the two take separate dividers from
++ * the CMU, so dwmmc0's CLKDIV of 1 says nothing about what this one is
++ * dividing. Identification has to happen between 100 and 400 kHz; guessing
++ * the input wrong by a factor of eight puts it outside that window in one
++ * direction or the other, and a card outside the window answers nothing,
++ * which looks exactly like a card that is not powered or not wired.
++ *
++ * Rather than guess once per boot, this guesses eleven times in one. CMD8
++ * and ACMD41 are the two questions worth asking: an SD 2.0 card answers the
++ * first and every card answers the second, so a divider at which either
++ * produces a non-zero response is the right order of magnitude. If none of
++ * them does, the clock is not what is wrong and the pin configuration or
++ * the card's supply is.
++ */
++static void
++dwmmc_sd_sweep(vm_offset_t regs, uint32_t hcon)
++{
++	static const uint32_t divs[] = {
++		0, 1, 2, 4, 8, 16, 32, 64, 125, 250, 500, 1000
++	};
++	uint32_t resp8[4], resp41[4];
++	unsigned int i;
++
++	printf("dwmmc:   sweeping the clock. CLKDIV n divides by 2n, except "
++	    "0, which divides by 1\n");
++
++	for (i = 0; i < sizeof(divs) / sizeof(divs[0]); i++) {
++		int rc8, rc41;
++
++		resp8[0] = resp41[0] = 0;
++
++		if (dwmmc_sd_prepare(regs, hcon, divs[i]) != 0) {
++			printf("dwmmc:     CLKDIV %4u: the controller would "
++			    "not start\n", divs[i]);
++			continue;
++		}
++
++		rc8 = dwmmc_cmd(regs, hcon, SD_SEND_IF_COND, SD_IF_COND_ARG,
++		    DWMMC_CMD_R1, resp8);
++
++		if (dwmmc_cmd(regs, hcon, MMC_APP_CMD, 0, DWMMC_CMD_R1,
++		    resp41) < 0) {
++			rc41 = -1;
++		} else {
++			rc41 = dwmmc_cmd(regs, hcon, SD_APP_OP_COND,
++			    SD_OCR_HCS | SD_OCR_VOLTAGE,
++			    DWMMC_CMD_RESP_EXP | DWMMC_CMD_PRV_DAT_WAIT,
++			    resp41);
++		}
++
++		printf("dwmmc:     CLKDIV %4u: CMD8 %d 0x%08x  ACMD41 %d "
++		    "0x%08x  STATUS 0x%08x\n", divs[i],
++		    rc8, resp8[0], rc41, resp41[0],
++		    dwmmc_read(regs, DWMMC_STATUS));
++	}
++
++	printf("dwmmc:   sweep done. 0 means the card answered, 1 means it "
++	    "stayed silent\n");
++}
++
++static int
++dwmmc_sd_init(vm_offset_t regs, uint32_t hcon)
++{
++	uint32_t resp[4];
++	uint32_t ocr = 0, rca;
++	int sd2 = 0, tries, rc;
++
++	printf("dwmmc:   card bring-up: CLKDIV %u to identify, %u to read, "
++	    "%u-bit, CLKSEL 0x%08x\n",
++	    dwmmc_sd_div, dwmmc_sd_div_hi, dwmmc_sd_width, dwmmc_sd_clksel);
++
++	if (dwmmc_sd_prepare(regs, hcon, dwmmc_sd_div) != 0) {
++		return -1;
++	}
 +
 +	/*
 +	 * CMD8 asks whether the card understands SD 2.0 voltage signalling.
@@ -1489,6 +1615,10 @@ card look broken on its first command.
 +	 * be reset. See dwmmc_sd_init().
 +	 */
 +	if (alive && dwmmc_sd_enable && (unit->bit & 2) != 0) {
++		if (dwmmc_sd_enable == 2) {
++			dwmmc_sd_sweep(regs, hcon);
++			return;
++		}
 +		if (dwmmc_sd_init(regs, hcon) != 0) {
 +			printf("dwmmc:   card bring-up failed; nothing "
 +			    "further on this controller\n");
@@ -1544,7 +1674,10 @@ card look broken on its first command.
 + * controller, whereas a command is not.
 + *
 + * dwmmc_sd=1: bring the card in the microSD slot up before reading, which
-+ * dwmmc2 needs and dwmmc0 must not be given. dwmmc_sd_div=<n> and
++ * dwmmc2 needs and dwmmc0 must not be given. dwmmc_sd=2 instead sweeps
++ * every plausible clock divider and reports which the card answers at,
++ * which is how to find out whether the clock is the problem; see
++ * dwmmc_sd_sweep(). dwmmc_sd_div=<n> and
 + * dwmmc_sd_div_hi=<n> are the CLKDIV used to identify the card and to read
 + * it (divide by 2n; 0 divides by one), dwmmc_sd_width=<1|4> the bus width,
 + * and dwmmc_sd_clksel=<hex> Samsung's phase register. See dwmmc_sd_init()
