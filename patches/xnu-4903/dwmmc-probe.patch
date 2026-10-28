@@ -493,9 +493,26 @@ earned its keep: the mask that clears the phase fields was written wide
 enough to clear the divider with them, so every candidate ran at divider 0
 rather than 3. CLKSEL read back 0x00000000 when it should have read
 0x03000000.
+
+Printing the registers after the setup rather than trusting them caught the
+thing underneath all of it:
+
+    card bring-up: ... CLKSEL 0x03020000
+    after setup:   ... CLKSEL 0x00000000
+
+The phase register was never written. It lives at two addresses: a core
+built with a 32-bit data bus keeps it at 0x09c and a 64-bit core keeps it at
+0x0a8, leaving 0x09c reserved. This is a 64-bit core -- HCON says so, and
+its FIFO is read in two halves for exactly that reason -- so every write
+went into a hole, read back as zero, and did nothing. Every attempt so far,
+including both sweeps, ran with no phase programmed at all.
+
+The offset now comes from the same HCON field the FIFO reads already use,
+and is confirmed rather than assumed: the value is read back, the other
+address is tried if it did not take, and which one won is printed.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,2049 @@
+@@ -0,0 +1,2113 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -666,14 +683,31 @@ rather than 3. CLKSEL read back 0x00000000 when it should have read
 + *     samsung,dw-mshc-sdr-timing = <3 0 2 0>
 + *
 + * which is divider 3, sample 0, drive 2 -- the default below.
++ *
++ * It lives at two addresses and the wrong one is silent. Cores built with a
++ * 32-bit data bus put it at 0x09c; cores built with a 64-bit bus put it at
++ * 0x0a8 and leave 0x09c reserved. This one is a 64-bit core -- HCON says so,
++ * and its FIFO is read in two halves for the same reason -- so 0x09c here
++ * reads as zero and swallows what is written to it, which is what it did:
++ * CLKSEL was set to 0x03020000 and read back 0x00000000, and every attempt
++ * up to that point had been made with the phase register never written at
++ * all. The offset is chosen from the same HCON field the FIFO reads use,
++ * and the write is read back and reported rather than assumed.
 + */
 +#define DWMMC_CLKSEL            0x09c
++#define DWMMC_CLKSEL64          0x0a8
 +#define DWMMC_CLKSEL_SAMPLE(x)  ((x) & 7u)
 +#define DWMMC_CLKSEL_DRIVE(x)   (((x) & 7u) << 16)
 +#define DWMMC_CLKSEL_DIV(x)     (((x) & 7u) << 24)
 +
 +/* divider 3, sample 0, drive 2: what the tree asks for. */
 +#define DWMMC_CLKSEL_SDR        (DWMMC_CLKSEL_DIV(3) | DWMMC_CLKSEL_DRIVE(2))
++
++/*
++ * Which of the two addresses this core uses, once something has written to
++ * one of them and read it back. Zero until then.
++ */
++static uint32_t dwmmc_clksel_off = 0;
 +#define DWMMC_BMOD              0x080
 +
 +/*
@@ -1054,6 +1088,52 @@ rather than 3. CLKSEL read back 0x00000000 when it should have read
 + * assumption is where to look first.
 + */
 +
++
++/*
++ * Write the phase register, wherever this core keeps it.
++ *
++ * HCON's data-width field chooses: a 64-bit core uses 0x0a8 and a narrower
++ * one 0x09c. That is the first guess and not the last word -- the write is
++ * read back, and if it did not take the other address is tried, because an
++ * unimplemented register here is silent rather than loud and a silent phase
++ * register is a card that never answers at any clock.
++ */
++static void
++dwmmc_set_clksel(vm_offset_t regs, uint32_t hcon, uint32_t val)
++{
++	uint32_t first, second, got;
++
++	if (dwmmc_clksel_off != 0) {
++		dwmmc_write(regs, dwmmc_clksel_off, val);
++		return;
++	}
++
++	first = (DWMMC_HCON_DATA_WIDTH(hcon) >= 2)
++	    ? DWMMC_CLKSEL64 : DWMMC_CLKSEL;
++	second = (first == DWMMC_CLKSEL64) ? DWMMC_CLKSEL : DWMMC_CLKSEL64;
++
++	dwmmc_write(regs, first, val);
++	got = dwmmc_read(regs, first);
++	if (got == val) {
++		dwmmc_clksel_off = first;
++		printf("dwmmc:   CLKSEL is at 0x%03x and took 0x%08x\n",
++		    first, val);
++		return;
++	}
++
++	dwmmc_write(regs, second, val);
++	got = dwmmc_read(regs, second);
++	if (got == val) {
++		dwmmc_clksel_off = second;
++		printf("dwmmc:   CLKSEL is at 0x%03x, not 0x%03x; it took "
++		    "0x%08x\n", second, first, val);
++		return;
++	}
++
++	printf("dwmmc:   CLKSEL took at neither 0x%03x nor 0x%03x "
++	    "(0x%08x reads back 0x%08x)\n", first, second, val, got);
++}
++
 +/*
 + * Clock changes do not take effect when written. The core applies them when
 + * it is given a command with UPDATE_CLOCK_REGS_ONLY set, which sends nothing
@@ -1371,7 +1451,7 @@ rather than 3. CLKSEL read back 0x00000000 when it should have read
 +	dwmmc_write(regs, DWMMC_BLKSIZ, DWMMC_SECTOR);
 +	dwmmc_write(regs, DWMMC_CTYPE, 0);      /* one bit until ACMD6 */
 +	dwmmc_write(regs, DWMMC_PWREN, 1);
-+	dwmmc_write(regs, DWMMC_CLKSEL, dwmmc_sd_clksel);
++	dwmmc_set_clksel(regs, hcon, dwmmc_sd_clksel);
 +	dwmmc_write(regs, DWMMC_FIFOTH,
 +	    (((depth / 2) - 1) << 16) | (depth / 2));
 +
@@ -1390,7 +1470,8 @@ rather than 3. CLKSEL read back 0x00000000 when it should have read
 +		    dwmmc_read(regs, DWMMC_CTRL),
 +		    dwmmc_read(regs, DWMMC_CLKENA),
 +		    dwmmc_read(regs, DWMMC_CLKDIV),
-+		    dwmmc_read(regs, DWMMC_CLKSEL),
++		    dwmmc_read(regs, dwmmc_clksel_off != 0 ?
++		    dwmmc_clksel_off : DWMMC_CLKSEL),
 +		    dwmmc_read(regs, DWMMC_UHS_REG),
 +		    dwmmc_read(regs, DWMMC_CTYPE));
 +	}
