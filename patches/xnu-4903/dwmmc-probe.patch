@@ -130,8 +130,37 @@ from the console.
 
 Meanwhile the read is treated as having succeeded, because by the thing it
 was written to test it has: a complete sector with none of the bits that
-mean it is wrong. The bytes settle it in a way no status register can. A
-sector that ends 55 aa came off the card; one that does not did not.
+mean it is wrong. The bytes settle it in a way no status register can.
+
+The bytes settled it:
+
+    dwmmc:   TMOUT reads back 0xffffff40 (wrote 0xffffff40)
+    dwmmc:   LBA 1:
+    dwmmc:     000  45 46 49 20 45 46 49 20  45 46 49 20 45 46 49 20
+    dwmmc:     010  45 46 49 20 45 46 49 20  45 46 49 20 45 46 49 20
+    ...
+    dwmmc:   CMD17 done: ... STATUS 0x00808d09
+
+45 46 49 20 is "EFI ". LBA 1 was asked for and the first word of the GPT
+header came back, so the card is being read and the data path works. But the
+same word came back 128 times, TMOUT had taken effect so the timeout was not
+the problem, and STATUS reported FIFO_COUNT = (0x808d09 >> 17) & 0x1fff = 64
+-- the FIFO completely full and never emptied.
+
+HCON had been printing the answer since the very first probe. Bits 9:7 are
+H_DATA_WIDTH: 0 is a 16-bit FIFO, 1 is 32 and 2 is 64. HCON here is
+0x0be42541, so bits 9:7 are 0b010 and this core's FIFO is 64 bits wide. A
+32-bit read of it returns the low half and does not consume the entry. Hence
+one word forever, a FIFO that never drains, a controller that gives up on the
+host -- and an HTO that was never about the host's speed at all, which is
+why making the drain a hundred times faster changed nothing.
+
+The device tree agrees in hindsight: fifo-depth 64, at 8 bytes an entry, is
+512 bytes, exactly one sector.
+
+So the FIFO is now read in the width HCON reports, 64 bits here and 32 where
+a core says so, and the sector buffer is declared as uint64_t so that the
+wider access lands aligned.
 
 Nothing is written, ever. There is no code here that can modify the card,
 which on the phone's own storage is the only responsible way to start. The
@@ -159,7 +188,7 @@ insert there, they both apply after this one, and three patches editing the
 same six lines is a merge conflict waiting for the next person.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,601 @@
+@@ -0,0 +1,624 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -319,8 +348,28 @@ same six lines is a merge conflict waiting for the next person.
 +#define DWMMC_CTRL_FIFO_RESET   (1u << 1)
 +#define DWMMC_CTRL_DMA_RESET    (1u << 2)
 +
-+/* HCON: bit 23 says the hold register is implemented. */
-+#define DWMMC_HCON_HOLD_REG     (1u << 23)
++/*
++ * HCON describes how this instance of the core was built.
++ *
++ * Bits 9:7 are H_DATA_WIDTH and they are the whole story of this driver's
++ * first real bug: 0 means the FIFO is 16 bits wide, 1 means 32 and 2 means
++ * 64. This controller reads 0x0be42541, so bits 9:7 are 0b010 and the FIFO
++ * is 64 bits wide. A 32-bit read of a 64-bit FIFO returns the low half and
++ * does not consume the entry, so the same word comes back forever, the FIFO
++ * never empties, and the controller eventually gives up on the host -- which
++ * is exactly what was seen: "EFI " repeated 128 times, STATUS reporting the
++ * FIFO still full at 64 entries, and HTO raised no matter how fast the drain
++ * loop ran.
++ *
++ * The device tree's fifo-depth of 64 agrees: 64 entries of 8 bytes is 512,
++ * one whole sector.
++ *
++ * Bit 22 is IMPLEMENT_HOLD_REG. This part sets both 22 and 23, so whichever
++ * of the two the documentation means, commands here carry USE_HOLD_REG
++ * either way and nothing about this board turns on getting it right.
++ */
++#define DWMMC_HCON_DATA_WIDTH(h)        (((h) >> 7) & 0x7)
++#define DWMMC_HCON_HOLD_REG             (1u << 22)
 +
 +/* CMD */
 +#define DWMMC_CMD_INDEX(i)      ((i) & 0x3f)
@@ -446,12 +495,23 @@ same six lines is a merge conflict waiting for the next person.
 + * exactly like a dead card.
 + */
 +static int
-+dwmmc_read_block(vm_offset_t regs, uint32_t hcon, uint32_t lba, uint32_t *buf)
++dwmmc_read_block(vm_offset_t regs, uint32_t hcon, uint32_t lba, void *buf)
 +{
-+	const int words = DWMMC_SECTOR / 4;
++	/*
++	 * The FIFO is read in the width the core was built with, which is
++	 * what HCON says and not what is convenient. See DWMMC_HCON_DATA_WIDTH.
++	 */
++	const uint32_t fifo_bytes = 2u << DWMMC_HCON_DATA_WIDTH(hcon);
++	uint8_t *out = buf;
 +	uint32_t cmd, sts, resp;
-+	int got = 0;
++	uint32_t got = 0;               /* bytes */
 +	int us;
++
++	if (fifo_bytes != 4 && fifo_bytes != 8) {
++		printf("dwmmc:   HCON says the FIFO is %u bytes wide, which "
++		    "this does not know how to read\n", fifo_bytes);
++		return -1;
++	}
 +
 +	/*
 +	 * A clean FIFO and a clean status, and nothing else. CTRL_RESET would
@@ -478,9 +538,7 @@ same six lines is a merge conflict waiting for the next person.
 +	/*
 +	 * A generous data timeout. The upper 24 bits are counted in card
 +	 * clock cycles and bound how long the controller will wait for the
-+	 * host to service the FIFO before raising HTO. Whatever S-Boot left
-+	 * here was tuned for its own loader, and the first attempt at this
-+	 * read died on exactly that -- HTO with the receive FIFO full.
++	 * host to service the FIFO before raising HTO.
 +	 */
 +	dwmmc_write(regs, DWMMC_TMOUT, 0xffffff40u);
 +
@@ -502,22 +560,15 @@ same six lines is a merge conflict waiting for the next person.
 +
 +	/*
 +	 * From here to the end of the transfer there is no printf and no
-+	 * delay, and that is the whole design of this loop.
++	 * delay, and that is deliberate.
 +	 *
-+	 * The first version printed the card's response between the command
++	 * An earlier version printed the card's response between the command
 +	 * and the drain. Writing one line to this console means rendering
 +	 * glyphs into a 720x1280 framebuffer, which takes milliseconds; the
-+	 * card fills the 64-word FIFO in microseconds. The controller raised
-+	 * HTO -- data starvation by the host -- while the kernel was still
-+	 * drawing text, and reported RINTSTS 0x424: command done, receive
-+	 * data ready, host timeout. The data had arrived and nobody came for
-+	 * it.
-+	 *
-+	 * So command completion and the drain are one loop, and there is not
-+	 * even a wait for the controller to accept the command in front of
-+	 * it: the first thing that happens after the command is written is a
-+	 * look at the FIFO. Anything worth saying is saved and said
-+	 * afterwards.
++	 * card fills the FIFO in microseconds. So command completion and the
++	 * drain are one loop, with not even a wait for the controller to
++	 * accept the command in front of it, and anything worth saying is
++	 * saved and said afterwards.
 +	 */
 +	for (us = 0; us < DWMMC_SPINS; us++) {
 +		uint32_t now = dwmmc_read(regs, DWMMC_RINTSTS);
@@ -528,16 +579,24 @@ same six lines is a merge conflict waiting for the next person.
 +			goto cmd_failed;
 +		}
 +
++		/* FIFO_COUNT is in entries, and an entry is fifo_bytes wide. */
 +		avail = DWMMC_STATUS_FIFO_COUNT(dwmmc_read(regs, DWMMC_STATUS));
-+		while (avail-- > 0 && got < words) {
-+			buf[got++] = dwmmc_read(regs, DWMMC_DATA);
++		while (avail-- > 0 && got < DWMMC_SECTOR) {
++			if (fifo_bytes == 8) {
++				*(uint64_t *)(void *)(out + got) =
++				    *(volatile uint64_t *)(regs + DWMMC_DATA);
++			} else {
++				*(uint32_t *)(void *)(out + got) =
++				    *(volatile uint32_t *)(regs + DWMMC_DATA);
++			}
++			got += fifo_bytes;
 +		}
 +
 +		if (now & DWMMC_INT_DATA_FATAL) {
 +			sts = now;
 +			goto data_failed;
 +		}
-+		if (got == words && (now & DWMMC_INT_DTO)) {
++		if (got == DWMMC_SECTOR && (now & DWMMC_INT_DTO)) {
 +			break;
 +		}
 +	}
@@ -545,41 +604,32 @@ same six lines is a merge conflict waiting for the next person.
 +	sts = dwmmc_read(regs, DWMMC_RINTSTS);
 +	resp = dwmmc_read(regs, DWMMC_RESP0);
 +
-+	if (got < words) {
-+		printf("dwmmc:   short read: %d of %d words, RESP0 0x%08x\n",
-+		    got, words, resp);
++	if (got < DWMMC_SECTOR) {
++		printf("dwmmc:   short read: %u of %u bytes, RESP0 0x%08x\n",
++		    got, (uint32_t)DWMMC_SECTOR, resp);
 +		dwmmc_print_errors("at the end", sts);
 +		return -1;
 +	}
++
 +	/*
-+	 * A whole sector, and none of the bits that mean it is wrong. That is
-+	 * the thing being tested, so it counts as success even when the
-+	 * controller never says DTO.
-+	 *
-+	 * It does not say DTO, every time, and the reason is not the host's
-+	 * timing: HTO was raised identically whether the drain was behind a
-+	 * framebuffer printf or in a tight spin, which is a hundredfold
-+	 * difference in latency and no difference in outcome. Once HTO fires
-+	 * the DesignWare core abandons the data phase, so the missing DTO
-+	 * follows from it rather than being a second fault. What makes HTO
-+	 * fire at all is still open -- the TMOUT write not taking, or the SMU
-+	 * in this controller's data path, are the two candidates -- and
-+	 * TMOUT is read back below so that the first of them can be ruled in
-+	 * or out from the console.
-+	 *
-+	 * The bytes decide it either way. A sector that ends 55 aa came off
-+	 * the card; one that does not did not.
++	 * A whole sector and none of the bits that mean it is wrong. HTO and
++	 * a missing DTO are reported but not treated as failure: HTO means
++	 * the host was late to the FIFO, and once it fires the core abandons
++	 * the data phase, so the absent DTO follows from it. With the FIFO
++	 * read at its real width neither should appear again, and if they do
++	 * the bytes below are still the thing that settles it.
 +	 */
-+	if (sts & DWMMC_INT_HTO) {
-+		printf("dwmmc:   HTO raised, no DTO, sector complete anyway\n");
++	if (sts & (DWMMC_INT_HTO | DWMMC_INT_DTO)) {
++		printf("dwmmc:   %s, %s\n",
++		    (sts & DWMMC_INT_HTO) ? "HTO raised" : "no HTO",
++		    (sts & DWMMC_INT_DTO) ? "transfer closed" : "no DTO");
 +	}
 +
 +	printf("dwmmc:   CMD17 done: RESP0 0x%08x (state %u%s), "
-+	    "RINTSTS 0x%08x, STATUS 0x%08x\n", resp, (resp >> 9) & 0xf,
++	    "RINTSTS 0x%08x, STATUS 0x%08x, FIFO %u bytes wide\n",
++	    resp, (resp >> 9) & 0xf,
 +	    ((resp >> 9) & 0xf) == 4 ? " = tran" : "", sts,
-+	    dwmmc_read(regs, DWMMC_STATUS));
-+	printf("dwmmc:   TMOUT reads back 0x%08x (wrote 0xffffff40)\n",
-+	    dwmmc_read(regs, DWMMC_TMOUT));
++	    dwmmc_read(regs, DWMMC_STATUS), fifo_bytes);
 +	return 0;
 +
 +cmd_failed:
@@ -594,7 +644,8 @@ same six lines is a merge conflict waiting for the next person.
 +
 +data_failed:
 +	dwmmc_print_errors("data error", sts);
-+	printf("dwmmc:   %d of %d words had arrived\n", got, words);
++	printf("dwmmc:   %u of %u bytes had arrived\n", got,
++	    (uint32_t)DWMMC_SECTOR);
 +	return -1;
 +}
 +
@@ -607,7 +658,7 @@ same six lines is a merge conflict waiting for the next person.
 + * can establish on its own.
 + */
 +static void
-+dwmmc_dump_sector(uint32_t lba, const uint32_t *buf)
++dwmmc_dump_sector(uint32_t lba, const void *buf)
 +{
 +	const unsigned char *b = (const unsigned char *)buf;
 +	int row;
@@ -705,7 +756,8 @@ same six lines is a merge conflict waiting for the next person.
 +	 * storage.
 +	 */
 +	if (dwmmc_read_count > 0) {
-+		uint32_t buf[DWMMC_SECTOR / 4];
++		/* uint64_t, so a 64-bit FIFO read lands aligned. */
++		uint64_t buf[DWMMC_SECTOR / 8];
 +		uint32_t n;
 +
 +		for (n = 0; n < dwmmc_read_count; n++) {
