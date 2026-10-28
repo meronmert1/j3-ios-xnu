@@ -460,9 +460,42 @@ The supply did come up once its pull was cleared first:
 
 and gpa0 is confirmed at 0x040 by gpa1 at 0x060 carrying uart2 on pins 5
 and 6 at function 3, which is S-Boot's own console.
+
+gpr4 at 0x040 took the write and the slot came alive electrically:
+
+    fsys  +0x040: CON 0x00000000  DAT 0x0000003f  PUD 0x00000555
+    gpr4 (+0x40) after:  CON 0x00222222  PUD 0x00000ffc
+
+The data register reading 0x3f while the pull register holds every one of
+those six pins down means something off-chip is pulling them up, which is
+the card. STATUS's DAT3 bit, zero before any of this, reads one at every
+divider afterwards.
+
+And the card still answered nothing, at every divider from 700 MHz to 350
+kHz, with the command state machine parked at 7 -- receive response start
+bit. The command goes out and the answer is not seen.
+
+That is a different fault from the one a clock sweep can find, and the tree
+had the answer in it the whole time:
+
+    samsung,dw-mshc-ciu-div    = <3>
+    samsung,dw-mshc-sdr-timing = <3 0 2 0>
+
+CLKSEL carries the phase the controller samples the line at, the phase it
+drives the clock at, and a further divider. Leaving it at zero does not stop
+anything being transmitted; it stops the answer being captured, and the
+symptom is silence at every speed. So CLKSEL now defaults to what the board
+was built for -- divider 3, sample 0, drive 2 -- and dwmmc_sd=3 sweeps the
+phases the way dwmmc_sd=2 sweeps the clock.
+
+Writing that caught its own bug, which is the second time this harness has
+earned its keep: the mask that clears the phase fields was written wide
+enough to clear the divider with them, so every candidate ran at divider 0
+rather than 3. CLKSEL read back 0x00000000 when it should have read
+0x03000000.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,1924 @@
+@@ -0,0 +1,2049 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -612,13 +645,35 @@ and 6 at function 3, which is S-Boot's own console.
 +#define DWMMC_UHS_REG           0x074
 +
 +/*
-+ * Samsung's own register, not part of the DesignWare layout. It carries the
-+ * sample and drive phase of the card clock and a further divider. Zero is
-+ * the reset value and is what the identification clock wants; a card that
-+ * answers CMD0 but fails later at speed is the symptom of needing something
-+ * else here, which is why it is a boot argument.
++ * Samsung's own register, outside the DesignWare layout. It carries the
++ * phase at which the controller drives the card clock, the phase at which
++ * it samples what comes back, and a further divider on the card clock:
++ *
++ *     bits  2:0   sample phase
++ *     bits 18:16  drive phase
++ *     bits 26:24  divide the card clock by this plus one
++ *
++ * Leaving it at zero was a mistake that cost a sweep. A wrong sample phase
++ * does not stop the controller transmitting -- the command goes out
++ * perfectly -- it stops the controller seeing the answer, and the symptom is
++ * a command state machine parked at "receive response start bit" at every
++ * clock divider from 700 MHz down to 350 kHz. Sweeping the clock cannot find
++ * that, because the clock is not what is wrong.
++ *
++ * The device tree carries the values this board was built for:
++ *
++ *     samsung,dw-mshc-ciu-div    = <3>
++ *     samsung,dw-mshc-sdr-timing = <3 0 2 0>
++ *
++ * which is divider 3, sample 0, drive 2 -- the default below.
 + */
 +#define DWMMC_CLKSEL            0x09c
++#define DWMMC_CLKSEL_SAMPLE(x)  ((x) & 7u)
++#define DWMMC_CLKSEL_DRIVE(x)   (((x) & 7u) << 16)
++#define DWMMC_CLKSEL_DIV(x)     (((x) & 7u) << 24)
++
++/* divider 3, sample 0, drive 2: what the tree asks for. */
++#define DWMMC_CLKSEL_SDR        (DWMMC_CLKSEL_DIV(3) | DWMMC_CLKSEL_DRIVE(2))
 +#define DWMMC_BMOD              0x080
 +
 +/*
@@ -879,6 +934,13 @@ and 6 at function 3, which is S-Boot's own console.
 +static uint32_t dwmmc_gpr4 = 0x040;
 +
 +/*
++ * One line of register state after the controller is set up. On in the
++ * ordinary bring-up and off in the sweeps, which would otherwise print it
++ * once per candidate and push their own results off the screen.
++ */
++static int dwmmc_pin_verbose = 1;
++
++/*
 + * dwmmc_halt=1 stops the boot here.
 + *
 + * Not a debugging convenience: the console is a framebuffer with no
@@ -894,7 +956,7 @@ and 6 at function 3, which is S-Boot's own console.
 +static uint32_t dwmmc_sd_div = 125;     /* CLKDIV while identifying */
 +static uint32_t dwmmc_sd_div_hi = 2;    /* CLKDIV once the card is selected */
 +static uint32_t dwmmc_sd_width = 4;
-+static uint32_t dwmmc_sd_clksel = 0;
++static uint32_t dwmmc_sd_clksel = DWMMC_CLKSEL_SDR;
 +
 +/*
 + * Cards of 2 GiB and under take a byte offset where larger ones take a block
@@ -1244,10 +1306,10 @@ and 6 at function 3, which is S-Boot's own console.
 +	    dwmmc_read(alive, dwmmc_gpa0 + EXYNOS_PIN_DAT),
 +	    dwmmc_read(alive, dwmmc_gpa0 + EXYNOS_PIN_PUD));
 +
-+	delay(10000);
++	delay(100000);
 +
 +	con = dwmmc_read(alive, dwmmc_gpa0 + EXYNOS_PIN_DAT);
-+	printf("dwmmc:   card supply after 10 ms: DAT 0x%08x -- pin %u is "
++	printf("dwmmc:   card supply after 100 ms: DAT 0x%08x -- pin %u is "
 +	    "%s\n", con, GPA0_TFLASH_EN_PIN,
 +	    (con & (1u << GPA0_TFLASH_EN_PIN)) ? "high" : "STILL LOW");
 +}
@@ -1315,6 +1377,22 @@ and 6 at function 3, which is S-Boot's own console.
 +
 +	if (dwmmc_set_clock(regs, div) != 0) {
 +		return -1;
++	}
++
++	/*
++	 * What the controller actually ended up with. Every one of these is
++	 * written above, and a register that did not take is worth seeing
++	 * before a card is blamed for not answering.
++	 */
++	if (dwmmc_pin_verbose) {
++		printf("dwmmc:   after setup: CTRL 0x%08x CLKENA 0x%08x "
++		    "CLKDIV 0x%08x CLKSEL 0x%08x UHS 0x%08x CTYPE 0x%08x\n",
++		    dwmmc_read(regs, DWMMC_CTRL),
++		    dwmmc_read(regs, DWMMC_CLKENA),
++		    dwmmc_read(regs, DWMMC_CLKDIV),
++		    dwmmc_read(regs, DWMMC_CLKSEL),
++		    dwmmc_read(regs, DWMMC_UHS_REG),
++		    dwmmc_read(regs, DWMMC_CTYPE));
 +	}
 +
 +	/*
@@ -1408,6 +1486,77 @@ and 6 at function 3, which is S-Boot's own console.
 +
 +	printf("dwmmc:   sweep done. 0 means the card answered, 1 means it "
 +	    "stayed silent\n");
++}
++
++
++/*
++ * Try every sample phase, at one clock divider.
++ *
++ * The companion to the clock sweep, and the one that was missing. Sweeping
++ * the divider asks "is the card being clocked at a rate it understands";
++ * this asks "is the controller looking at the line when the card answers".
++ * They fail identically from the outside -- silence -- and no amount of the
++ * first finds a fault in the second.
++ *
++ * The drive phase is swept alongside, two values rather than eight, because
++ * a wrong drive phase corrupts what the card receives while a wrong sample
++ * phase loses what it sends, and the second is the failure in front of us.
++ */
++static void
++dwmmc_sd_phases(vm_offset_t regs, uint32_t hcon)
++{
++	uint32_t resp8[4], resp41[4];
++	uint32_t drive, sample;
++
++	if (dwmmc_pin) {
++		dwmmc_sd_pins();
++	}
++
++	printf("dwmmc:   sweeping CLKSEL phases at CLKDIV %u, divider %u\n",
++	    dwmmc_sd_div, (dwmmc_sd_clksel >> 24) & 7);
++
++	for (drive = 0; drive < 4; drive += 2) {
++		for (sample = 0; sample < 8; sample++) {
++			int rc8, rc41;
++
++			/*
++			 * Sample and drive only. The divider in bits 26:24
++			 * is what the tree asks for and is not being
++			 * questioned here, and a mask wide enough to reach
++			 * the phases reaches it too if it is written
++			 * carelessly.
++			 */
++			dwmmc_sd_clksel =
++			    (dwmmc_sd_clksel & ~0x00070007u)
++			    | DWMMC_CLKSEL_SAMPLE(sample)
++			    | DWMMC_CLKSEL_DRIVE(drive);
++
++			resp8[0] = resp41[0] = 0;
++
++			if (dwmmc_sd_prepare(regs, hcon, dwmmc_sd_div) != 0) {
++				continue;
++			}
++
++			rc8 = dwmmc_cmd(regs, hcon, SD_SEND_IF_COND,
++			    SD_IF_COND_ARG, DWMMC_CMD_R1, resp8);
++
++			if (dwmmc_cmd(regs, hcon, MMC_APP_CMD, 0,
++			    DWMMC_CMD_R1, resp41) < 0) {
++				rc41 = -1;
++			} else {
++				rc41 = dwmmc_cmd(regs, hcon, SD_APP_OP_COND,
++				    SD_OCR_HCS | SD_OCR_VOLTAGE,
++				    DWMMC_CMD_RESP_EXP | DWMMC_CMD_PRV_DAT_WAIT,
++				    resp41);
++			}
++
++			printf("dwmmc:     drive %u sample %u: CMD8 %d "
++			    "0x%08x  ACMD41 %d 0x%08x\n",
++			    drive, sample, rc8, resp8[0], rc41, resp41[0]);
++		}
++	}
++
++	printf("dwmmc:   phase sweep done. 0 means the card answered\n");
 +}
 +
 +static int
@@ -1941,7 +2090,13 @@ and 6 at function 3, which is S-Boot's own console.
 +	 */
 +	if (alive && dwmmc_sd_enable && (unit->bit & 2) != 0) {
 +		if (dwmmc_sd_enable == 2) {
++			dwmmc_pin_verbose = 0;
 +			dwmmc_sd_sweep(regs, hcon);
++			return;
++		}
++		if (dwmmc_sd_enable == 3) {
++			dwmmc_pin_verbose = 0;
++			dwmmc_sd_phases(regs, hcon);
 +			return;
 +		}
 +		if (dwmmc_sd_init(regs, hcon) != 0) {
@@ -2001,8 +2156,11 @@ and 6 at function 3, which is S-Boot's own console.
 + * dwmmc_sd=1: bring the card in the microSD slot up before reading, which
 + * dwmmc2 needs and dwmmc0 must not be given. dwmmc_sd=2 instead sweeps
 + * every plausible clock divider and reports which the card answers at,
-+ * which is how to find out whether the clock is the problem; see
-+ * dwmmc_sd_sweep(). dwmmc_sd_div=<n> and
++ * which is how to find out whether the clock is the problem, and
++ * dwmmc_sd=3 sweeps the sample and drive phases at one divider. The two
++ * failures look identical from outside -- silence -- and neither sweep
++ * finds the other's fault; see dwmmc_sd_sweep() and dwmmc_sd_phases().
++ * dwmmc_sd_div=<n> and
 + * dwmmc_sd_div_hi=<n> are the CLKDIV used to identify the card and to read
 + * it (divide by 2n; 0 divides by one), dwmmc_sd_width=<1|4> the bus width,
 + * and dwmmc_sd_clksel=<hex> Samsung's phase register. See dwmmc_sd_init()
