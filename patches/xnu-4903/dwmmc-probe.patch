@@ -510,9 +510,22 @@ including both sweeps, ran with no phase programmed at all.
 The offset now comes from the same HCON field the FIFO reads already use,
 and is confirmed rather than assumed: the value is read back, the other
 address is tried if it did not take, and which one won is printed.
+
+The image went onto the eMMC in the end without any of this: TWRP's Install
+Image wrote root.img to SYSTEM, and rd=mmc0 rooted on it. The kernel now
+mounts its root from the phone's own storage, launchd is read off the disk
+and runs, and the RAM disk is gone along with its eighteen-megabyte ceiling.
+
+launchd then exits with "No service cache", which is not a storage fault,
+and two sectors ten megabytes into the image read back byte for byte what
+the file holds. Two sectors is not eighteen megabytes, though, and a root
+that mounts and then fails can be failing on one bad byte anywhere in it --
+so the scan now carries a checksum of everything it reads, and
+tools/imgsum.py computes the same two numbers from the file it was written
+from. One number against one number, for the whole image.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,2113 @@
+@@ -0,0 +1,2134 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -2014,13 +2027,27 @@ address is tried if it did not take, and which one won is printed.
 + * Progress is printed every 65536 sectors because a scan of a 200 MiB
 + * partition is a minute of silence otherwise, and a minute of silence and a
 + * hang look the same from across the room.
++ *
++ * A checksum of everything read comes out at the end, and it is the point
++ * of the whole thing once an image is on the disk. Comparing one sector
++ * against the file it came from says that sector is right; comparing a
++ * checksum over the whole range says every sector is, and the difference
++ * matters when a filesystem mounts, runs its init, and then fails for
++ * reasons that could be a bad byte anywhere in eighteen megabytes.
++ *
++ * It is two running sums, the shape Adler uses: one over the words and one
++ * over the first. The second catches a transposition that the first would
++ * not, which is the failure a block driver with a wrong loop produces.
++ * Thirty lines of Python compute the same two numbers from the file.
 + */
 +static void
 +dwmmc_scan(vm_offset_t regs, uint32_t hcon, uint32_t first, uint32_t count)
 +{
 +	uint64_t buf[DWMMC_SECTOR / 8];
 +	const unsigned char *b = (const unsigned char *)(const void *)buf;
++	const uint32_t *w = (const uint32_t *)(const void *)buf;
 +	uint32_t n, hits = 0, nonzero = 0;
++	uint32_t sum1 = 0, sum2 = 0;
 +	int found_first = 0;
 +
 +	printf("dwmmc:   scanning %u sectors from LBA %u (%u MiB)\n",
@@ -2035,6 +2062,11 @@ address is tried if it did not take, and which one won is printed.
 +			printf("dwmmc:   read of LBA %u failed; scan stops "
 +			    "here\n", lba);
 +			break;
++		}
++
++		for (i = 0; i < DWMMC_SECTOR / 4; i++) {
++			sum1 += w[i];
++			sum2 += sum1;
 +		}
 +
 +		for (i = 0; i < DWMMC_SECTOR / 8; i++) {
@@ -2095,6 +2127,8 @@ address is tried if it did not take, and which one won is printed.
 +
 +	printf("dwmmc:   scan done: %u signatures, %u of %u sectors had "
 +	    "data\n", hits, nonzero, n);
++	printf("dwmmc:   checksum over those %u sectors: %08x %08x\n",
++	    n, sum1, sum2);
 +}
 +
 +static void
