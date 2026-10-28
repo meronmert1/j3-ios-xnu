@@ -203,9 +203,47 @@ late enough for printf to reach the console. The call site is deliberately
 not next to inittodr(): hfs-filesystem-builtin and memdev-ramdisk-root both
 insert there, they both apply after this one, and three patches editing the
 same six lines is a merge conflict waiting for the next person.
+
+The read works, so this adds the thing it was for: /dev/mmc0, a block device
+the filesystem layer can mount.
+
+    dwmmc_part_lba=<first> dwmmc_part_blocks=<count>    publish the window
+    rd=mmc0                                             root on it
+
+It is a bdevsw and not an IOKit storage stack, for the reason given at the
+top: IOStorageFamily is a separate kext and is not in this tree, while the
+root device is only ever a dev_t. bsd/dev/memdev.c is the same shape and is
+already patched here, so this is that shape with CMD17 where memdev has a
+bcopy. IOFindBSDRoot() gets a case for rd=mmc0 beside its existing one for
+rd=mdX, which exists because a memory device has no IOMedia to match either.
+
+Read-only, and not as a precaution that could be relaxed: there is no code
+here that can write to the card. This is the phone's own eMMC with Android's
+partitions on it. Nothing is given up by that -- vfs_subr.c:1022 sets
+MNT_RDONLY | MNT_ROOTFS on the root mount before trying any filesystem, so
+the root is read-only whatever the device could do.
+
+One controller, one request at a time. The transfer is polled, so a second
+thread arriving mid-transfer would read another's FIFO; a mutex makes that
+impossible rather than merely unlikely. Sectors land in a bounce buffer and
+are copied, because the FIFO is read 32 bits at a time and a transfer's
+pages are not guaranteed to be aligned for that -- one 512-byte copy against
+128 uncached register reads is not worth finding out where that assumption
+fails.
+
+The per-read commentary is now behind a flag that only the probe sets. A
+filesystem asks for thousands of sectors a second, and a printf in the data
+path is the bug this driver was already bitten by once.
+
+The window is two boot arguments rather than a partition table reader. There
+is no need for one yet: heimdall print-pit says where the partitions are and
+those numbers do not move. On this handset CACHE is 6127616 + 409600 and
+SYSTEM is 491520 + 5636096, which is 200 MiB and 2752 MiB -- the first small
+enough to flash in seconds for a first root on real storage, the second the
+size of the iOS 12 root filesystem.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,646 @@
+@@ -0,0 +1,965 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -306,8 +344,15 @@ same six lines is a merge conflict waiting for the next person.
 +
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
 +#include <mach/vm_types.h>
++#include <kern/locks.h>
 +#include <libkern/libkern.h>
++#include <miscfs/devfs/devfs.h>
 +#include <pexpert/pexpert.h>
 +
 +/*
@@ -485,9 +530,19 @@ same six lines is a merge conflict waiting for the next person.
 +	{ "dwmmc2 (microSD slot)",  0x13560000, 2 },
 +};
 +
++static void dwmmc_blockdev_init(vm_offset_t regs, uint32_t hcon);
++
 +/* dwmmc_read=<sectors> and dwmmc_lba=<first>; see dwmmc_probe(). */
 +static uint32_t dwmmc_read_count = 0;
 +static uint32_t dwmmc_read_lba = 0;
++
++/*
++ * The window /dev/mmc0 shows, and whether it has been published yet. Set
++ * from boot arguments; see dwmmc_probe() and the block device at the end.
++ */
++static uint32_t dwmmc_part_lba = 0;     /* first sector of the window */
++static uint32_t dwmmc_part_blocks = 0;  /* its length, in sectors */
++static int      dwmmc_bmajor = -1;
 +
 +#define DWMMC_READ_MAX          4
 +
@@ -528,7 +583,8 @@ same six lines is a merge conflict waiting for the next person.
 + * exactly like a dead card.
 + */
 +static int
-+dwmmc_read_block(vm_offset_t regs, uint32_t hcon, uint32_t lba, void *buf)
++dwmmc_read_block(vm_offset_t regs, uint32_t hcon, uint32_t lba, void *buf,
++    int verbose)
 +{
 +	/*
 +	 * The FIFO is read in the width the core was built with, which is
@@ -658,17 +714,24 @@ same six lines is a merge conflict waiting for the next person.
 +	 * read at its real width neither should appear again, and if they do
 +	 * the bytes below are still the thing that settles it.
 +	 */
-+	if (sts & (DWMMC_INT_HTO | DWMMC_INT_DTO)) {
-+		printf("dwmmc:   %s, %s\n",
-+		    (sts & DWMMC_INT_HTO) ? "HTO raised" : "no HTO",
-+		    (sts & DWMMC_INT_DTO) ? "transfer closed" : "no DTO");
++	/*
++	 * Only the probe says anything. Once this is answering a filesystem
++	 * there are thousands of these a second, and a printf in the data
++	 * path is the bug this driver has already been bitten by once.
++	 */
++	if (verbose) {
++		if (sts & (DWMMC_INT_HTO | DWMMC_INT_DTO)) {
++			printf("dwmmc:   %s, %s\n",
++			    (sts & DWMMC_INT_HTO) ? "HTO raised" : "no HTO",
++			    (sts & DWMMC_INT_DTO) ? "transfer closed"
++			    : "no DTO");
++		}
++		printf("dwmmc:   CMD17 done: RESP0 0x%08x (state %u%s), "
++		    "RINTSTS 0x%08x, STATUS 0x%08x, FIFO %u bytes wide\n",
++		    resp, (resp >> 9) & 0xf,
++		    ((resp >> 9) & 0xf) == 4 ? " = tran" : "", sts,
++		    dwmmc_read(regs, DWMMC_STATUS), fifo_bytes);
 +	}
-+
-+	printf("dwmmc:   CMD17 done: RESP0 0x%08x (state %u%s), "
-+	    "RINTSTS 0x%08x, STATUS 0x%08x, FIFO %u bytes wide\n",
-+	    resp, (resp >> 9) & 0xf,
-+	    ((resp >> 9) & 0xf) == 4 ? " = tran" : "", sts,
-+	    dwmmc_read(regs, DWMMC_STATUS), fifo_bytes);
 +	return 0;
 +
 +cmd_failed:
@@ -730,6 +793,7 @@ same six lines is a merge conflict waiting for the next person.
 +	vm_offset_t regs;
 +	uint32_t verid, hcon, usrid, ctrl, status, cdetect;
 +	uint32_t clkena, clkdiv, ctype, blksiz, fifoth, bmod;
++	int alive = 0;
 +
 +	regs = ml_io_map(unit->base, DWMMC_REGS_SIZE);
 +	if (regs == 0) {
@@ -787,6 +851,7 @@ same six lines is a merge conflict waiting for the next person.
 +		    "produces; check the address\n", DWMMC_VERID_REV(verid));
 +	} else {
 +		printf("dwmmc:   alive: mapping, bus and clock all work\n");
++		alive = 1;
 +	}
 +
 +	/*
@@ -801,13 +866,21 @@ same six lines is a merge conflict waiting for the next person.
 +
 +		for (n = 0; n < dwmmc_read_count; n++) {
 +			if (dwmmc_read_block(regs, hcon,
-+			    dwmmc_read_lba + n, buf) != 0) {
++			    dwmmc_read_lba + n, buf, 1) != 0) {
 +				printf("dwmmc:   read of LBA %u failed\n",
 +				    dwmmc_read_lba + n);
 +				break;
 +			}
 +			dwmmc_dump_sector(dwmmc_read_lba + n, buf);
 +		}
++	}
++
++	/*
++	 * Publish the device only once, and only on a controller that
++	 * answered. dwmmc_part_blocks is what asks for it at all.
++	 */
++	if (alive && dwmmc_part_blocks != 0 && dwmmc_bmajor < 0) {
++		dwmmc_blockdev_init(regs, hcon);
 +	}
 +}
 +
@@ -823,6 +896,12 @@ same six lines is a merge conflict waiting for the next person.
 + * that sector, and print what comes back. Default 0, which sends no command
 + * at all -- the probe only reads identity registers, and that is safe on any
 + * controller, whereas a command is not.
++ *
++ * dwmmc_part_lba=<first>, dwmmc_part_blocks=<count>: publish /dev/mmc0 as a
++ * read-only window onto that range of the card, so that rd=mmc0 can root on
++ * it. Default 0 blocks, which publishes nothing. The numbers come from the
++ * PIT; on this handset CACHE is 6127616 + 409600 and SYSTEM is 491520 +
++ * 5636096.
 + */
 +void dwmmc_probe(void);
 +
@@ -837,6 +916,10 @@ same six lines is a merge conflict waiting for the next person.
 +	    sizeof(dwmmc_read_count));
 +	(void)PE_parse_boot_argn("dwmmc_lba", &dwmmc_read_lba,
 +	    sizeof(dwmmc_read_lba));
++	(void)PE_parse_boot_argn("dwmmc_part_lba", &dwmmc_part_lba,
++	    sizeof(dwmmc_part_lba));
++	(void)PE_parse_boot_argn("dwmmc_part_blocks", &dwmmc_part_blocks,
++	    sizeof(dwmmc_part_blocks));
 +
 +	if (dwmmc_read_count > DWMMC_READ_MAX) {
 +		dwmmc_read_count = DWMMC_READ_MAX;
@@ -851,6 +934,280 @@ same six lines is a merge conflict waiting for the next person.
 +			dwmmc_probe_one(&dwmmc_units[i]);
 +		}
 +	}
++}
++
++/* ------------------------------------------------------- block device ---- */
++
++/*
++ * The same controller, as something the filesystem layer can mount.
++ *
++ * This is a bdevsw, not an IOKit storage stack. The root device is a dev_t;
++ * IOBlockStorageDevice under IOBlockStorageDriver is how a real handset
++ * arrives at one, but IOStorageFamily is a separate kext and is not in this
++ * tree, so that road starts by building another kext into the kernel.
++ * bsd/dev/memdev.c -- already patched here so that rd=md0 works -- shows the
++ * smaller shape: a strategy routine and two devfs nodes. This is that, with
++ * CMD17 where memdev has a bcopy.
++ *
++ * Read-only, and not as a precaution that could be relaxed later: there is
++ * no code here that can write to the card at all. This is the phone's own
++ * eMMC, with Android's partitions on it, and the kernel that is learning to
++ * talk to it is three days old. vfs_subr.c:1022 sets MNT_RDONLY | MNT_ROOTFS
++ * on the root mount before trying any filesystem, so nothing is given up:
++ * the root is mounted read-only whatever the device could do.
++ *
++ * One controller, one request at a time. Transfers are polled, so a second
++ * thread arriving mid-transfer would read another's FIFO; the mutex is what
++ * makes that impossible rather than merely unlikely.
++ *
++ * A sector is read into a bounce buffer and copied, rather than straight
++ * into the caller's pages. The FIFO is read 32 bits at a time and the buffer
++ * a transfer lands in is not guaranteed to be aligned for that; one 512-byte
++ * copy against 128 uncached register reads is not a cost worth the risk of
++ * finding out where that assumption fails.
++ *
++ * dwmmc_part_lba and dwmmc_part_blocks are a window onto the card, so that
++ * the device is a partition rather than the whole disk. They come from boot
++ * arguments because there is no partition table reader here yet and, for a
++ * first root filesystem on real storage, there does not need to be: the PIT
++ * says where CACHE and SYSTEM start, and those numbers do not change.
++ */
++
++static lck_grp_t        *dwmmc_lck_grp;
++static lck_mtx_t        *dwmmc_lock;
++
++static vm_offset_t      dwmmc_dev_regs;         /* the controller, mapped */
++static uint32_t         dwmmc_dev_hcon;
++static int              dwmmc_cmajor = -1;
++static dev_t            dwmmc_bdev = NODEV;
++static void             *dwmmc_bdevb;
++static void             *dwmmc_cdevb;
++
++static uint64_t         dwmmc_bounce[DWMMC_SECTOR / 8];
++
++static int
++dwmmc_open(__unused dev_t dev, __unused int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	return (dwmmc_part_blocks != 0) ? 0 : ENXIO;
++}
++
++static int
++dwmmc_close(__unused dev_t dev, __unused int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++dwmmc_size(__unused dev_t dev)
++{
++	return (dwmmc_part_blocks != 0) ? DWMMC_SECTOR : -1;
++}
++
++static void
++dwmmc_strategy(struct buf *bp)
++{
++	caddr_t dst;
++	uint64_t offset, length;
++	uint32_t sectors, i;
++	int error = 0;
++
++	if (dwmmc_part_blocks == 0) {
++		buf_seterror(bp, ENXIO);
++		buf_biodone(bp);
++		return;
++	}
++
++	if (!(buf_flags(bp) & B_READ)) {
++		buf_seterror(bp, EROFS);
++		buf_biodone(bp);
++		return;
++	}
++
++	buf_setresid(bp, buf_count(bp));
++
++	offset = (uint64_t)buf_blkno(bp) * DWMMC_SECTOR;
++	length = (uint64_t)dwmmc_part_blocks * DWMMC_SECTOR;
++
++	/*
++	 * Reading at the end is end-of-file and leaves resid == count;
++	 * reading past it is an error. memdev draws the line in the same
++	 * place and the filesystem layer expects it there.
++	 */
++	if (offset >= length) {
++		if (offset != length) {
++			buf_seterror(bp, EINVAL);
++		}
++		buf_biodone(bp);
++		return;
++	}
++	if (offset + buf_count(bp) > length) {
++		buf_setcount(bp, (uint32_t)(length - offset));
++	}
++
++	if (buf_count(bp) % DWMMC_SECTOR) {
++		buf_seterror(bp, EINVAL);
++		buf_biodone(bp);
++		return;
++	}
++
++	if (buf_map(bp, &dst)) {
++		buf_seterror(bp, ENOMEM);
++		buf_biodone(bp);
++		return;
++	}
++
++	sectors = buf_count(bp) / DWMMC_SECTOR;
++
++	lck_mtx_lock(dwmmc_lock);
++	for (i = 0; i < sectors; i++) {
++		error = dwmmc_read_block(dwmmc_dev_regs, dwmmc_dev_hcon,
++		    dwmmc_part_lba + (uint32_t)(offset / DWMMC_SECTOR) + i,
++		    dwmmc_bounce, 0);
++		if (error != 0) {
++			break;
++		}
++		memcpy(dst + (size_t)i * DWMMC_SECTOR, dwmmc_bounce,
++		    DWMMC_SECTOR);
++	}
++	lck_mtx_unlock(dwmmc_lock);
++
++	if (error != 0) {
++		buf_seterror(bp, EIO);
++		buf_setresid(bp, buf_count(bp) - (uint32_t)i * DWMMC_SECTOR);
++	} else {
++		buf_setresid(bp, 0);
++	}
++
++	buf_unmap(bp);
++	buf_biodone(bp);
++}
++
++static int
++dwmmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    struct proc *p)
++{
++	int error;
++
++	error = proc_suser(p);
++	if (error) {
++		return error;
++	}
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*(uint32_t *)(void *)data = DWMMC_SECTOR;
++		break;
++	case DKIOCGETBLOCKCOUNT:
++		*(uint64_t *)(void *)data = dwmmc_part_blocks;
++		break;
++	case DKIOCISWRITABLE:
++		*(uint32_t *)(void *)data = 0;
++		break;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++		*(uint64_t *)(void *)data = 32;
++		break;
++	default:
++		return ENOTTY;
++	}
++	return 0;
++}
++
++static int
++dwmmc_rw(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (uio_rw(uio) != UIO_READ) {
++		return EROFS;
++	}
++	return physio(dwmmc_strategy, NULL, dev, B_READ, minphys, uio,
++	           DWMMC_SECTOR);
++}
++
++static struct bdevsw dwmmc_bdevsw = {
++	/* open */ dwmmc_open,
++	/* close */ dwmmc_close,
++	/* strategy */ dwmmc_strategy,
++	/* ioctl */ dwmmc_ioctl,
++	/* dump */ eno_dump,
++	/* psize */ dwmmc_size,
++	/* flags */ D_DISK,
++};
++
++static struct cdevsw dwmmc_cdevsw = {
++	/* open */ dwmmc_open,
++	/* close */ dwmmc_close,
++	/* read */ dwmmc_rw,
++	/* write */ dwmmc_rw,
++	/* ioctl */ dwmmc_ioctl,
++	/* stop */ eno_stop,
++	/* reset */ eno_reset,
++	/* ttys */ NULL,
++	/* select */ eno_select,
++	/* mmap */ eno_mmap,
++	/* strategy */ eno_strat,
++	/* getc */ eno_getc,
++	/* putc */ eno_putc,
++	/* flags */ D_DISK,
++};
++
++/*
++ * IOFindBSDRoot() resolves rd=mdX by calling mdevlookup() before it tries
++ * any IOKit matching, because a memory device has no IOMedia to match
++ * against. Neither does this, for the same reason, so rd=mmc0 is answered
++ * the same way.
++ */
++dev_t dwmmc_lookup(void);
++
++dev_t
++dwmmc_lookup(void)
++{
++	return (dwmmc_part_blocks != 0) ? dwmmc_bdev : (dev_t)NODEV;
++}
++
++static void
++dwmmc_blockdev_init(vm_offset_t regs, uint32_t hcon)
++{
++	dwmmc_dev_regs = regs;
++	dwmmc_dev_hcon = hcon;
++
++	dwmmc_lck_grp = lck_grp_alloc_init("dwmmc", LCK_GRP_ATTR_NULL);
++	if (dwmmc_lck_grp == NULL) {
++		printf("dwmmc: no lock group\n");
++		return;
++	}
++	dwmmc_lock = lck_mtx_alloc_init(dwmmc_lck_grp, LCK_ATTR_NULL);
++	if (dwmmc_lock == NULL) {
++		printf("dwmmc: no lock\n");
++		return;
++	}
++
++	dwmmc_bmajor = bdevsw_add(-1, &dwmmc_bdevsw);
++	if (dwmmc_bmajor < 0) {
++		printf("dwmmc: bdevsw_add failed: %d\n", dwmmc_bmajor);
++		return;
++	}
++	dwmmc_cmajor = cdevsw_add_with_bdev(-1, &dwmmc_cdevsw, dwmmc_bmajor);
++	if (dwmmc_cmajor < 0) {
++		printf("dwmmc: cdevsw_add failed: %d\n", dwmmc_cmajor);
++		return;
++	}
++
++	dwmmc_bdev = makedev(dwmmc_bmajor, 0);
++	dwmmc_bdevb = devfs_make_node(dwmmc_bdev, DEVFS_BLOCK,
++	    UID_ROOT, GID_OPERATOR, 0600, "mmc0");
++	dwmmc_cdevb = devfs_make_node(makedev(dwmmc_cmajor, 0), DEVFS_CHAR,
++	    UID_ROOT, GID_OPERATOR, 0600, "rmmc0");
++	if (dwmmc_bdevb == NULL || dwmmc_cdevb == NULL) {
++		printf("dwmmc: devfs_make_node failed\n");
++		return;
++	}
++
++	printf("dwmmc: mmc0 is major %d, minor 0: LBA %u + %u sectors "
++	    "(%u MiB), read-only\n", dwmmc_bmajor, dwmmc_part_lba,
++	    dwmmc_part_blocks, dwmmc_part_blocks / 2048);
++	printf("dwmmc: boot with rd=mmc0 to use it as the root device\n");
 +}
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
@@ -891,3 +1248,46 @@ same six lines is a merge conflict waiting for the next person.
  	bsd_init_kprintf("calling os_reason_init\n");
  	os_reason_init();
  
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -55,6 +55,12 @@
+ extern dev_t mdevlookup(int devid);
+ extern void mdevremoveall(void);
+ extern int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
++
++/*
++ * bsd/dev/dwmmc.c. The storage controller's block device, looked up the same
++ * way a memory device is and for the same reason; see below.
++ */
++extern dev_t dwmmc_lookup(void);
+ extern void di_root_ramfile(IORegistryEntry * entry);
+ 
+ #if CONFIG_EMBEDDED
+@@ -547,6 +553,27 @@
+ 		}
+ 	}
+ 
++//
++//	Or on the storage controller's own block device.
++//
++//	Everything past this point resolves a root by matching an IOMedia,
++//	and bsd/dev/dwmmc.c has none to match: it is a bdevsw, because
++//	IOStorageFamily is a separate kext and is not in this tree. A memory
++//	device is in exactly the same position, which is why the case above
++//	exists at all, so this follows it rather than inventing a mechanism.
++//
++	if (strncmp(rdBootVar, "mmc0", sizeof("mmc0")) == 0) {
++		*root = dwmmc_lookup();                                                         /* Ask the driver for its dev_t */
++		if (*root != (dev_t) - 1) {
++			strlcpy(rootName, "mmc0", rootNameSize);
++			IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++			*oflags = 0;                                                                    /* Show that this is not network */
++			goto iofrootx;                                                                  /* Join common exit... */
++		}
++		panic("IOFindBSDRoot: rd=mmc0, but the dwmmc block device was not published; "
++		    "dwmmc_part_blocks must name a window onto the card\n");
++	}
++
+ 	if ((!matching) && rdBootVar[0]) {
+ 		// by BSD name
+ 		look = rdBootVar;
