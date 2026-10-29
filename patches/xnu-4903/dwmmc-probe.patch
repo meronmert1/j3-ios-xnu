@@ -593,9 +593,35 @@ answers and this did not are answered.
 And every ioctl gets a line, with its group, its number and what was
 answered, for the first two dozen. A refusal is invisible otherwise, and a
 refusal is exactly the shape of the difference being looked for.
+
+The real root filesystem went on with none of that mattering. The iOS 12.5.8
+system volume came out of the IPSW's APFS image, into a 5632 MiB HFS+ image,
+onto USERDATA through a TWRP flashable zip -- Install runs a zip's
+update-binary as root, which is a root shell on a recovery whose adb,
+terminal and OTG are all broken -- and the kernel rooted on it:
+
+    OS version: 16H88
+
+That line is the kernel reading SystemVersion.plist off the mounted volume.
+launchd came up without a word about a service cache, because the cache is
+there in a real root, and ran its boot tasks until:
+
+    fsck timed out. Can't stat /dev/disk0s1
+    BAD DISK NAME /dev/disk0s1
+    launchd[1] <Emergency>: Boot task failed: fsck-safe
+
+which is a name, not a device. iOS runs fsck over its root before mounting
+it for real, and a handset's root is disk0s1. Those nodes come from IOMedia,
+which comes from IOStorageFamily, which is not in this tree and is why this
+driver is a bdevsw at all -- but userland wants the node, not the stack
+behind it. Two more devfs entries for the same major and minor are
+indistinguishable from the real thing to anything that opens them, so the
+device is published as disk0s1 and rdisk0s1 as well, and as disk0 for
+whatever asks for the device rather than the volume. mmc0 stays, because
+rd=mmc0 names it.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,2426 @@
+@@ -0,0 +1,2464 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -3016,10 +3042,48 @@ refusal is exactly the shape of the difference being looked for.
 +		return;
 +	}
 +
++	/*
++	 * The same device again, under the name iOS expects.
++	 *
++	 * The real root filesystem mounts and launchd comes up on it, and the
++	 * first thing it does is run fsck over the root -- by the name a
++	 * handset's root has, which is disk0s1:
++	 *
++	 *     fsck timed out. Can't stat /dev/disk0s1
++	 *     BAD DISK NAME /dev/disk0s1
++	 *     launchd[1] <Emergency>: Boot task failed: fsck-safe
++	 *
++	 * On an iPhone those nodes come from IOMedia, which comes from
++	 * IOStorageFamily, which is not in this tree and is the reason this
++	 * driver is a bdevsw in the first place. The node is what userland
++	 * actually wants, though, not the stack behind it: two more devfs
++	 * entries for the same major and minor cost nothing and are indis-
++	 * tinguishable from the real thing to anything that opens them.
++	 *
++	 * mmc0 stays, because rd=mmc0 names it and because a name that says
++	 * what the device is remains worth having.
++	 */
++	(void)devfs_make_node(dwmmc_bdev, DEVFS_BLOCK,
++	    UID_ROOT, GID_OPERATOR, 0640, "disk0s1");
++	(void)devfs_make_node(makedev(dwmmc_cmajor, 0), DEVFS_CHAR,
++	    UID_ROOT, GID_OPERATOR, 0640, "rdisk0s1");
++
++	/*
++	 * And as the whole disk. Nothing has asked for it yet, but anything
++	 * that wants to look at the device rather than the volume will ask
++	 * for disk0, and it is the same window either way.
++	 */
++	(void)devfs_make_node(dwmmc_bdev, DEVFS_BLOCK,
++	    UID_ROOT, GID_OPERATOR, 0640, "disk0");
++	(void)devfs_make_node(makedev(dwmmc_cmajor, 0), DEVFS_CHAR,
++	    UID_ROOT, GID_OPERATOR, 0640, "rdisk0");
++
 +	printf("dwmmc: mmc0 is major %d, minor 0: LBA %u + %u sectors "
 +	    "(%u MiB), %s\n", dwmmc_bmajor, dwmmc_part_lba,
 +	    dwmmc_part_blocks, dwmmc_part_blocks / 2048,
 +	    dwmmc_writable ? "WRITABLE" : "read-only");
++	printf("dwmmc: also /dev/disk0s1 and /dev/rdisk0s1, which is what "
++	    "iOS looks for\n");
 +	printf("dwmmc: boot with rd=mmc0 to use it as the root device\n");
 +}
 --- a/bsd/conf/files
