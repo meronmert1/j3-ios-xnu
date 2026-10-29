@@ -551,9 +551,31 @@ card goes away to program the block and holds DAT0 low while it does, so
 this waits for data_busy to clear. Returning before it does would hand the
 next command to a card that is still busy, and that failure would surface
 somewhere with nothing to do with writing.
+
+Writing was not the difference. With the same kernel and the same image and
+only rd=md0 in place of rd=mmc0, launchd gets past its banner, spawns
+xpcproxy and reaches "Early boot complete"; on mmc0 it exits between the
+banner and xpcproxy with "No service cache", and the cache file it is named
+after is absent from the image in both cases. So it is not that file, and it
+is the root device.
+
+Which exposed something this file had wrong. The per-transfer commentary is
+off once a filesystem is driving the device -- thousands of transfers a
+second, and a printf in the data path is a bug this driver has already been
+bitten by once -- but off was implemented as silent. A read that failed
+returned EIO and said nothing. A filesystem that meets EIO while walking its
+catalog reports EIO to the caller rather than ENOENT, and a program that
+tolerates a missing file will not tolerate a broken one. That is exactly the
+shape of the failure in front of us and there was no way to see it.
+
+So the first eight failed transfers get a line: direction, LBA, which sector
+of which request, and how large the request was. Eight is enough to see a
+pattern and few enough that a filesystem in trouble cannot fill the screen
+with them. The error path also no longer copies the bounce buffer into the
+caller's pages when the read that was meant to fill it did not.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,2337 @@
+@@ -0,0 +1,2363 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -1012,6 +1034,21 @@ somewhere with nothing to do with writing.
 + * been read back and believed.
 + */
 +static uint32_t dwmmc_writable = 0;
++
++/*
++ * How many failed transfers still get a line, and how many there have been.
++ *
++ * The per-transfer commentary is off once a filesystem is driving this, for
++ * the reason given above dwmmc_read_block(): there are thousands of these a
++ * second and a printf in the data path is a bug this driver has already
++ * been bitten by. But off meant silent, and a silent EIO is worse than a
++ * slow one: it reaches the filesystem as an I/O error, comes back to the
++ * caller as EIO rather than ENOENT, and the program that gets it blames
++ * something else entirely. A handful of lines costs nothing and is the
++ * difference between a diagnosis and a guess.
++ */
++#define DWMMC_IO_ERRORS_SHOWN   8
++static uint32_t dwmmc_io_errors = 0;
 +
 +/* dwmmc_scan_lba=<first> and dwmmc_scan_blocks=<count>; see dwmmc_scan(). */
 +static uint32_t dwmmc_scan_lba = 0;
@@ -2712,19 +2749,30 @@ somewhere with nothing to do with writing.
 +		if (reading) {
 +			error = dwmmc_read_block(dwmmc_dev_regs,
 +			    dwmmc_dev_hcon, lba, dwmmc_bounce, 0);
-+			if (error != 0) {
-+				break;
-+			}
-+			memcpy(dst + (size_t)i * DWMMC_SECTOR, dwmmc_bounce,
-+			    DWMMC_SECTOR);
 +		} else {
 +			memcpy(dwmmc_bounce, dst + (size_t)i * DWMMC_SECTOR,
 +			    DWMMC_SECTOR);
 +			error = dwmmc_write_block(dwmmc_dev_regs,
 +			    dwmmc_dev_hcon, lba, dwmmc_bounce, 0);
-+			if (error != 0) {
-+				break;
++		}
++
++		if (error != 0) {
++			dwmmc_io_errors++;
++			if (dwmmc_io_errors <= DWMMC_IO_ERRORS_SHOWN) {
++				printf("dwmmc: %s LBA %u failed (sector %u of "
++				    "%u, %u bytes at block %lld); this is the "
++				    "%u%s\n", reading ? "read of" : "write to",
++				    lba, i, sectors, buf_count(bp),
++				    (long long)buf_blkno(bp), dwmmc_io_errors,
++				    dwmmc_io_errors == DWMMC_IO_ERRORS_SHOWN ?
++				    " and the last one reported" : "");
 +			}
++			break;
++		}
++
++		if (reading) {
++			memcpy(dst + (size_t)i * DWMMC_SECTOR, dwmmc_bounce,
++			    DWMMC_SECTOR);
 +		}
 +	}
 +	lck_mtx_unlock(dwmmc_lock);
