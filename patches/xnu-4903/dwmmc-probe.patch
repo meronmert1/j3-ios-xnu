@@ -573,9 +573,29 @@ of which request, and how large the request was. Eight is enough to see a
 pattern and few enough that a filesystem in trouble cannot fill the screen
 with them. The error path also no longer copies the bounce buffer into the
 caller's pages when the read that was meant to fill it did not.
+
+No transfer failed. Not one line, through a mount, a launchd that loads and
+runs, and a panic. So the reads are right and the EIO theory is gone, which
+is what the instrumentation was for.
+
+What is left is behaviour, not data, so the next round compares behaviour
+with the thing this device replaced. memdev's own source answers two
+questions it had been guessed at: mdevsize() returns the sector size and
+not the sector count, which this already did; and mdevioctl() answers
+DKIOCSETBLOCKSIZE with anything from DEV_BSIZE up, stores it, and scales
+buf_blkno() by it in its strategy routine. This accepted 512 and refused
+everything else -- a gratuitous difference from the thing it was copied
+from, in a driver whose entire remaining problem is a difference from the
+thing it was copied from. It stores it now, and scales by it, and
+DKIOCGETBLOCKCOUNT reports in those units. The two write-side limits memdev
+answers and this did not are answered.
+
+And every ioctl gets a line, with its group, its number and what was
+answered, for the first two dozen. A refusal is invisible otherwise, and a
+refusal is exactly the shape of the difference being looked for.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,2363 @@
+@@ -0,0 +1,2426 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -1049,6 +1069,32 @@ caller's pages when the read that was meant to fill it did not.
 + */
 +#define DWMMC_IO_ERRORS_SHOWN   8
 +static uint32_t dwmmc_io_errors = 0;
++
++/*
++ * Every ioctl the device is asked, and what it answered, for the first few.
++ *
++ * The same reasoning as the failed transfers above. A filesystem asks a
++ * block device a list of questions when it mounts and a driver that says
++ * ENOTTY to one of them is usually fine -- the caller takes a default --
++ * but "usually" is not a diagnosis, and the difference between this device
++ * and the RAM disk it replaced has to be somewhere. Refusals are invisible
++ * and a refusal is exactly the shape of a difference.
++ */
++#define DWMMC_IOCTLS_SHOWN      24
++static uint32_t dwmmc_ioctls = 0;
++
++/*
++ * The block size the device reports, which is not always the 512 it reads
++ * and writes in.
++ *
++ * spec_open() sets this to 512 and back, and memdev -- which this device is
++ * modelled on -- stores whatever it is given and scales buf_blkno() by it.
++ * The first version here accepted 512 and refused everything else, which is
++ * a difference in behaviour from the thing it was copied from, in a driver
++ * whose whole problem is a difference in behaviour from the thing it was
++ * copied from. So it stores it, as memdev does.
++ */
++static uint32_t dwmmc_secsize = DWMMC_SECTOR;
 +
 +/* dwmmc_scan_lba=<first> and dwmmc_scan_blocks=<count>; see dwmmc_scan(). */
 +static uint32_t dwmmc_scan_lba = 0;
@@ -2672,7 +2718,12 @@ caller's pages when the read that was meant to fill it did not.
 +static int
 +dwmmc_size(__unused dev_t dev)
 +{
-+	return (dwmmc_part_blocks != 0) ? DWMMC_SECTOR : -1;
++	/*
++	 * The sector size, not the number of sectors. memdev's mdevsize()
++	 * returns mdSecsize and this is modelled on it; the name is BSD's,
++	 * not a description.
++	 */
++	return (dwmmc_part_blocks != 0) ? (int)dwmmc_secsize : -1;
 +}
 +
 +static void
@@ -2698,7 +2749,7 @@ caller's pages when the read that was meant to fill it did not.
 +
 +	buf_setresid(bp, buf_count(bp));
 +
-+	offset = (uint64_t)buf_blkno(bp) * DWMMC_SECTOR;
++	offset = (uint64_t)buf_blkno(bp) * dwmmc_secsize;
 +	length = (uint64_t)dwmmc_part_blocks * DWMMC_SECTOR;
 +
 +	/*
@@ -2794,14 +2845,20 @@ caller's pages when the read that was meant to fill it did not.
 +{
 +	int error;
 +
++	/*
++	 * Refused for a caller without privilege, as memdev refuses, and
++	 * logged rather than returned straight away: a device that answers
++	 * nothing because the asker is not root looks exactly like a device
++	 * that answers nothing, and the two want different fixes.
++	 */
 +	error = proc_suser(p);
 +	if (error) {
-+		return error;
++		goto out;
 +	}
 +
 +	switch (cmd) {
 +	case DKIOCGETBLOCKSIZE:
-+		*(uint32_t *)(void *)data = DWMMC_SECTOR;
++		*(uint32_t *)(void *)data = dwmmc_secsize;
 +		break;
 +
 +	/*
@@ -2817,29 +2874,55 @@ caller's pages when the read that was meant to fill it did not.
 +	 * opened at all. The root mount died in bdevvp() with "open", several
 +	 * layers away from the ioctl that caused it.
 +	 *
-+	 * 512 is the only size on offer, and both of spec_open()'s calls ask
-+	 * for it, since 512 is what this reports. Anything else is refused
-+	 * rather than silently ignored.
++	 * Anything from 512 up is stored and used, which is what memdev does;
++	 * the card is still read and written in 512-byte sectors either way,
++	 * and only the scaling of buf_blkno() changes. Refusing everything
++	 * but 512, as the first version did, was a difference from memdev for
++	 * no reason, in a driver whose whole problem is a difference from
++	 * memdev.
 +	 */
 +	case DKIOCSETBLOCKSIZE:
-+		if (*(uint32_t *)(void *)data != DWMMC_SECTOR) {
-+			return EINVAL;
++		if (*(uint32_t *)(void *)data < DWMMC_SECTOR ||
++		    (*(uint32_t *)(void *)data % DWMMC_SECTOR) != 0) {
++			error = EINVAL;
++			break;
 +		}
++		dwmmc_secsize = *(uint32_t *)(void *)data;
 +		break;
 +	case DKIOCGETBLOCKCOUNT:
-+		*(uint64_t *)(void *)data = dwmmc_part_blocks;
++		*(uint64_t *)(void *)data =
++		    (uint64_t)dwmmc_part_blocks * DWMMC_SECTOR / dwmmc_secsize;
 +		break;
 +	case DKIOCISWRITABLE:
 +		*(uint32_t *)(void *)data = dwmmc_writable;
 +		break;
 +	case DKIOCGETMAXBLOCKCOUNTREAD:
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
 +	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
 +		*(uint64_t *)(void *)data = 32;
 +		break;
 +	default:
-+		return ENOTTY;
++		error = ENOTTY;
++		break;
 +	}
-+	return 0;
++
++	/*
++	 * Printed after the fact so the answer can be reported with the
++	 * question. The group and number are what identify a DKIOC: they are
++	 * 'd' and the ordinal, and reading them off the screen is quicker
++	 * than matching a 32-bit encoding by eye.
++	 */
++out:
++	if (dwmmc_ioctls < DWMMC_IOCTLS_SHOWN) {
++		dwmmc_ioctls++;
++		printf("dwmmc: ioctl 0x%08lx (group '%c' num %u) -> %d%s\n",
++		    (unsigned long)cmd, (char)((cmd >> 8) & 0xff),
++		    (unsigned int)(cmd & 0xff), error,
++		    error == ENOTTY ? " (refused)" : "");
++	}
++
++	return error;
 +}
 +
 +static int
