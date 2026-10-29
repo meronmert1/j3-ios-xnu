@@ -59,6 +59,16 @@ guessing which.
 
 This is a debugging aid. It is noisy by design and belongs in a bring-up tree,
 not a shipping one.
+
+bsd_init()'s share of it is switchable, and that is worth a sentence because
+it was not at first. The console here is a framebuffer with no scrollback,
+these are forty-odd lines, and they sit directly above everything that
+happens afterwards. That was free while the boot stopped inside bsd_init().
+It stopped being free once the root filesystem mounted and the interesting
+output moved past it: fsck's verdict on the root volume arrives long after
+bsd_init() is done, and three attempts to photograph it caught the trace
+instead. bsdtrace=0 turns it off; it is on by default, because for the stretch
+it covers it is still the only thing that says where a silent kernel stopped.
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
 @@ -231,14 +231,16 @@
@@ -159,14 +169,31 @@ not a shipping one.
  
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -449,7 +449,9 @@
+@@ -449,7 +449,24 @@
  	boolean_t       netboot = FALSE;
  #endif
  
 -#define bsd_init_kprintf(x...) /* kprintf("bsd_init: " x) */
-+/* Bring-up: printf, not the kprintf this line used to be. See the
-+ * bootstrap-trace patch header. */
-+#define bsd_init_kprintf(x...) printf("bsd_init: " x)
++/*
++ * Bring-up: printf, not the kprintf this line used to be, and switchable.
++ * See the bootstrap-trace patch header.
++ *
++ * Switchable because this console has no scrollback and these forty-odd
++ * lines are the first thing a screenful of later output pushes off the top.
++ * They were worth having until the interesting output moved past them --
++ * fsck's complaint about the root volume arrives after bsd_init() is done
++ * and could not be read with the trace on. bsdtrace=0 turns it off.
++ */
++	static int bsd_trace = -1;
++
++	if (bsd_trace < 0) {
++		uint32_t on = 1;
++		(void)PE_parse_boot_argn("bsdtrace", &on, sizeof(on));
++		bsd_trace = (int)on;
++	}
++
++#define bsd_init_kprintf(x...) do { if (bsd_trace) { \
++	printf("bsd_init: " x); } } while (0)
  
  	throttle_init();
  
