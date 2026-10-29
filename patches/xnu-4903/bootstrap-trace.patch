@@ -69,6 +69,14 @@ output moved past it: fsck's verdict on the root volume arrives long after
 bsd_init() is done, and three attempts to photograph it caught the trace
 instead. bsdtrace=0 turns it off; it is on by default, because for the stretch
 it covers it is still the only thing that says where a silent kernel stopped.
+
+The flag sits at file scope, next to the macro, and not inside bsd_init()
+where the macro used to be defined. bsdinit_task() is the macro's other
+caller -- one line, near the end, long after bsd_init() has returned -- and a
+function-local static would not be in scope there. bsd_init() reads the
+boot-arg into the flag, and since it runs first the ordering needs nothing
+else; the -1 it starts at is truthy anyway, so the default is "on" whichever
+of the two reaches the macro first.
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
 @@ -231,14 +231,16 @@
@@ -169,13 +177,12 @@ it covers it is still the only thing that says where a silent kernel stopped.
  
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -449,7 +449,26 @@
- 	boolean_t       netboot = FALSE;
- #endif
+@@ -436,6 +436,26 @@
+  * used like any other.
+  */
  
--#define bsd_init_kprintf(x...) /* kprintf("bsd_init: " x) */
 +/*
-+ * Bring-up: printf, not the kprintf this line used to be, and switchable.
++ * Bring-up: printf, not the kprintf this macro used to be, and switchable.
 + * See the bootstrap-trace patch header.
 + *
 + * Switchable because this console has no scrollback and these forty-odd
@@ -183,21 +190,34 @@ it covers it is still the only thing that says where a silent kernel stopped.
 + * They were worth having until the interesting output moved past them --
 + * fsck's complaint about the root volume arrives after bsd_init() is done
 + * and could not be read with the trace on. bsdtrace=0 turns it off.
++ *
++ * At file scope rather than inside bsd_init(), because bsdinit_task() uses
++ * the macro as well and a function-local static is not in scope there.
++ * bsd_init() reads the boot-arg into it and runs first; the -1 it starts at
++ * is truthy, so the default stays "on" whoever gets there first.
 + */
-+	static int bsd_trace = -1;
++static int bsd_trace = -1;
 +
++#define bsd_init_kprintf(x...) do { if (bsd_trace) { \
++	printf("bsd_init: " x); } } while (0)
++
+ void
+ bsd_init(void)
+ {
+@@ -449,7 +469,11 @@
+ 	boolean_t       netboot = FALSE;
+ #endif
+ 
+-#define bsd_init_kprintf(x...) /* kprintf("bsd_init: " x) */
 +	if (bsd_trace < 0) {
 +		uint32_t on = 1;
 +		(void)PE_parse_boot_argn("bsdtrace", &on, sizeof(on));
 +		bsd_trace = (int)on;
 +	}
-+
-+#define bsd_init_kprintf(x...) do { if (bsd_trace) { \
-+	printf("bsd_init: " x); } } while (0)
  
  	throttle_init();
  
-@@ -845,7 +864,7 @@
+@@ -845,7 +869,7 @@
  #endif
  
  	bsd_init_kprintf("calling sysctl_mib_init\n");
