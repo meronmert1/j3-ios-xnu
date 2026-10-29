@@ -169,7 +169,7 @@ it covers it is still the only thing that says where a silent kernel stopped.
  
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -449,7 +449,24 @@
+@@ -449,7 +449,26 @@
  	boolean_t       netboot = FALSE;
  #endif
  
@@ -197,7 +197,7 @@ it covers it is still the only thing that says where a silent kernel stopped.
  
  	throttle_init();
  
-@@ -845,7 +847,7 @@
+@@ -845,7 +864,7 @@
  #endif
  
  	bsd_init_kprintf("calling sysctl_mib_init\n");
