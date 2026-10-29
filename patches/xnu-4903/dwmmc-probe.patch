@@ -523,9 +523,37 @@ that mounts and then fails can be failing on one bad byte anywhere in it --
 so the scan now carries a checksum of everything it reads, and
 tools/imgsum.py computes the same two numbers from the file it was written
 from. One number against one number, for the whole image.
+
+The whole image then checksummed identically on the disk and in the file --
+e6019ffe 23736c27 over all 36864 sectors, from the scan and from
+tools/imgsum.py -- and the scan found HFS+'s backup volume header at the far
+end where it belongs. Storage is not the problem and has not been since.
+
+What is left is that launchd will not come up on a volume it cannot write
+to. The RAM disk it used to root on was writable and this never arose; the
+first boot from real storage had launchd read off the disk, started, and
+exiting at once. So CMD24, which is the read above in the other direction.
+
+It is behind dwmmc_write=1 rather than simply on. The refusal this file
+started with -- no code here can write at all -- was the right answer while
+the only thing at stake was a diagnostic, and the wrong one once the root
+moved. But the window is still two numbers from a boot argument pointed at
+the phone's own storage, and a wrong dwmmc_part_lba with writing enabled is
+a handset that does not boot again rather than a mount that fails. The
+publish line says WRITABLE when it is on.
+
+Two things differ from the read and both are about filling rather than
+emptying. Space comes from STATUS's fifo_full bit instead of being computed
+from the occupancy, because computing it needs the depth and the depth is
+only legible in FIFOTH's reset value, which S-Boot has already overwritten
+on this controller. And the transfer ending is not the write ending: the
+card goes away to program the block and holds DAT0 low while it does, so
+this waits for data_busy to clear. Returning before it does would hand the
+next command to a card that is still busy, and that failure would surface
+somewhere with nothing to do with writing.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,2134 @@
+@@ -0,0 +1,2337 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -899,8 +927,10 @@ from. One number against one number, for the whole image.
 +	                         DWMMC_INT_FRUN | DWMMC_INT_SBE | \
 +	                         DWMMC_INT_EBE)
 +
-+/* STATUS: the FIFO occupancy, in words. */
++/* STATUS: the FIFO occupancy, in words, and the two bits the write path uses. */
 +#define DWMMC_STATUS_FIFO_COUNT(s)      (((s) >> 17) & 0x1fff)
++#define DWMMC_STATUS_FIFO_FULL          (1u << 3)
++#define DWMMC_STATUS_DATA_BUSY          (1u << 9)
 +
 +/*
 + * Command indices. The bring-up sequence is the standard one: idle the card,
@@ -915,6 +945,7 @@ from. One number against one number, for the whole image.
 +#define SD_SEND_IF_COND         8
 +#define MMC_SET_BLOCKLEN        16
 +#define MMC_READ_SINGLE_BLOCK   17
++#define MMC_WRITE_BLOCK         24
 +#define SD_APP_OP_COND          41      /* ACMD41 */
 +#define MMC_APP_CMD             55
 +
@@ -970,6 +1001,17 @@ from. One number against one number, for the whole image.
 +static uint32_t dwmmc_part_lba = 0;     /* first sector of the window */
 +static uint32_t dwmmc_part_blocks = 0;  /* its length, in sectors */
 +static int      dwmmc_bmajor = -1;
++
++/*
++ * Whether /dev/mmc0 will write, and off unless asked.
++ *
++ * This is the phone's own storage with Android's partitions on it, and the
++ * window is two numbers from a boot argument. A wrong dwmmc_part_lba with
++ * writes enabled is a bricked handset rather than a failed mount, so writing
++ * is something that has to be turned on deliberately, once the window has
++ * been read back and believed.
++ */
++static uint32_t dwmmc_writable = 0;
 +
 +/* dwmmc_scan_lba=<first> and dwmmc_scan_blocks=<count>; see dwmmc_scan(). */
 +static uint32_t dwmmc_scan_lba = 0;
@@ -1971,6 +2013,164 @@ from. One number against one number, for the whole image.
 +	return -1;
 +}
 +
++
++/*
++ * One 512-byte sector, by CMD24. The mirror of the read above.
++ *
++ * Why it exists: the root filesystem now lives on the eMMC and launchd will
++ * not come up on a volume it cannot write to. The RAM disk it used to root
++ * on was writable, so this never came up; the first boot from real storage
++ * ended with launchd exiting at once, with the root mounted and its own
++ * binary read off the disk without a bad byte in eighteen megabytes.
++ *
++ * It is the same command path and the same FIFO in the other direction, so
++ * the two routines are deliberately the same shape: one FIFO reset, one
++ * command, one loop that carries both the error checks and the data, and
++ * nothing printed between the command and the end of the transfer.
++ *
++ * Two things differ, and both are about the FIFO being filled rather than
++ * emptied. Space is taken from STATUS's fifo_full bit rather than computed
++ * from the occupancy, because that needs the depth and the depth is only
++ * legible in FIFOTH's reset value, which S-Boot has already overwritten on
++ * the controller this runs on. And a write is not over when the transfer
++ * is: the card goes away to program the block and holds DAT0 low while it
++ * does, so this waits for data_busy to clear before returning. Returning
++ * early would mean the next command arrives at a card that is still busy,
++ * and the failure would surface somewhere else entirely.
++ */
++static int
++dwmmc_write_block(vm_offset_t regs, uint32_t hcon, uint32_t lba,
++    const void *buf, int verbose)
++{
++	const uint32_t fifo_bytes = 2u << DWMMC_HCON_DATA_WIDTH(hcon);
++	const uint8_t *in = buf;
++	uint32_t cmd, sts, resp;
++	uint32_t sent = 0;              /* bytes */
++	int us;
++
++	if (fifo_bytes != 4 && fifo_bytes != 8) {
++		printf("dwmmc:   HCON says the FIFO is %u bytes wide, which "
++		    "this does not know how to write\n", fifo_bytes);
++		return -1;
++	}
++
++	dwmmc_write(regs, DWMMC_CTRL,
++	    dwmmc_read(regs, DWMMC_CTRL) | DWMMC_CTRL_FIFO_RESET);
++	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
++		if (!(dwmmc_read(regs, DWMMC_CTRL) & DWMMC_CTRL_FIFO_RESET)) {
++			break;
++		}
++		delay(1);
++	}
++	if (us == DWMMC_TIMEOUT_US) {
++		printf("dwmmc:   FIFO reset never completed\n");
++		return -1;
++	}
++
++	dwmmc_write(regs, DWMMC_RINTSTS, DWMMC_INT_ALL);
++	dwmmc_write(regs, DWMMC_BLKSIZ, DWMMC_SECTOR);
++	dwmmc_write(regs, DWMMC_BYTCNT, DWMMC_SECTOR);
++	dwmmc_write(regs, DWMMC_TMOUT, 0xffffff40u);
++
++	dwmmc_write(regs, DWMMC_CMDARG,
++	    dwmmc_block_addressed ? lba : lba * DWMMC_SECTOR);
++
++	cmd = DWMMC_CMD_INDEX(MMC_WRITE_BLOCK)
++	    | DWMMC_CMD_RESP_EXP | DWMMC_CMD_CHECK_CRC
++	    | DWMMC_CMD_DATA_EXP | DWMMC_CMD_WRITE
++	    | DWMMC_CMD_PRV_DAT_WAIT | DWMMC_CMD_START;
++	if (hcon & DWMMC_HCON_HOLD_REG) {
++		cmd |= DWMMC_CMD_USE_HOLD_REG;
++	}
++
++	dwmmc_write(regs, DWMMC_CMD, cmd);
++
++	for (us = 0; us < DWMMC_SPINS; us++) {
++		uint32_t now = dwmmc_read(regs, DWMMC_RINTSTS);
++
++		if (now & DWMMC_INT_CMD_ERR) {
++			sts = now;
++			goto cmd_failed;
++		}
++
++		while (sent < DWMMC_SECTOR &&
++		    !(dwmmc_read(regs, DWMMC_STATUS) & DWMMC_STATUS_FIFO_FULL)) {
++			/*
++			 * The halves go in the same order they come out:
++			 * low at DWMMC_DATA, high at DWMMC_DATA + 4, and
++			 * the second one is what pushes the entry. See the
++			 * note above DWMMC_DATA.
++			 */
++			dwmmc_write(regs, DWMMC_DATA,
++			    *(const uint32_t *)(const void *)(in + sent));
++			if (fifo_bytes == 8) {
++				dwmmc_write(regs, DWMMC_DATA + 4,
++				    *(const uint32_t *)(const void *)
++				    (in + sent + 4));
++			}
++			sent += fifo_bytes;
++		}
++
++		if (now & DWMMC_INT_DATA_FATAL) {
++			sts = now;
++			goto data_failed;
++		}
++		if (sent == DWMMC_SECTOR && (now & DWMMC_INT_DTO)) {
++			break;
++		}
++	}
++
++	sts = dwmmc_read(regs, DWMMC_RINTSTS);
++	resp = dwmmc_read(regs, DWMMC_RESP0);
++
++	if (sent < DWMMC_SECTOR) {
++		printf("dwmmc:   short write: %u of %u bytes, RESP0 0x%08x\n",
++		    sent, (uint32_t)DWMMC_SECTOR, resp);
++		dwmmc_print_errors("at the end", sts);
++		return -1;
++	}
++	if (!(sts & DWMMC_INT_DTO)) {
++		printf("dwmmc:   all %u bytes went out but the transfer never "
++		    "closed\n", sent);
++		dwmmc_print_errors("at the end", sts);
++		return -1;
++	}
++
++	/*
++	 * The card is now programming the block and holding DAT0 low. Nothing
++	 * else may be asked of it until it lets go.
++	 */
++	for (us = 0; us < DWMMC_TIMEOUT_US; us++) {
++		if (!(dwmmc_read(regs, DWMMC_STATUS) &
++		    DWMMC_STATUS_DATA_BUSY)) {
++			break;
++		}
++		delay(1);
++	}
++	if (us == DWMMC_TIMEOUT_US) {
++		printf("dwmmc:   the card is still busy %u us after writing "
++		    "LBA %u\n", (uint32_t)DWMMC_TIMEOUT_US, lba);
++		return -1;
++	}
++
++	if (verbose) {
++		printf("dwmmc:   CMD24 done: LBA %u, RESP0 0x%08x (state %u%s)"
++		    ", RINTSTS 0x%08x\n", lba, resp, (resp >> 9) & 0xf,
++		    ((resp >> 9) & 0xf) == 4 ? " = tran" : "", sts);
++	}
++	return 0;
++
++cmd_failed:
++	dwmmc_print_errors("write command rejected", sts);
++	return -1;
++
++data_failed:
++	dwmmc_print_errors("write data error", sts);
++	printf("dwmmc:   %u of %u bytes had gone out\n", sent,
++	    (uint32_t)DWMMC_SECTOR);
++	return -1;
++}
++
 +/*
 + * The first 64 bytes, and whatever the sector announces itself to be.
 + *
@@ -2296,9 +2496,11 @@ from. One number against one number, for the whole image.
 + * single dump comes back empty and the question is whether the data landed
 + * somewhere else or was never written; see dwmmc_scan().
 + *
++ * dwmmc_write=1: let /dev/mmc0 write. Off by default; see dwmmc_writable
++ * for why it is a boot argument and not simply the behaviour.
++ *
 + * dwmmc_part_lba=<first>, dwmmc_part_blocks=<count>: publish /dev/mmc0 as a
-+ * read-only window onto that range of the card, so that rd=mmc0 can root on
-+ * it. Default 0 blocks, which publishes nothing. The numbers come from the
++ * window onto that range of the card, so that rd=mmc0 can root on it. Default 0 blocks, which publishes nothing. The numbers come from the
 + * PIT; on this handset CACHE is 6127616 + 409600 and SYSTEM is 491520 +
 + * 5636096.
 + */
@@ -2336,6 +2538,8 @@ from. One number against one number, for the whole image.
 +	    sizeof(dwmmc_scan_lba));
 +	(void)PE_parse_boot_argn("dwmmc_scan_blocks", &dwmmc_scan_blocks,
 +	    sizeof(dwmmc_scan_blocks));
++	(void)PE_parse_boot_argn("dwmmc_write", &dwmmc_writable,
++	    sizeof(dwmmc_writable));
 +	(void)PE_parse_boot_argn("dwmmc_part_lba", &dwmmc_part_lba,
 +	    sizeof(dwmmc_part_lba));
 +	(void)PE_parse_boot_argn("dwmmc_part_blocks", &dwmmc_part_blocks,
@@ -2375,21 +2579,22 @@ from. One number against one number, for the whole image.
 + * tree, so that road starts by building another kext into the kernel.
 + * bsd/dev/memdev.c -- already patched here so that rd=md0 works -- shows the
 + * smaller shape: a strategy routine and two devfs nodes. This is that, with
-+ * CMD17 where memdev has a bcopy.
++ * CMD17 and CMD24 where memdev has a bcopy.
 + *
-+ * Read-only, and not as a precaution that could be relaxed later: there is
-+ * no code here that can write to the card at all. This is the phone's own
-+ * eMMC, with Android's partitions on it, and the kernel that is learning to
-+ * talk to it is three days old. vfs_subr.c:1022 sets MNT_RDONLY | MNT_ROOTFS
-+ * on the root mount before trying any filesystem, so nothing is given up:
-+ * the root is mounted read-only whatever the device could do.
++ * Read-only until asked otherwise, which is not the same as the blanket
++ * refusal this started with. That refusal was right while nothing here
++ * could write at all; it stopped being right when the root moved onto the
++ * eMMC, because launchd does not come up on a volume it cannot write to.
++ * This is still the phone's own storage with Android's partitions on it and
++ * a window set from two boot arguments, so writing waits for dwmmc_write=1
++ * and for whoever sets it to have read the window back first.
 + *
 + * One controller, one request at a time. Transfers are polled, so a second
 + * thread arriving mid-transfer would read another's FIFO; the mutex is what
 + * makes that impossible rather than merely unlikely.
 + *
-+ * A sector is read into a bounce buffer and copied, rather than straight
-+ * into the caller's pages. The FIFO is read 32 bits at a time and the buffer
++ * A sector goes through a bounce buffer rather than the caller's pages in
++ * either direction. The FIFO is moved 32 bits at a time and the buffer
 + * a transfer lands in is not guaranteed to be aligned for that; one 512-byte
 + * copy against 128 uncached register reads is not a cost worth the risk of
 + * finding out where that assumption fails.
@@ -2440,6 +2645,7 @@ from. One number against one number, for the whole image.
 +	uint64_t offset, length;
 +	uint32_t sectors, i;
 +	int error = 0;
++	int reading;
 +
 +	if (dwmmc_part_blocks == 0) {
 +		buf_seterror(bp, ENXIO);
@@ -2447,7 +2653,7 @@ from. One number against one number, for the whole image.
 +		return;
 +	}
 +
-+	if (!(buf_flags(bp) & B_READ)) {
++	if (!(buf_flags(bp) & B_READ) && !dwmmc_writable) {
 +		buf_seterror(bp, EROFS);
 +		buf_biodone(bp);
 +		return;
@@ -2459,9 +2665,11 @@ from. One number against one number, for the whole image.
 +	length = (uint64_t)dwmmc_part_blocks * DWMMC_SECTOR;
 +
 +	/*
-+	 * Reading at the end is end-of-file and leaves resid == count;
-+	 * reading past it is an error. memdev draws the line in the same
-+	 * place and the filesystem layer expects it there.
++	 * At the end of the window is end-of-file and leaves resid == count;
++	 * past it is an error. memdev draws the line in the same place and
++	 * the filesystem layer expects it there. This is also what keeps a
++	 * write inside the partition it was given, which matters rather more
++	 * than it did when nothing here could write at all.
 +	 */
 +	if (offset >= length) {
 +		if (offset != length) {
@@ -2487,17 +2695,37 @@ from. One number against one number, for the whole image.
 +	}
 +
 +	sectors = buf_count(bp) / DWMMC_SECTOR;
++	reading = (buf_flags(bp) & B_READ) != 0;
 +
++	/*
++	 * Both directions go through the bounce buffer rather than the
++	 * caller's pages. The FIFO is moved 32 bits at a time and a
++	 * transfer's pages are not guaranteed to be aligned for that; one
++	 * 512-byte copy against 128 uncached register accesses is not worth
++	 * finding out where that assumption fails.
++	 */
 +	lck_mtx_lock(dwmmc_lock);
 +	for (i = 0; i < sectors; i++) {
-+		error = dwmmc_read_block(dwmmc_dev_regs, dwmmc_dev_hcon,
-+		    dwmmc_part_lba + (uint32_t)(offset / DWMMC_SECTOR) + i,
-+		    dwmmc_bounce, 0);
-+		if (error != 0) {
-+			break;
++		uint32_t lba = dwmmc_part_lba
++		    + (uint32_t)(offset / DWMMC_SECTOR) + i;
++
++		if (reading) {
++			error = dwmmc_read_block(dwmmc_dev_regs,
++			    dwmmc_dev_hcon, lba, dwmmc_bounce, 0);
++			if (error != 0) {
++				break;
++			}
++			memcpy(dst + (size_t)i * DWMMC_SECTOR, dwmmc_bounce,
++			    DWMMC_SECTOR);
++		} else {
++			memcpy(dwmmc_bounce, dst + (size_t)i * DWMMC_SECTOR,
++			    DWMMC_SECTOR);
++			error = dwmmc_write_block(dwmmc_dev_regs,
++			    dwmmc_dev_hcon, lba, dwmmc_bounce, 0);
++			if (error != 0) {
++				break;
++			}
 +		}
-+		memcpy(dst + (size_t)i * DWMMC_SECTOR, dwmmc_bounce,
-+		    DWMMC_SECTOR);
 +	}
 +	lck_mtx_unlock(dwmmc_lock);
 +
@@ -2554,7 +2782,7 @@ from. One number against one number, for the whole image.
 +		*(uint64_t *)(void *)data = dwmmc_part_blocks;
 +		break;
 +	case DKIOCISWRITABLE:
-+		*(uint32_t *)(void *)data = 0;
++		*(uint32_t *)(void *)data = dwmmc_writable;
 +		break;
 +	case DKIOCGETMAXBLOCKCOUNTREAD:
 +	case DKIOCGETMAXSEGMENTCOUNTREAD:
@@ -2569,11 +2797,13 @@ from. One number against one number, for the whole image.
 +static int
 +dwmmc_rw(dev_t dev, struct uio *uio, __unused int ioflag)
 +{
-+	if (uio_rw(uio) != UIO_READ) {
++	int reading = (uio_rw(uio) == UIO_READ);
++
++	if (!reading && !dwmmc_writable) {
 +		return EROFS;
 +	}
-+	return physio(dwmmc_strategy, NULL, dev, B_READ, minphys, uio,
-+	           DWMMC_SECTOR);
++	return physio(dwmmc_strategy, NULL, dev, reading ? B_READ : B_WRITE,
++	           minphys, uio, DWMMC_SECTOR);
 +}
 +
 +static struct bdevsw dwmmc_bdevsw = {
@@ -2656,8 +2886,9 @@ from. One number against one number, for the whole image.
 +	}
 +
 +	printf("dwmmc: mmc0 is major %d, minor 0: LBA %u + %u sectors "
-+	    "(%u MiB), read-only\n", dwmmc_bmajor, dwmmc_part_lba,
-+	    dwmmc_part_blocks, dwmmc_part_blocks / 2048);
++	    "(%u MiB), %s\n", dwmmc_bmajor, dwmmc_part_lba,
++	    dwmmc_part_blocks, dwmmc_part_blocks / 2048,
++	    dwmmc_writable ? "WRITABLE" : "read-only");
 +	printf("dwmmc: boot with rd=mmc0 to use it as the root device\n");
 +}
 --- a/bsd/conf/files
