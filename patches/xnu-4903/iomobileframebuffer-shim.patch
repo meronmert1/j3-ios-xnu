@@ -134,6 +134,88 @@ rather than a number, and the layout of those 64 bytes is not known here, so
 none is invented: it answers none supported, with the structure zeroed, and
 logs the scalar that came in. If that turns out to be the wrong answer, the
 kind being asked about is the first thing worth knowing.
+
+Both were answered, and the boot after that was the same as the first one:
+SIGABRT, BKDisplay.m:417, the identical two offsets, and not one
+"unimplemented selector" line on the console. Nothing new was being asked
+for and the display was still not being found.
+
+So the rest of the chain was read out of QuartzCore rather than guessed at,
+and it turns out to be accounted for end to end.
+
+    -[CAWindowServer _detectDisplays], run once from a pthread_once:
+      for each of three kinds -- AppleCLCDDisplay, AppleRGBOutDisplay,
+      AppleWirelessDisplay:
+        count = display_count_of_type(kind)
+        for i in 0..count:
+          d = create_display_of_type(kind, i, block)
+          if (!d->iomfb_ref) { destroy; continue; }
+          s = d->new_server()
+          [self addDisplay:[[CAWindowServerDisplay alloc]
+                            _initWithCADisplayServer:s]]
+
+    display_count_of_type(kind):
+      list = IOMobileFramebufferCreateDisplayList()
+      count the entries whose info->type == kind
+
+and the display list comes from _iomfb_populate_display_infos, which walks
+the same IOMobileFramebuffer services this file registers and decides each
+one's type like this:
+
+    if (no "AppleTV" property)                 -- a handset, so: us
+            GetDisplay(&p, 0, 0)               -- "the one that is NOT main"
+            type = (p && p->service == this) ? 1 : 0
+
+That call is meant to fail on a handset: there is one framebuffer, it is the
+main display, and nothing matches "not main". The type is therefore 0, the
+name is "primary", and AppleCLCDDisplay is the kind that picks it up --
+which also means answering selector 18 with 1 is load bearing in a second
+place, since answering 0 would file this display as an external one and
+leave the window server with nothing.
+
+Everything downstream of that lines up too. The display's constructor is the
+one that calls GetID, GetDisplaySize, SetDebugFlags, SetDisplayDevice,
+EnableDisableVideoPowerSavings and GetColorRemapMode -- the six selectors
+the console named -- so it ran; the EAGLServer constructor is the only
+caller of SupportedFrameInfo, so that ran too; -initWithCADisplayServer: is
+[super init] and a calloc and cannot fail; and -[CAWindowServer addDisplay:]
+appends without a condition beyond rejecting a duplicate. The names agree as
+well: AppleCLCDDisplay passes false for the TVOut flag, so its server is
+named "LCD", and +[CADisplay mainDisplay] is precisely the display whose
+name is that.
+
+In other words there is nothing left in the static picture that can refuse
+us, which is the point at which reading stops being worth anything. What is
+left differs only in the values that cross the boundary and the order they
+cross it in:
+
+  - a selector answered with something the framework rejects quietly,
+  - an entry point that is not externalMethod and so has never printed
+    anything -- the framework calls IOConnectSetNotificationPort twice, for
+    the vsync run loop source and for hot plug detect, and IOUserClient
+    refuses it by default,
+  - or the display being built correctly and _CASGetDisplays, the mach call
+    CADisplay makes back to the window server for the list, returning
+    nothing -- in which case nothing in this file is at fault and the hunt
+    moves into backboardd.
+
+Telling those apart needs the conversation rather than another guess, so
+this boot prints it: every call with its selector, the scalars in, the
+scalars out and the result; every client numbered, so that the opens the
+framework makes while probing can be told from the one the window server
+keeps and so that each call can be attributed to one or the other; and a
+line from each of the entry points that used to be silent. iomfbtrace=0
+turns the chatty half off again and leaves the numbered opens and the
+unimplemented-selector lines, which are worth having either way.
+
+The 64 bytes of selector 74 are no longer a mystery either -- _InfoKeyInitialize
+reads the scalar in as an index, the scalar out as a total count, and the
+bytes as that field's name, which QuartzCore compares against
+"Presentation_time", "Presentation_delta", "Requested_presentation",
+"Performance_headroom" and "Thermal_throttle". The answer stays none: a count
+of zero is survivable, QuartzCore's test on the returned array skips straight
+past frame-info collection to add_vsync_source, and naming fields nothing
+here measures would buy a per-frame conversation with nothing behind it.
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
 @@ -111,3 +111,6 @@
@@ -174,7 +256,7 @@ kind being asked about is the first thing worth knowing.
  
 --- /dev/null
 +++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,616 @@
 +/*
 + * IOMobileFramebufferShim.cpp -- enough of IOMobileFramebuffer that iOS
 + * believes this handset has a display.
@@ -217,15 +299,69 @@ kind being asked about is the first thing worth knowing.
 + * framebuffer behind it yet -- the pixels this kernel prints to are the ones
 + * the shim set up at boot and nothing here touches them.
 + *
-+ * It is deliberately the smallest thing that can fail differently. Every
-+ * other selector returns kIOReturnUnsupported, and what the framework asks
-+ * for next is a question for the next boot rather than a guess made now.
++ * What the whole chain above the framework turned out to be, read out of
++ * QuartzCore, because everything this file answers is answered for its
++ * benefit:
++ *
++ *     -[CAWindowServer _detectDisplays]
++ *       for each of three kinds -- CLCD, RGBOut, Wireless:
++ *         count = display_count_of_type(kind)
++ *         for i in 0..count:
++ *           d = create_display_of_type(kind, i, block)   -- the AppleDisplay
++ *           s = d->new_server()                          -- the EAGLServer
++ *           [self addDisplay:[[CAWindowServerDisplay alloc]
++ *                             _initWithCADisplayServer:s]]
++ *
++ *     display_count_of_type(kind):
++ *       list = IOMobileFramebufferCreateDisplayList()
++ *       count entries whose info->type == kind
++ *
++ * and the display list is built by _iomfb_populate_display_infos, which
++ * walks the same IOMobileFramebuffer services and decides each one's type
++ * like this:
++ *
++ *     if (no "AppleTV" property)                    -- a handset, so: us
++ *             GetDisplay(&p, 0, 0)                  -- "the display that is
++ *                                                       NOT the main one"
++ *             type = (p != NULL && p->service == this) ? 1 : 0
++ *
++ * That call is meant to fail on a handset: there is one framebuffer, it is
++ * the main display, and nothing matches "not main". type is therefore 0,
++ * the name is "primary", and CLCD is the kind that finds it. Answering
++ * selector 18 with 1 is what makes that come out right, and answering it
++ * with 0 would make this display count as an external one and leave
++ * CAWindowServer with nothing.
++ *
++ * Which is to say: everything from the service down to addDisplay: is
++ * accounted for, and none of it can refuse us on the evidence read so far.
++ * The names line up too -- the server is called "LCD" (AppleCLCDDisplay
++ * passes false for the TVOut flag) and +[CADisplay mainDisplay] is the
++ * display whose name is exactly that. So this boot is not about adding an
++ * answer; it is about seeing the conversation, because the remaining
++ * candidates differ only in what values cross the boundary and in which
++ * order:
++ *
++ *   - a selector answered with something the framework rejects quietly,
++ *   - an entry point that is not externalMethod at all, which until now
++ *     logged nothing: IOConnectSetNotificationPort is used twice by the
++ *     framework and IOUserClient refuses it by default,
++ *   - or the display being built correctly and _CASGetDisplays -- the mach
++ *     call CADisplay makes back to the window server -- returning nothing,
++ *     in which case nothing here is at fault and the hunt moves into
++ *     backboardd.
++ *
++ * So every call is now traced with its arguments and its answers, every
++ * client is numbered so that the probe opens can be told apart from the one
++ * the window server keeps, and the entry points that used to be silent
++ * announce themselves. Boot with iomfbtrace=0 to have none of it.
 + */
 +
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOUserClient.h>
 +#include <IOKit/IOLib.h>
++#include <libkern/OSAtomic.h>
 +#include <pexpert/pexpert.h>
++#include <sys/proc.h>          /* proc_selfpid, to name who opened a client */
 +
 +/*
 + * The selectors, named from the framework's own callers. Each was found by
@@ -252,11 +388,19 @@ kind being asked about is the first thing worth knowing.
 +#define kIOMFBSupportedFrameInfo 74
 +
 +/*
-+ * The one display. CADisplay keeps whatever GetID returns and hands it back
-+ * to the window server as the display it wants, so the value matters only in
-+ * that it is not zero and does not change.
++ * The one display. This is what GetID answers. It is not the number the
++ * window server matches on -- that one is a counter inside QuartzCore,
++ * handed out when the CAWindowServerDisplay is built and carried back to
++ * CADisplay in the kCADisplayId field of the display list -- so the value
++ * matters only in being non-zero and stable.
 + */
 +#define kIOMFBDisplayID         1
++
++/* Boot-arg iomfbtrace, on unless it is turned off. */
++static int iomfb_trace = 1;
++
++/* One number per user client, so the probes can be told from the keeper. */
++static volatile SInt32 iomfb_client_count;
 +
 +class IOMobileFramebuffer : public IOService
 +{
@@ -274,17 +418,87 @@ kind being asked about is the first thing worth knowing.
 +
 +	IOMobileFramebuffer      *fOwner;
 +	task_t                    fTask;
++	uint32_t                  fSerial;
++
++	IOReturn handleMethod(uint32_t selector,
++	    IOExternalMethodArguments *arguments,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference);
 +
 +public:
 +	virtual bool initWithTask(task_t owningTask, void *securityID,
 +	    UInt32 type) APPLE_KEXT_OVERRIDE;
 +	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientDied(void) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn externalMethod(uint32_t selector,
 +	    IOExternalMethodArguments *arguments,
 +	    IOExternalMethodDispatch *dispatch, OSObject *target,
 +	    void *reference) APPLE_KEXT_OVERRIDE;
++
++	/*
++	 * The quiet ones. None of these was reachable through externalMethod
++	 * and so none of them has ever printed anything, while the framework
++	 * calls IOConnectSetNotificationPort twice -- for the vsync run loop
++	 * source and for hot plug detect -- and IOUserClient answers it with
++	 * kIOReturnUnsupported. Whether that matters is exactly the sort of
++	 * thing that has to be seen rather than assumed, so they all say so
++	 * and then do what they did before.
++	 */
++	virtual IOReturn registerNotificationPort(mach_port_t port,
++	    UInt32 type, UInt32 refCon) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn getNotificationSemaphore(UInt32 notification_type,
++	    semaphore_t *semaphore) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type,
++	    IOOptionBits *options,
++	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn connectClient(IOUserClient *client) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	virtual IOExternalMethod *getTargetAndMethodForIndex(
++		IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
++	virtual IOExternalAsyncMethod *getAsyncTargetAndMethodForIndex(
++		IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
 +};
++
++/*
++ * Up to eight scalars of a call, comma separated, into a caller's buffer.
++ * Eight because IOExternalMethodArguments carries sixteen and no selector
++ * the framework uses passes more than a few; a line that runs off the right
++ * of a 720 pixel console is worse than a truncated one.
++ */
++static void
++iomfb_scalars(char *buf, size_t len, const uint64_t *v, uint32_t n)
++{
++	size_t off = 0;
++	uint32_t i;
++
++	if (len == 0) {
++		return;
++	}
++	buf[0] = '\0';
++	if (v == NULL) {
++		return;
++	}
++	for (i = 0; i < n && i < 8; i++) {
++		int wrote;
++
++		if (off + 1 >= len) {
++			break;
++		}
++		wrote = snprintf(buf + off, len - off, "%s%llu",
++		    i ? "," : "", (unsigned long long)v[i]);
++		/*
++		 * snprintf returns what it would have written, which on
++		 * truncation is more than it did. Taking that at face value
++		 * would wrap len - off on the next pass, so the loop stops at
++		 * the truncation instead.
++		 */
++		if (wrote < 0 || (size_t)wrote >= len - off) {
++			break;
++		}
++		off += (size_t)wrote;
++	}
++}
 +
 +#define super IOService
 +OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
@@ -292,8 +506,14 @@ kind being asked about is the first thing worth knowing.
 +bool
 +IOMobileFramebuffer::start(IOService *provider)
 +{
++	uint32_t on = 1;
++
 +	if (!super::start(provider)) {
 +		return false;
++	}
++
++	if (PE_parse_boot_argn("iomfbtrace", &on, sizeof(on))) {
++		iomfb_trace = (int)on;
 +	}
 +
 +	/*
@@ -303,7 +523,8 @@ kind being asked about is the first thing worth knowing.
 +	 */
 +	registerService();
 +
-+	IOLog("IOMobileFramebuffer: registered\n");
++	IOLog("IOMobileFramebuffer: registered (trace %s)\n",
++	    iomfb_trace ? "on" : "off");
 +	return true;
 +}
 +
@@ -341,13 +562,6 @@ kind being asked about is the first thing worth knowing.
 +	}
 +
 +	*handler = client;
-+
-+	/*
-+	 * One line per open, because start()'s line is printed before launchd
-+	 * exists and is long gone by the time anything looks for a display.
-+	 * This one lands in the middle of whatever is happening instead.
-+	 */
-+	IOLog("IOMobileFramebuffer: user client opened\n");
 +	return kIOReturnSuccess;
 +}
 +
@@ -364,6 +578,23 @@ kind being asked about is the first thing worth knowing.
 +	}
 +	fTask = owningTask;
 +	fOwner = NULL;
++
++	/*
++	 * Numbered from one on the way in rather than on the way out, so that
++	 * a client which fails to start still consumes its number and the gap
++	 * is visible.
++	 *
++	 * The framework opens one of these per service per probe and closes it
++	 * again when the answer is no, and the window server keeps exactly one
++	 * open for the display it built. Which client a call belongs to is
++	 * therefore the difference between "something looked at us" and
++	 * "something is using us", and a console full of unnumbered lines
++	 * cannot tell them apart.
++	 */
++	fSerial = (uint32_t)OSIncrementAtomic(&iomfb_client_count) + 1;
++
++	IOLog("IOMobileFramebuffer: [%u] opened by pid %d\n",
++	    (unsigned)fSerial, proc_selfpid());
 +	return true;
 +}
 +
@@ -380,6 +611,8 @@ kind being asked about is the first thing worth knowing.
 +IOReturn
 +IOMobileFramebufferUserClient::clientClose(void)
 +{
++	IOLog("IOMobileFramebuffer: [%u] closed\n", (unsigned)fSerial);
++
 +	if (!isInactive()) {
 +		terminate();
 +	}
@@ -387,20 +620,138 @@ kind being asked about is the first thing worth knowing.
 +}
 +
 +IOReturn
++IOMobileFramebufferUserClient::clientDied(void)
++{
++	IOLog("IOMobileFramebuffer: [%u] client died\n", (unsigned)fSerial);
++	return super::clientDied();
++}
++
++IOReturn
++IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port,
++    UInt32 type, UInt32 refCon)
++{
++	IOReturn ret = super::registerNotificationPort(port, type, refCon);
++
++	IOLog("IOMobileFramebuffer: [%u] registerNotificationPort type %u "
++	    "refCon %u ret 0x%x\n", (unsigned)fSerial, (unsigned)type,
++	    (unsigned)refCon, ret);
++	return ret;
++}
++
++IOReturn
++IOMobileFramebufferUserClient::getNotificationSemaphore(
++	UInt32 notification_type, semaphore_t *semaphore)
++{
++	IOReturn ret = super::getNotificationSemaphore(notification_type,
++	    semaphore);
++
++	IOLog("IOMobileFramebuffer: [%u] getNotificationSemaphore type %u "
++	    "ret 0x%x\n", (unsigned)fSerial, (unsigned)notification_type, ret);
++	return ret;
++}
++
++IOReturn
++IOMobileFramebufferUserClient::clientMemoryForType(UInt32 type,
++    IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOReturn ret = super::clientMemoryForType(type, options, memory);
++
++	IOLog("IOMobileFramebuffer: [%u] clientMemoryForType %u ret 0x%x\n",
++	    (unsigned)fSerial, (unsigned)type, ret);
++	return ret;
++}
++
++IOReturn
++IOMobileFramebufferUserClient::connectClient(IOUserClient *client)
++{
++	IOLog("IOMobileFramebuffer: [%u] connectClient\n", (unsigned)fSerial);
++	return super::connectClient(client);
++}
++
++IOReturn
++IOMobileFramebufferUserClient::setProperties(OSObject *properties)
++{
++	IOLog("IOMobileFramebuffer: [%u] setProperties\n", (unsigned)fSerial);
++	return super::setProperties(properties);
++}
++
++IOExternalMethod *
++IOMobileFramebufferUserClient::getTargetAndMethodForIndex(IOService **targetP,
++    UInt32 index)
++{
++	IOLog("IOMobileFramebuffer: [%u] getTargetAndMethodForIndex %u\n",
++	    (unsigned)fSerial, (unsigned)index);
++	return super::getTargetAndMethodForIndex(targetP, index);
++}
++
++IOExternalAsyncMethod *
++IOMobileFramebufferUserClient::getAsyncTargetAndMethodForIndex(
++	IOService **targetP, UInt32 index)
++{
++	IOLog("IOMobileFramebuffer: [%u] getAsyncTargetAndMethodForIndex %u\n",
++	    (unsigned)fSerial, (unsigned)index);
++	return super::getAsyncTargetAndMethodForIndex(targetP, index);
++}
++
++IOReturn
 +IOMobileFramebufferUserClient::externalMethod(uint32_t selector,
 +    IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch,
 +    OSObject *target, void *reference)
 +{
++	char in[96];
++	char out[96];
++	uint32_t inCount;
++	uint32_t inBytes;
++	uint32_t outWanted;
++	uint32_t outBytes;
++	IOReturn ret;
++
 +	if (arguments == NULL) {
 +		return kIOReturnBadArgument;
 +	}
 +
++	/*
++	 * The inputs are read before the call because a selector is free to
++	 * overwrite the argument block, and the whole point of the line is to
++	 * say what was asked as well as what was answered.
++	 */
++	inCount = arguments->scalarInputCount;
++	inBytes = arguments->structureInputSize;
++	outWanted = arguments->scalarOutputCount;
++	outBytes = arguments->structureOutputSize;
++	iomfb_scalars(in, sizeof(in), arguments->scalarInput, inCount);
++
++	ret = handleMethod(selector, arguments, dispatch, target, reference);
++
++	if (iomfb_trace) {
++		iomfb_scalars(out, sizeof(out), arguments->scalarOutput,
++		    arguments->scalarOutputCount);
++		IOLog("IOMobileFramebuffer: [%u] selector %u in %u{%s}/%ub "
++		    "out %u->%u{%s}/%ub ret 0x%x\n",
++		    (unsigned)fSerial, (unsigned)selector,
++		    (unsigned)inCount, in, (unsigned)inBytes,
++		    (unsigned)outWanted,
++		    (unsigned)arguments->scalarOutputCount, out,
++		    (unsigned)outBytes, ret);
++	}
++
++	return ret;
++}
++
++IOReturn
++IOMobileFramebufferUserClient::handleMethod(uint32_t selector,
++    IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch,
++    OSObject *target, void *reference)
++{
 +	switch (selector) {
 +	case kIOMFBIsMainDisplay:
 +		/*
 +		 * There is one display and this is it. The framework compares
 +		 * this against the 1 that GetMainDisplay asked for and keeps
-+		 * the first service that says yes.
++		 * the first service that says yes; it also compares it against
++		 * the 0 that the display list asks for, where saying yes is
++		 * what makes this a primary display rather than an external
++		 * one.
 +		 */
 +		if (arguments->scalarOutputCount < 1) {
 +			return kIOReturnBadArgument;
@@ -470,26 +821,33 @@ kind being asked about is the first thing worth knowing.
 +		arguments->scalarOutputCount = 0;
 +		return kIOReturnSuccess;
 +
-+	case kIOMFBSupportedFrameInfo: {
++	case kIOMFBSupportedFrameInfo:
 +		/*
-+		 * kern_SupportedFrameInfo passes one scalar in and takes back
-+		 * a count and 64 bytes:
++		 * The layout of the 64 bytes is known now, from
++		 * _InfoKeyInitialize in the framework. The scalar in is an
++		 * index, the scalar out is the total number of fields, and the
++		 * bytes are that field's name as a C string:
 +		 *
-+		 *     IOConnectCallMethod(connect, 74, &kind, 1, NULL, 0,
-+		 *                         &count, &one, info, &sixtyfour);
-+		 *     *outCount = count;
++		 *     SupportedFrameInfo(ref, 0, &count, buf);
++		 *     if (ret != 0 && count == 0) give up;
++		 *     names = calloc(count + 1, 8);
++		 *     names[0] = strndup(buf, 64);
++		 *     for (i = 1; i < count; i++) {
++		 *             SupportedFrameInfo(ref, i, &count, buf);
++		 *             names[i] = strndup(buf, 64);
++		 *     }
 +		 *
-+		 * The layout of those 64 bytes is not known here, so none is
-+		 * invented: the answer is none supported, with the structure
-+		 * zeroed. The scalar that came in is logged, because if this
-+		 * turns out to be the wrong answer then which kind was being
-+		 * asked about is the first thing worth knowing.
++		 * and QuartzCore walks that array comparing against
++		 * "Presentation_time", "Presentation_delta",
++		 * "Requested_presentation", "Performance_headroom" and
++		 * "Thermal_throttle".
++		 *
++		 * The answer stays none. A count of zero is survivable -- the
++		 * cbz on the returned array in QuartzCore skips straight to
++		 * add_vsync_source and carries on -- and naming fields we do
++		 * not actually measure would buy a per-frame conversation with
++		 * nothing behind it.
 +		 */
-+		IOLog("IOMobileFramebuffer: SupportedFrameInfo kind %llu, "
-+		    "answering none\n",
-+		    (unsigned long long)(arguments->scalarInputCount >= 1 ?
-+		    arguments->scalarInput[0] : 0));
-+
 +		if (arguments->scalarOutputCount >= 1) {
 +			arguments->scalarOutput[0] = 0;
 +			arguments->scalarOutputCount = 1;
@@ -500,24 +858,17 @@ kind being asked about is the first thing worth knowing.
 +			    arguments->structureOutputSize);
 +		}
 +		return kIOReturnSuccess;
-+	}
 +
 +	default:
 +		break;
 +	}
 +
 +	/*
-+	 * Everything else, loudly. The next thing the framework wants is
-+	 * worth knowing by number rather than guessing at in advance, and a
-+	 * line per unimplemented selector is how it gets named.
++	 * Everything else, loudly and by number. The trace line above carries
++	 * the shape of the call; this one is the word to look for.
 +	 */
-+	IOLog("IOMobileFramebuffer: unimplemented selector %u "
-+	    "(in %u scalars/%u bytes, out %u scalars/%u bytes)\n",
-+	    (unsigned)selector,
-+	    (unsigned)arguments->scalarInputCount,
-+	    (unsigned)arguments->structureInputSize,
-+	    (unsigned)arguments->scalarOutputCount,
-+	    (unsigned)arguments->structureOutputSize);
++	IOLog("IOMobileFramebuffer: [%u] unimplemented selector %u\n",
++	    (unsigned)fSerial, (unsigned)selector);
 +
 +	return super::externalMethod(selector, arguments, dispatch, target,
 +	           reference);
