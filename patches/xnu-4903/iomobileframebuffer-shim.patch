@@ -199,23 +199,81 @@ cross it in:
     nothing -- in which case nothing in this file is at fault and the hunt
     moves into backboardd.
 
-Telling those apart needs the conversation rather than another guess, so
-this boot prints it: every call with its selector, the scalars in, the
+Telling those apart needed the conversation rather than another guess, so
+that boot printed it: every call with its selector, the scalars in, the
 scalars out and the result; every client numbered, so that the opens the
-framework makes while probing can be told from the one the window server
-keeps and so that each call can be attributed to one or the other; and a
-line from each of the entry points that used to be silent. iomfbtrace=0
-turns the chatty half off again and leaves the numbered opens and the
-unimplemented-selector lines, which are worth having either way.
+framework makes while probing could be told from the one the window server
+keeps and so that each call could be attributed to one or the other; and a
+line from each of the entry points that used to be silent.
 
-The 64 bytes of selector 74 are no longer a mystery either -- _InfoKeyInitialize
-reads the scalar in as an index, the scalar out as a total count, and the
-bytes as that field's name, which QuartzCore compares against
-"Presentation_time", "Presentation_delta", "Requested_presentation",
-"Performance_headroom" and "Thermal_throttle". The answer stays none: a count
-of zero is survivable, QuartzCore's test on the returned array skips straight
-past frame-info collection to add_vsync_source, and naming fields nothing
-here measures would buy a per-frame conversation with nothing behind it.
+It came back the same on every backboardd, which crash-loops:
+
+    IOMobileFramebuffer: [1] opened by pid 61
+    IOMobileFramebuffer: [1] selector 18 in 0{}/0b out 1->1{1}/0b ret 0x0
+    IOMobileFramebuffer: [1] closed
+    IOMobileFramebuffer: [2] opened by pid 61
+    IOMobileFramebuffer: [2] selector 18 in 0{}/0b out 1->1{1}/0b ret 0x0
+    IOMobileFramebuffer: [2] selector 57 in 0{}/0b out 1->1{0}/0b ret 0x0
+    IOMobileFramebuffer: [2] selector 7  in 0{}/0b out 1->1{1}/0b ret 0x0
+    IOMobileFramebuffer: [2] selector 15 in 2{0,16}/0b out 1->1{0}/0b ret 0x0
+    IOMobileFramebuffer: [2] selector 22 in 1{0}/0b out 0->0{}/0b ret 0x0
+    IOMobileFramebuffer: [2] selector 8  in 0{}/0b out 2->2{720,1280}/0b ret 0x0
+    IOMobileFramebuffer: [2] selector 33 in 1{0}/0b out 0->0{}/0b ret 0x0
+    IOMobileFramebuffer: [2] selector 74 in 1{0}/0b out 1->1{0}/64b ret 0x0
+    exit: backboardd[61] no exit reason (signal 6, status 0)
+    IOMobileFramebuffer: [2] client died
+    IOMobileFramebuffer: [2] closed
+
+Client [1] is the display list asking for a display that is not the main
+one, being told that this one is, and letting go -- which is the answer that
+files this display as type 0, "primary", and hands it to AppleCLCDDisplay.
+Client [2] is OpenByName("primary") and then the AppleDisplay constructor in
+its own order: GetColorRemapMode, then update_framebuffer with GetID,
+SetDebugFlags, SetDisplayDevice, GetDisplaySize and
+EnableDisableVideoPowerSavings, then new_server(). Selector 74 is reached
+only from the EAGLServer constructor, so the display had been built and the
+server made.
+
+And then nothing. Not one further call, and in particular no
+registerNotificationPort, which is the thing to look for: the framework's
+run-loop sources are set up by _kern_GetRunLoopSource, which calls
+IOConnectSetNotificationPort, which this driver now logs.
+
+The absence is the answer, because the branch that was skipped is this one:
+
+    SupportedFrameInfo(ref) -> names
+    if (!names) goto no_frame_info;              -- cbz x0, 0x18530d650
+    src = IOMobileFramebufferGetRunLoopSource(ref, 3);
+    if (!src) goto no_frame_info;
+    add_runloop_source(this, src, true);
+    IOMobileFramebufferFrameInfo(ref, callback, this, 1, 0);
+
+and add_runloop_source is not what its name suggests:
+
+    slot = b ? 0x118 : 0x110;
+    if (!this->[slot])
+            this->[slot] = x_thread_create(thread_body, this);
+    while (!this->[b ? 0x198 : 0x190])
+            pthread_cond_wait(...);
+    CFRunLoopAddSource(rl, src, kCFRunLoopDefaultMode);
+
+It starts the IOMFBServer's own thread and waits for it to publish its run
+loop. The only other call to it is in the branch taken when the display's
+flags carry 0x300, which is the external-display case; on a handset this one
+is the only thing that ever starts that thread. So answering "no frame info"
+left the window server holding a display whose server had never run -- and
+the earlier note in this file that a count of zero was survivable, because
+QuartzCore's test merely skips frame-info collection, was wrong about what
+else sits inside the part being skipped.
+
+So selector 74 now answers one field. The name is deliberately none of the
+five QuartzCore looks for -- it walks the list against "Presentation_time",
+"Presentation_delta", "Requested_presentation", "Performance_headroom" and
+"Thermal_throttle", calls ChangeFrameInfo for each one it recognises, and
+passes over the rest in silence. One unrecognised name gets the list past
+the test without claiming a field this driver has no value to put in.
+iomfbframeinfo=0 puts the old answer back, so the two can be compared from
+the command line rather than from a second build.
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
 @@ -111,3 +111,6 @@
@@ -256,7 +314,7 @@ here measures would buy a per-frame conversation with nothing behind it.
  
 --- /dev/null
 +++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,695 @@
 +/*
 + * IOMobileFramebufferShim.cpp -- enough of IOMobileFramebuffer that iOS
 + * believes this handset has a display.
@@ -332,28 +390,34 @@ here measures would buy a per-frame conversation with nothing behind it.
 + * with 0 would make this display count as an external one and leave
 + * CAWindowServer with nothing.
 + *
-+ * Which is to say: everything from the service down to addDisplay: is
-+ * accounted for, and none of it can refuse us on the evidence read so far.
 + * The names line up too -- the server is called "LCD" (AppleCLCDDisplay
 + * passes false for the TVOut flag) and +[CADisplay mainDisplay] is the
-+ * display whose name is exactly that. So this boot is not about adding an
-+ * answer; it is about seeing the conversation, because the remaining
-+ * candidates differ only in what values cross the boundary and in which
-+ * order:
++ * display whose name is exactly that. Everything from the service down to
++ * addDisplay: is accounted for and none of it can refuse us, which is the
++ * point at which reading stopped being worth anything and every call got
++ * traced instead: selector, scalars in, scalars out, result, and a number
++ * per client so that the opens the framework makes while probing can be
++ * told from the one the window server keeps.
 + *
-+ *   - a selector answered with something the framework rejects quietly,
-+ *   - an entry point that is not externalMethod at all, which until now
-+ *     logged nothing: IOConnectSetNotificationPort is used twice by the
-+ *     framework and IOUserClient refuses it by default,
-+ *   - or the display being built correctly and _CASGetDisplays -- the mach
-+ *     call CADisplay makes back to the window server -- returning nothing,
-+ *     in which case nothing here is at fault and the hunt moves into
-+ *     backboardd.
++ * What the trace said, per backboardd:
 + *
-+ * So every call is now traced with its arguments and its answers, every
-+ * client is numbered so that the probe opens can be told apart from the one
-+ * the window server keeps, and the entry points that used to be silent
-+ * announce themselves. Boot with iomfbtrace=0 to have none of it.
++ *     [1] opened by pid 61 ... selector 18 -> 1 ... closed
++ *     [2] opened by pid 61 ... 18, 57, 7, 15, 22, 8, 33, 74
++ *     exit: backboardd[61] signal 6
++ *
++ * [1] is the display list asking for a display that is not the main one and
++ * being told no; [2] is OpenByName("primary") followed by the AppleDisplay
++ * constructor, update_framebuffer, and new_server(). Reaching selector 74
++ * means the EAGLServer constructor ran, so the display was built. And then
++ * nothing. Not one further call, and in particular no
++ * registerNotificationPort, which GetRunLoopSource would have caused.
++ *
++ * The answer to selector 74 was what stopped it, and see that case in
++ * externalMethod below for why: the branch it skipped is the one that
++ * starts the IOMFBServer's thread.
++ *
++ * Boot with iomfbtrace=0 for none of the chatter and iomfbframeinfo=0 for
++ * the old answer to 74.
 + */
 +
 +#include <IOKit/IOService.h>
@@ -398,6 +462,27 @@ here measures would buy a per-frame conversation with nothing behind it.
 +
 +/* Boot-arg iomfbtrace, on unless it is turned off. */
 +static int iomfb_trace = 1;
++
++/*
++ * Boot-arg iomfbframeinfo, on unless it is turned off. Off is the old
++ * behaviour -- SupportedFrameInfo answering none -- kept switchable so the
++ * two can be compared from the command line rather than from the build.
++ */
++static int iomfb_frameinfo = 1;
++
++/*
++ * The single frame-info field SupportedFrameInfo advertises, and the reason
++ * it has a name nothing is looking for.
++ *
++ * QuartzCore asks for the list and then walks it against five names of its
++ * own -- "Presentation_time", "Presentation_delta",
++ * "Requested_presentation", "Performance_headroom", "Thermal_throttle" --
++ * calling IOMobileFramebufferChangeFrameInfo for each one it finds. Names
++ * that match nothing are passed over in silence. So a list of one name that
++ * is deliberately none of those gets the list past the test without
++ * promising a field this driver cannot produce a value for.
++ */
++static const char kIOMFBFrameInfoName[] = "Unsupported";
 +
 +/* One number per user client, so the probes can be told from the keeper. */
 +static volatile SInt32 iomfb_client_count;
@@ -515,6 +600,10 @@ here measures would buy a per-frame conversation with nothing behind it.
 +	if (PE_parse_boot_argn("iomfbtrace", &on, sizeof(on))) {
 +		iomfb_trace = (int)on;
 +	}
++	on = 1;
++	if (PE_parse_boot_argn("iomfbframeinfo", &on, sizeof(on))) {
++		iomfb_frameinfo = (int)on;
++	}
 +
 +	/*
 +	 * Matched from gIOKernelConfigTables against IOResources, so there is
@@ -523,8 +612,9 @@ here measures would buy a per-frame conversation with nothing behind it.
 +	 */
 +	registerService();
 +
-+	IOLog("IOMobileFramebuffer: registered (trace %s)\n",
-+	    iomfb_trace ? "on" : "off");
++	IOLog("IOMobileFramebuffer: registered (trace %s, frame info %s)\n",
++	    iomfb_trace ? "on" : "off",
++	    iomfb_frameinfo ? "one field" : "none");
 +	return true;
 +}
 +
@@ -821,12 +911,15 @@ here measures would buy a per-frame conversation with nothing behind it.
 +		arguments->scalarOutputCount = 0;
 +		return kIOReturnSuccess;
 +
-+	case kIOMFBSupportedFrameInfo:
++	case kIOMFBSupportedFrameInfo: {
 +		/*
-+		 * The layout of the 64 bytes is known now, from
-+		 * _InfoKeyInitialize in the framework. The scalar in is an
-+		 * index, the scalar out is the total number of fields, and the
-+		 * bytes are that field's name as a C string:
++		 * One field, named so that nothing matches it -- and the whole
++		 * display depends on there being one.
++		 *
++		 * The call itself is, from _InfoKeyInitialize in the
++		 * framework: the scalar in is an index, the scalar out is the
++		 * total number of fields, and the 64 bytes are that field's
++		 * name as a C string.
 +		 *
 +		 *     SupportedFrameInfo(ref, 0, &count, buf);
 +		 *     if (ret != 0 && count == 0) give up;
@@ -837,27 +930,71 @@ here measures would buy a per-frame conversation with nothing behind it.
 +		 *             names[i] = strndup(buf, 64);
 +		 *     }
 +		 *
-+		 * and QuartzCore walks that array comparing against
-+		 * "Presentation_time", "Presentation_delta",
-+		 * "Requested_presentation", "Performance_headroom" and
-+		 * "Thermal_throttle".
++		 * This used to answer none, on the reasoning that QuartzCore's
++		 * test on the returned array -- cbz x0, 0x18530d650 -- merely
++		 * skips frame-info collection and carries on. The trace says
++		 * otherwise. What that branch skips is:
 +		 *
-+		 * The answer stays none. A count of zero is survivable -- the
-+		 * cbz on the returned array in QuartzCore skips straight to
-+		 * add_vsync_source and carries on -- and naming fields we do
-+		 * not actually measure would buy a per-frame conversation with
-+		 * nothing behind it.
++		 *     if (!names) goto no_frame_info;
++		 *     src = IOMobileFramebufferGetRunLoopSource(ref, 3);
++		 *     if (!src) goto no_frame_info;
++		 *     add_runloop_source(this, src, true);
++		 *     IOMobileFramebufferFrameInfo(ref, callback, this, 1, 0);
++		 *
++		 * and add_runloop_source is not what its name suggests:
++		 *
++		 *     slot = b ? 0x118 : 0x110;
++		 *     if (!this->[slot])
++		 *             this->[slot] = x_thread_create(thread_body, this);
++		 *     while (!this->[b ? 0x198 : 0x190])
++		 *             pthread_cond_wait(...);
++		 *     CFRunLoopAddSource(rl, src, kCFRunLoopDefaultMode);
++		 *
++		 * It starts the IOMFBServer's own thread and waits for it to
++		 * publish its run loop. The only other call to it is in the
++		 * branch taken when the display's flags have 0x300 set, which
++		 * is the external-display case and not this one. So on a
++		 * handset this call is the only thing that ever starts that
++		 * thread, and answering none left the window server holding a
++		 * display whose server had never run.
++		 *
++		 * The evidence was the absence of a line rather than a line:
++		 * GetRunLoopSource ends up in _kern_GetRunLoopSource, which
++		 * calls IOConnectSetNotificationPort, and this driver now logs
++		 * registerNotificationPort. Nothing was logged, and nothing at
++		 * all reached this driver after selector 74 -- which is where
++		 * that branch is.
++		 *
++		 * So: one field. The name is deliberately none of the five
++		 * QuartzCore looks for, because the loop that follows calls
++		 * ChangeFrameInfo only for names it recognises and passes over
++		 * the rest in silence. That gets the array past the test
++		 * without claiming a field this driver has no value for.
++		 * iomfbframeinfo=0 restores the old answer for comparison.
 +		 */
++		uint64_t index;
++
++		index = (arguments->scalarInputCount >= 1) ?
++		    arguments->scalarInput[0] : 0;
++
 +		if (arguments->scalarOutputCount >= 1) {
-+			arguments->scalarOutput[0] = 0;
++			arguments->scalarOutput[0] = iomfb_frameinfo ? 1 : 0;
 +			arguments->scalarOutputCount = 1;
 +		}
 +		if (arguments->structureOutput != NULL &&
 +		    arguments->structureOutputSize > 0) {
 +			bzero(arguments->structureOutput,
 +			    arguments->structureOutputSize);
++			if (iomfb_frameinfo && index == 0 &&
++			    arguments->structureOutputSize >=
++			    sizeof(kIOMFBFrameInfoName)) {
++				memcpy(arguments->structureOutput,
++				    kIOMFBFrameInfoName,
++				    sizeof(kIOMFBFrameInfoName));
++			}
 +		}
 +		return kIOReturnSuccess;
++	}
 +
 +	default:
 +		break;
