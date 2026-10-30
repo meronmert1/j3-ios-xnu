@@ -60,6 +60,26 @@ smallest thing that can fail differently, which is the point. Every other
 selector returns kIOReturnUnsupported and logs its number, so whatever the
 framework reaches for next is named on the next boot instead of guessed at
 on this one.
+
+It did not start the first time, and the reason is worth keeping.
+
+The personality was on IOPlatformExpertDevice, which looked right -- it is
+the provider every other entry in gIOKernelConfigTables matches against.
+But IOKit starts one driver per nub, the highest scoring one, and that nub
+already belongs to IOPlatformExpert at score 1000. IOPanicPlatform sits on
+the same nub at score 0 for exactly that reason: it is what runs when
+nothing else will. A third claimant is simply never tried, and the evidence
+was that backboardd crash-looped without a single "unimplemented selector"
+line -- it never found a service to open, so nothing in the user client was
+ever reached.
+
+IOResources is the nub that carries several drivers at once, which is what a
+driver with no hardware of its own matches against, and a match category of
+its own is how they stay out of each other's way there.
+
+A line is logged on every successful open as well as at start, because
+start() prints before launchd exists and has scrolled away long before
+anything asks for a display.
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
 @@ -111,3 +111,6 @@
@@ -71,7 +91,7 @@ on this one.
 +iokit/Kernel/IOMobileFramebufferShim.cpp		optional iokitcpp
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -38,6 +38,16 @@
+@@ -38,6 +38,26 @@
      "     'IOClass'         = IOPanicPlatform;"
      "     'IOProviderClass' = IOPlatformExpertDevice;"
      "     'IOProbeScore'    = 0:32;"
@@ -80,17 +100,27 @@ on this one.
 +     * The display iOS insists on. See iokit/Kernel/IOMobileFramebufferShim.cpp
 +     * for what it has to answer and why; this is how it gets started, since
 +     * there is no kext here to carry a personality of its own.
++     *
++     * On IOResources rather than IOPlatformExpertDevice, which is where the
++     * first attempt put it and where it never ran. IOKit starts one driver
++     * per nub -- the highest scoring one -- and IOPlatformExpert already has
++     * that nub at 1000; IOPanicPlatform sits on it at 0 precisely because it
++     * is the one that runs when nothing else does. A third claimant is never
++     * tried. IOResources is the nub that carries several drivers at once,
++     * which is what every pseudo-driver without hardware of its own uses,
++     * and a match category of its own is how they avoid each other there.
 +     */
 +    "   {"
 +    "     'IOClass'         = IOMobileFramebuffer;"
-+    "     'IOProviderClass' = IOPlatformExpertDevice;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOMobileFramebuffer;"
 +    "     'IOProbeScore'    = 1000:32;"
      "   }"
      ")";
  
 --- /dev/null
 +++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,218 @@
 +/*
 + * IOMobileFramebufferShim.cpp -- enough of IOMobileFramebuffer that iOS
 + * believes this handset has a display.
@@ -184,9 +214,9 @@ on this one.
 +	}
 +
 +	/*
-+	 * Matched from gIOKernelConfigTables against IOPlatformExpertDevice,
-+	 * so there is no kext and no Info.plist; registerService() is what
-+	 * puts it where IOServiceGetMatchingServices can find it.
++	 * Matched from gIOKernelConfigTables against IOResources, so there is
++	 * no kext and no Info.plist; registerService() is what puts it where
++	 * IOServiceGetMatchingServices can find it.
 +	 */
 +	registerService();
 +
@@ -229,6 +259,13 @@ on this one.
 +	}
 +
 +	*handler = client;
++
++	/*
++	 * One line per open, because start()'s line is printed before launchd
++	 * exists and is long gone by the time anything looks for a display.
++	 * This one lands in the middle of whatever is happening instead.
++	 */
++	IOLog("IOMobileFramebuffer: user client opened\n");
 +	return kIOReturnSuccess;
 +}
 +
