@@ -375,7 +375,8 @@ build_deps() {
     # it without ever defining that, so the file arrives empty.
     sed -i '' -e 's/^#if OS_FIREHOSE_SPI$/#if 1 \/* OS_FIREHOSE_SPI, which xnu never defines *\//' \
         "$FAKEROOT/usr/local/include/kernel/os/firehose_buffer_private.h"
-    (cd "$WORK_DIR" && xcrun clang -arch arm64 -mkernel -nostdinc -Wno-packed \
+    (cd "$WORK_DIR" && xcrun clang -arch arm64 -mcpu=cortex-a53 \
+        -mkernel -nostdinc -Wno-packed \
         -Wall -DKERNEL=1 -DOS_FIREHOSE_SPI=1 -DDISPATCH_USE_DTRACE=0 \
         -I"$ldd" -I"$ldd/os" -I"$ldd/src/firehose" \
         -I"$lpf/private/os" \
