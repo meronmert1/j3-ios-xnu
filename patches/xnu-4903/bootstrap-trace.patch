@@ -60,33 +60,75 @@ guessing which.
 This is a debugging aid. It is noisy by design and belongs in a bring-up tree,
 not a shipping one.
 
-bsd_init()'s share of it is switchable, and that is worth a sentence because
-it was not at first. The console here is a framebuffer with no scrollback,
-these are forty-odd lines, and they sit directly above everything that
-happens afterwards. That was free while the boot stopped inside bsd_init().
-It stopped being free once the root filesystem mounted and the interesting
-output moved past it: fsck's verdict on the root volume arrives long after
-bsd_init() is done, and three attempts to photograph it caught the trace
-instead. bsdtrace=0 turns it off; it is on by default, because for the stretch
-it covers it is still the only thing that says where a silent kernel stopped.
+The whole trace is switchable, and that is worth a paragraph because it was
+not at first, and then was only half so. The console here is a framebuffer
+with no scrollback. These are around a hundred and ten lines -- forty in
+bsd_init(), the rest in kernel_bootstrap(), commpage and StartIOKit -- and
+they sit directly above everything that happens afterwards. That was free
+while the boot stopped inside bsd_init(). It stopped being free once the
+root filesystem mounted and the interesting output moved past them: fsck's
+verdict on the root volume arrives long after bsd_init() is done, and four
+attempts to photograph it caught the trace instead. The first fix switched
+only bsd_init()'s share, which freed forty lines and was still not enough --
+the other seventy were the ones at the top of the photograph.
 
-The flag sits at file scope, next to the macro, and not inside bsd_init()
-where the macro used to be defined. bsdinit_task() is the macro's other
-caller -- one line, near the end, long after bsd_init() has returned -- and a
-function-local static would not be in scope there. bsd_init() reads the
-boot-arg into the flag, and since it runs first the ordering needs nothing
-else; the -1 it starts at is truthy anyway, so the default is "on" whichever
-of the two reaches the macro first.
+boottrace=0 turns all four off. bsdtrace is the name the flag had while it
+covered bsd_init() alone and is still accepted, because that is what is
+written in the command lines this tree has been booted with. The default is
+on: for the stretch it covers it is still the only thing that says where a
+silent kernel stopped.
+
+One flag, defined in osfmk/kern/startup.c and read by the other three.
+kernel_bootstrap() traces first, so it is the one that reads the boot-arg,
+lazily, on its first line; the others only test the flag. It starts at -1,
+which is truthy, so a caller that somehow arrives before the boot-arg has
+been looked at still prints rather than silently not. IOStartIOKit.cpp
+declares it extern "C", since startup.c is C and the symbol it defines is
+unmangled.
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
-@@ -231,14 +231,16 @@
+@@ -228,17 +228,55 @@
+ /* mach leak logging */
+ int log_leaks = 0;
+ 
++/*
++ * Bring-up: printf, not the kprintf these lines used to be, and switchable.
++ * See the bootstrap-trace patch header.
++ *
++ * The flag lives here because kernel_bootstrap() is the first of the four
++ * places that trace, and the other three -- commpage, StartIOKit, bsd_init
++ * -- read it rather than each parsing the boot-arg again. It starts at -1,
++ * which is truthy, so a caller that somehow arrives before the boot-arg has
++ * been looked at still prints.
++ *
++ * boottrace=0 turns the whole trace off. bsdtrace is the name this had when
++ * it only covered bsd_init() and is still accepted, because that is what is
++ * written in the command lines this tree has been booted with.
++ */
++int bootstrap_trace = -1;
++
++static void
++bootstrap_trace_read_boot_arg(void)
++{
++	uint32_t on = 1;
++
++	if (!PE_parse_boot_argn("boottrace", &on, sizeof(on))) {
++		on = 1;
++		(void)PE_parse_boot_argn("bsdtrace", &on, sizeof(on));
++	}
++	bootstrap_trace = (int)on;
++}
++
  static inline void
  kernel_bootstrap_log(const char *message)
  {
 -//	kprintf("kernel_bootstrap: %s\n", message);
-+	/* Bring-up: printf, not the kprintf this line used to be. See the
-+	 * bootstrap-trace patch header. */
-+	printf("kernel_bootstrap: %s\n", message);
++	if (bootstrap_trace < 0) {
++		bootstrap_trace_read_boot_arg();
++	}
++	if (bootstrap_trace) {
++		printf("kernel_bootstrap: %s\n", message);
++	}
  	kernel_debug_string_early(message);
  }
  
@@ -94,11 +136,16 @@ of the two reaches the macro first.
  kernel_bootstrap_thread_log(const char *message)
  {
 -//	kprintf("kernel_bootstrap_thread: %s\n", message);
-+	printf("kernel_bootstrap_thread: %s\n", message);
++	if (bootstrap_trace < 0) {
++		bootstrap_trace_read_boot_arg();
++	}
++	if (bootstrap_trace) {
++		printf("kernel_bootstrap_thread: %s\n", message);
++	}
  	kernel_debug_string_early(message);
  }
  
-@@ -456,7 +458,7 @@
+@@ -456,7 +494,7 @@
  {
  	processor_t             processor = current_processor();
  
@@ -107,7 +154,7 @@ of the two reaches the macro first.
  	kernel_bootstrap_thread_log("idle_thread_create");
  	/*
  	 * Create the idle processor thread.
-@@ -592,6 +594,7 @@
+@@ -592,6 +630,7 @@
  #ifdef  IOKIT
  	kernel_bootstrap_log("PE_init_iokit");
  	PE_init_iokit();
@@ -115,7 +162,7 @@ of the two reaches the macro first.
  #endif
  
  	assert(ml_get_interrupts_enabled() == FALSE);
-@@ -606,7 +609,9 @@
+@@ -606,7 +645,9 @@
  	// Reset interrupts masked timeout before we enable interrupts
  	ml_spin_debug_clear_self();
  #endif
@@ -125,7 +172,7 @@ of the two reaches the macro first.
  
  #if (defined(__i386__) || defined(__x86_64__)) && NCOPY_WINDOWS > 0
  	/*
-@@ -622,9 +627,13 @@
+@@ -622,9 +663,13 @@
  	/*
  	 *	Initialize the shared region module.
  	 */
@@ -139,7 +186,7 @@ of the two reaches the macro first.
  
  #if CONFIG_MACF
  	kernel_bootstrap_log("mac_policy_initmach");
-@@ -646,7 +655,9 @@
+@@ -646,7 +691,9 @@
  	 * Must be done prior to lockdown so that we can free (and possibly relocate)
  	 * the static KVA mappings used for the jettisoned bootstrap segments.
  	 */
@@ -149,7 +196,7 @@ of the two reaches the macro first.
  #if defined(__arm__) || defined(__arm64__)
  #if CONFIG_KERNEL_INTEGRITY
  	machine_lockdown_preflight();
-@@ -654,7 +665,9 @@
+@@ -654,7 +701,9 @@
  	/*
  	 *  Finalize protections on statically mapped pages now that comm page mapping is established.
  	 */
@@ -159,7 +206,7 @@ of the two reaches the macro first.
  #endif
  
  #if CONFIG_SCHED_SFI
-@@ -680,6 +693,7 @@
+@@ -680,6 +729,7 @@
  	read_random(&vm_kernel_addrhash_salt, sizeof(vm_kernel_addrhash_salt));
  	read_random(&vm_kernel_addrhash_salt_ext, sizeof(vm_kernel_addrhash_salt_ext));
  
@@ -167,7 +214,7 @@ of the two reaches the macro first.
  	vm_set_restrictions();
  
  
-@@ -697,6 +711,7 @@
+@@ -697,6 +747,7 @@
  	 *	Start the user bootstrap.
  	 */
  #ifdef  MACH_BSD
@@ -196,28 +243,24 @@ of the two reaches the macro first.
 + * bsd_init() reads the boot-arg into it and runs first; the -1 it starts at
 + * is truthy, so the default stays "on" whoever gets there first.
 + */
-+static int bsd_trace = -1;
++extern int bootstrap_trace;
 +
-+#define bsd_init_kprintf(x...) do { if (bsd_trace) { \
++#define bsd_init_kprintf(x...) do { if (bootstrap_trace) { \
 +	printf("bsd_init: " x); } } while (0)
 +
  void
  bsd_init(void)
  {
-@@ -449,7 +469,11 @@
+@@ -449,8 +469,6 @@
  	boolean_t       netboot = FALSE;
  #endif
  
 -#define bsd_init_kprintf(x...) /* kprintf("bsd_init: " x) */
-+	if (bsd_trace < 0) {
-+		uint32_t on = 1;
-+		(void)PE_parse_boot_argn("bsdtrace", &on, sizeof(on));
-+		bsd_trace = (int)on;
-+	}
- 
+-
  	throttle_init();
  
-@@ -845,7 +869,7 @@
+ 	printf(copyright);
+@@ -845,7 +863,7 @@
  #endif
  
  	bsd_init_kprintf("calling sysctl_mib_init\n");
@@ -228,129 +271,145 @@ of the two reaches the macro first.
  	bsd_autoconf();
 --- a/iokit/Kernel/IOStartIOKit.cpp
 +++ b/iokit/Kernel/IOStartIOKit.cpp
-@@ -150,28 +150,39 @@
+@@ -63,6 +63,10 @@
+ #include <kern/clock.h>
+ #include <sys/time.h>
+ 
++/* Bring-up: the bootstrap trace's on/off flag, defined in osfmk/kern/startup.c. */
++extern "C" int bootstrap_trace;
++#define boot_trace(x...) do { if (bootstrap_trace) { printf(x); } } while (0)
++
+ void
+ IOKitInitializeTime( void )
+ {
+@@ -150,28 +154,39 @@
  	// of iokit basic service initialisation, or better we have IOLib stuff
  	// initialise as basic OS services.
  	//
-+	printf("StartIOKit: IOLibInit\n");
++	boot_trace("StartIOKit: IOLibInit\n");
  	IOLibInit();
-+	printf("StartIOKit: OSlibkernInit\n");
++	boot_trace("StartIOKit: OSlibkernInit\n");
  	OSlibkernInit();
-+	printf("StartIOKit: devsw_init\n");
++	boot_trace("StartIOKit: devsw_init\n");
  	devsw_init();
  
  	gIOProgressBackbufferKey  = OSSymbol::withCStringNoCopy(kIOProgressBackbufferKey);
  	gIORemoveOnReadProperties = OSSet::withObjects((const OSObject **) &gIOProgressBackbufferKey, 1);
  
-+	printf("StartIOKit: interruptAccountingInit\n");
++	boot_trace("StartIOKit: interruptAccountingInit\n");
  	interruptAccountingInit();
  
-+	printf("StartIOKit: new IOPlatformExpertDevice\n");
++	boot_trace("StartIOKit: new IOPlatformExpertDevice\n");
  	rootNub = new IOPlatformExpertDevice;
  
-+	printf("StartIOKit: initWithArgs\n");
++	boot_trace("StartIOKit: initWithArgs\n");
  	if (rootNub && rootNub->initWithArgs( p1, p2, p3, p4)) {
-+		printf("StartIOKit: attach\n");
++		boot_trace("StartIOKit: attach\n");
  		rootNub->attach( 0 );
  
  		/* If the bootstrap segment set up a function to record startup
  		 * extensions, call it now.
  		 */
  		if (record_startup_extensions_function) {
-+			printf("StartIOKit: record_startup_extensions\n");
++			boot_trace("StartIOKit: record_startup_extensions\n");
  			record_startup_extensions_function();
-+			printf("StartIOKit: record_startup_extensions - done\n");
++			boot_trace("StartIOKit: record_startup_extensions - done\n");
  		}
  
-+		printf("StartIOKit: registerService\n");
++		boot_trace("StartIOKit: registerService\n");
  		rootNub->registerService();
-+		printf("StartIOKit: registerService - done\n");
++		boot_trace("StartIOKit: registerService - done\n");
  
  #if !NO_KEXTD
  		/* Add a busy count to keep the registry busy until kextd has
-@@ -179,9 +190,11 @@
+@@ -179,9 +194,11 @@
  		 * messages the kernel after the in-kernel linker has been
  		 * removed and personalities have been sent.
  		 */
-+		printf("StartIOKit: adjustBusy\n");
++		boot_trace("StartIOKit: adjustBusy\n");
  		IOService::getServiceRoot()->adjustBusy(1);
  #endif
  	}
-+	printf("StartIOKit: done\n");
++	boot_trace("StartIOKit: done\n");
  }
  
  void
 --- a/osfmk/arm/commpage/commpage.c
 +++ b/osfmk/arm/commpage/commpage.c
-@@ -37,6 +37,7 @@
+@@ -37,6 +37,12 @@
   *	Purpose:	Set up and export a RO/RW page
   */
  #include <libkern/section_keywords.h>
 +#include <kern/misc_protos.h>    /* Bring-up: printf, see the bootstrap-trace patch */
++
++/* Bring-up: the bootstrap trace's on/off flag, defined in osfmk/kern/startup.c. */
++extern int bootstrap_trace;
++#define boot_trace(x...) do { if (bootstrap_trace) { printf(x); } } while (0)
++
  #include <mach/mach_types.h>
  #include <mach/machine.h>
  #include <mach/vm_map.h>
-@@ -78,13 +79,18 @@
+@@ -78,13 +84,18 @@
  	uint16_t        c2;
  	int cpufamily;
  
-+	printf("commpage: pmap_create_sharedpage\n");
++	boot_trace("commpage: pmap_create_sharedpage\n");
  	sharedpage_rw_addr = pmap_create_sharedpage();
-+	printf("commpage: pmap_create_sharedpage - done\n");
++	boot_trace("commpage: pmap_create_sharedpage - done\n");
  	commPagePtr = (vm_address_t)_COMM_PAGE_BASE_ADDRESS;
  
  	*((uint16_t*)(_COMM_PAGE_VERSION + _COMM_PAGE_RW_OFFSET)) = (uint16_t) _COMM_PAGE_THIS_VERSION;
  
-+	printf("commpage: init_cpu_capabilities\n");
++	boot_trace("commpage: init_cpu_capabilities\n");
  	commpage_init_cpu_capabilities();
-+	printf("commpage: set_timestamp\n");
++	boot_trace("commpage: set_timestamp\n");
  	commpage_set_timestamp(0, 0, 0, 0, 0);
-+	printf("commpage: set_timestamp - done\n");
++	boot_trace("commpage: set_timestamp - done\n");
  
  	if (_cpu_capabilities & kCache32) {
  		c2 = 32;
-@@ -99,8 +105,11 @@
+@@ -99,8 +110,11 @@
  	*((uint16_t*)(_COMM_PAGE_CACHE_LINESIZE + _COMM_PAGE_RW_OFFSET)) = c2;
  	*((uint32_t*)(_COMM_PAGE_SPIN_COUNT + _COMM_PAGE_RW_OFFSET)) = 1;
  
-+	printf("commpage: update_active_cpus\n");
++	boot_trace("commpage: update_active_cpus\n");
  	commpage_update_active_cpus();
-+	printf("commpage: cpuid_get_cpufamily\n");
++	boot_trace("commpage: cpuid_get_cpufamily\n");
  	cpufamily = cpuid_get_cpufamily();
-+	printf("commpage: cpuid_get_cpufamily - done\n");
++	boot_trace("commpage: cpuid_get_cpufamily - done\n");
  
  	/* machine_info valid after ml_get_max_cpus() */
  	*((uint8_t*)(_COMM_PAGE_PHYSICAL_CPUS + _COMM_PAGE_RW_OFFSET)) = (uint8_t) machine_info.physical_cpu_max;
-@@ -124,12 +133,16 @@
+@@ -124,12 +138,16 @@
  	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64 + _COMM_PAGE_RW_OFFSET)) = (uint8_t) PAGE_SHIFT;
  #endif /* __arm64__ */
  
-+	printf("commpage: update_timebase\n");
++	boot_trace("commpage: update_timebase\n");
  	commpage_update_timebase();
-+	printf("commpage: update_mach_continuous_time\n");
++	boot_trace("commpage: update_mach_continuous_time\n");
  	commpage_update_mach_continuous_time(0);
  
  	clock_sec_t secs;
  	clock_usec_t microsecs;
-+	printf("commpage: clock_get_boottime_microtime\n");
++	boot_trace("commpage: clock_get_boottime_microtime\n");
  	clock_get_boottime_microtime(&secs, &microsecs);
-+	printf("commpage: clock_get_boottime_microtime - done\n");
++	boot_trace("commpage: clock_get_boottime_microtime - done\n");
  	commpage_update_boottime(secs * USEC_PER_SEC + microsecs);
  
  	/*
-@@ -143,6 +156,7 @@
+@@ -143,6 +161,7 @@
  	*((uint8_t *)(_COMM_PAGE_APPROX_TIME_SUPPORTED + _COMM_PAGE_RW_OFFSET)) = 0;
  #endif
  
-+	printf("commpage: update_kdebug_state\n");
++	boot_trace("commpage: update_kdebug_state\n");
  	commpage_update_kdebug_state();
  
  #if CONFIG_ATM
-@@ -151,6 +165,7 @@
+@@ -151,6 +170,7 @@
  
  
  	*((uint64_t*)(_COMM_PAGE_REMOTETIME_PARAMS + _COMM_PAGE_RW_OFFSET)) = BT_RESET_SENTINEL_TS;
-+	printf("commpage: populate - done\n");
++	boot_trace("commpage: populate - done\n");
  }
  
  struct mu {
