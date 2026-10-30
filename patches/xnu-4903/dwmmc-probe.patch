@@ -619,9 +619,52 @@ indistinguishable from the real thing to anything that opens them, so the
 device is published as disk0s1 and rdisk0s1 as well, and as disk0 for
 whatever asks for the device rather than the volume. mmc0 stays, because
 rd=mmc0 names it.
+
+Then a second window, because one volume is not what iOS is looking for.
+
+With the root volume finally passing fsck, launchd moved on to the next
+thing it checks and stopped there instead:
+
+    fsck timed out. Can't stat /dev/disk0s2
+    BAD DISK NAME /dev/disk0s2
+    launchd[1] <Emergency>: Boot task failed: fsck-safe
+
+That line had been on the screen all along, above the root's own failure and
+below the top of a console with no scrollback. It is the data partition. On
+a handset disk0s1 is the system volume, mounted read-only, and disk0s2 is
+/private/var; launchd checks both before it will go on, and a missing one is
+as fatal as a broken one.
+
+So the driver now carries a window per minor rather than one window. minor 0
+is disk0s1 and minor 1 is disk0s2, set by dwmmc_part2_lba and
+dwmmc_part2_blocks alongside the pair that were already there. Everything
+that used to read the single window -- open, size, strategy, the DKIOC
+answers, the character device -- turns its dev_t back into a minor first.
+The node for minor 1 is only created when a window was given for it: a node
+that exists and answers ENXIO is worse than no node, because fsck would then
+report a disk it could not read rather than one that is not there.
+
+Both windows are on the same eMMC, which has the room. The root image
+occupies the first 5632 MiB of USERDATA and about six thousand more sit
+behind it unused, so the data partition goes there and no repartitioning of
+the phone is involved.
+
+The writable flag became per window in the same change, because the two
+windows want opposite answers. /private/var is useless unless it can be
+written. The root is the opposite: iOS mounts it read-only and there is
+nothing it should ever write there, and leaving it unwritable also stops
+fsck from "repairing" it -- which it did on three boots running, each time
+leaving a volume that no longer matched the image that was written and a
+different complaint to chase on the next boot. A whole-partition read-back
+afterwards found the first and last 1900 MiB changed and the middle
+untouched, which is the shape of a volume whose metadata has been rewritten,
+not of a transfer that went wrong. The sector size is per window too, for
+the same reason it has to be settable at all: it is set per open, and two
+volumes opened at once would otherwise share one and scale each other's
+block numbers.
 --- /dev/null
 +++ b/bsd/dev/dwmmc.c
-@@ -0,0 +1,2464 @@
+@@ -0,0 +1,2548 @@
 +/*
 + * dwmmc.c -- a first look at the DesignWare Mobile Storage Host Controller
 + * on Exynos 7570.
@@ -1063,23 +1106,61 @@ rd=mmc0 names it.
 +static uint32_t dwmmc_read_lba = 0;
 +
 +/*
-+ * The window /dev/mmc0 shows, and whether it has been published yet. Set
-+ * from boot arguments; see dwmmc_probe() and the block device at the end.
++ * The windows /dev/mmc0 shows, one per minor, and whether they have been
++ * published yet. Set from boot arguments; see dwmmc_probe() and the block
++ * device at the end.
++ *
++ * Two of them, because iOS wants two volumes rather than one. launchd
++ * fsck-checks the root and then the data partition, by the names a handset
++ * has for them, and the second one is as fatal as the first:
++ *
++ *     fsck timed out. Can't stat /dev/disk0s2
++ *     BAD DISK NAME /dev/disk0s2
++ *     launchd[1] <Emergency>: Boot task failed: fsck-safe
++ *
++ * minor 0 is disk0s1, the root, which iOS mounts read-only. minor 1 is
++ * disk0s2, which is /private/var and is written to constantly. They are two
++ * windows onto the same eMMC: the root image takes the first 5632 MiB of
++ * USERDATA and six thousand more sit behind it doing nothing. Nothing here
++ * reads a partition table, so both windows are boot arguments, as the first
++ * one always was.
 + */
-+static uint32_t dwmmc_part_lba = 0;     /* first sector of the window */
-+static uint32_t dwmmc_part_blocks = 0;  /* its length, in sectors */
++#define DWMMC_WINDOWS   2
++
++static uint32_t dwmmc_lba[DWMMC_WINDOWS];     /* first sector of each */
++static uint32_t dwmmc_blocks[DWMMC_WINDOWS];  /* its length, in sectors */
 +static int      dwmmc_bmajor = -1;
 +
 +/*
-+ * Whether /dev/mmc0 will write, and off unless asked.
-+ *
-+ * This is the phone's own storage with Android's partitions on it, and the
-+ * window is two numbers from a boot argument. A wrong dwmmc_part_lba with
-+ * writes enabled is a bricked handset rather than a failed mount, so writing
-+ * is something that has to be turned on deliberately, once the window has
-+ * been read back and believed.
++ * The minor a dev_t names, or -1. Everything that reaches this driver from
++ * the device layer comes in as a dev_t and has to be turned back into a
++ * window before it means anything.
 + */
-+static uint32_t dwmmc_writable = 0;
++static int
++dwmmc_window(dev_t dev)
++{
++	int w = minor(dev);
++
++	return (w >= 0 && w < DWMMC_WINDOWS) ? w : -1;
++}
++
++/*
++ * Whether each window will write, and off unless asked.
++ *
++ * This is the phone's own storage with Android's partitions on it, and a
++ * window is two numbers from a boot argument. A wrong dwmmc_lba with writes
++ * enabled is a bricked handset rather than a failed mount, so writing is
++ * something that has to be turned on deliberately, once the window has been
++ * read back and believed.
++ *
++ * Per window rather than per driver, because the two want opposite answers.
++ * The root is read-only to iOS and there is nothing it should ever write
++ * there; leaving it that way also means fsck cannot "repair" it, which it
++ * did for three boots running, each time leaving a volume that differed
++ * from the image and a different complaint to chase. /private/var is the
++ * opposite: unwritable, it is useless.
++ */
++static uint32_t dwmmc_writable[DWMMC_WINDOWS];
 +
 +/*
 + * How many failed transfers still get a line, and how many there have been.
@@ -1120,7 +1201,9 @@ rd=mmc0 names it.
 + * whose whole problem is a difference in behaviour from the thing it was
 + * copied from. So it stores it, as memdev does.
 + */
-+static uint32_t dwmmc_secsize = DWMMC_SECTOR;
++static uint32_t dwmmc_secsize[DWMMC_WINDOWS] = {
++	DWMMC_SECTOR, DWMMC_SECTOR
++};
 +
 +/* dwmmc_scan_lba=<first> and dwmmc_scan_blocks=<count>; see dwmmc_scan(). */
 +static uint32_t dwmmc_scan_lba = 0;
@@ -2557,9 +2640,9 @@ rd=mmc0 names it.
 +
 +	/*
 +	 * Publish the device only once, and only on a controller that
-+	 * answered. dwmmc_part_blocks is what asks for it at all.
++	 * answered. A non-zero dwmmc_blocks[0] is what asks for it at all.
 +	 */
-+	if (alive && dwmmc_part_blocks != 0 && dwmmc_bmajor < 0) {
++	if (alive && dwmmc_blocks[0] != 0 && dwmmc_bmajor < 0) {
 +		dwmmc_blockdev_init(regs, hcon);
 +	}
 +}
@@ -2647,12 +2730,18 @@ rd=mmc0 names it.
 +	    sizeof(dwmmc_scan_lba));
 +	(void)PE_parse_boot_argn("dwmmc_scan_blocks", &dwmmc_scan_blocks,
 +	    sizeof(dwmmc_scan_blocks));
-+	(void)PE_parse_boot_argn("dwmmc_write", &dwmmc_writable,
-+	    sizeof(dwmmc_writable));
-+	(void)PE_parse_boot_argn("dwmmc_part_lba", &dwmmc_part_lba,
-+	    sizeof(dwmmc_part_lba));
-+	(void)PE_parse_boot_argn("dwmmc_part_blocks", &dwmmc_part_blocks,
-+	    sizeof(dwmmc_part_blocks));
++	(void)PE_parse_boot_argn("dwmmc_write", &dwmmc_writable[0],
++	    sizeof(dwmmc_writable[0]));
++	(void)PE_parse_boot_argn("dwmmc_part_lba", &dwmmc_lba[0],
++	    sizeof(dwmmc_lba[0]));
++	(void)PE_parse_boot_argn("dwmmc_part_blocks", &dwmmc_blocks[0],
++	    sizeof(dwmmc_blocks[0]));
++	(void)PE_parse_boot_argn("dwmmc_write2", &dwmmc_writable[1],
++	    sizeof(dwmmc_writable[1]));
++	(void)PE_parse_boot_argn("dwmmc_part2_lba", &dwmmc_lba[1],
++	    sizeof(dwmmc_lba[1]));
++	(void)PE_parse_boot_argn("dwmmc_part2_blocks", &dwmmc_blocks[1],
++	    sizeof(dwmmc_blocks[1]));
 +
 +	if (dwmmc_read_count > DWMMC_READ_MAX) {
 +		dwmmc_read_count = DWMMC_READ_MAX;
@@ -2708,7 +2797,7 @@ rd=mmc0 names it.
 + * copy against 128 uncached register reads is not a cost worth the risk of
 + * finding out where that assumption fails.
 + *
-+ * dwmmc_part_lba and dwmmc_part_blocks are a window onto the card, so that
++ * dwmmc_lba[] and dwmmc_blocks[] are windows onto the card, so that
 + * the device is a partition rather than the whole disk. They come from boot
 + * arguments because there is no partition table reader here yet and, for a
 + * first root filesystem on real storage, there does not need to be: the PIT
@@ -2728,10 +2817,12 @@ rd=mmc0 names it.
 +static uint64_t         dwmmc_bounce[DWMMC_SECTOR / 8];
 +
 +static int
-+dwmmc_open(__unused dev_t dev, __unused int flags, __unused int devtype,
++dwmmc_open(dev_t dev, __unused int flags, __unused int devtype,
 +    __unused struct proc *p)
 +{
-+	return (dwmmc_part_blocks != 0) ? 0 : ENXIO;
++	int w = dwmmc_window(dev);
++
++	return (w >= 0 && dwmmc_blocks[w] != 0) ? 0 : ENXIO;
 +}
 +
 +static int
@@ -2742,14 +2833,16 @@ rd=mmc0 names it.
 +}
 +
 +static int
-+dwmmc_size(__unused dev_t dev)
++dwmmc_size(dev_t dev)
 +{
 +	/*
 +	 * The sector size, not the number of sectors. memdev's mdevsize()
 +	 * returns mdSecsize and this is modelled on it; the name is BSD's,
 +	 * not a description.
 +	 */
-+	return (dwmmc_part_blocks != 0) ? (int)dwmmc_secsize : -1;
++	int w = dwmmc_window(dev);
++
++	return (w >= 0 && dwmmc_blocks[w] != 0) ? (int)dwmmc_secsize[w] : -1;
 +}
 +
 +static void
@@ -2760,14 +2853,16 @@ rd=mmc0 names it.
 +	uint32_t sectors, i;
 +	int error = 0;
 +	int reading;
++	int w;
 +
-+	if (dwmmc_part_blocks == 0) {
++	w = dwmmc_window(buf_device(bp));
++	if (w < 0 || dwmmc_blocks[w] == 0) {
 +		buf_seterror(bp, ENXIO);
 +		buf_biodone(bp);
 +		return;
 +	}
 +
-+	if (!(buf_flags(bp) & B_READ) && !dwmmc_writable) {
++	if (!(buf_flags(bp) & B_READ) && !dwmmc_writable[w]) {
 +		buf_seterror(bp, EROFS);
 +		buf_biodone(bp);
 +		return;
@@ -2775,8 +2870,8 @@ rd=mmc0 names it.
 +
 +	buf_setresid(bp, buf_count(bp));
 +
-+	offset = (uint64_t)buf_blkno(bp) * dwmmc_secsize;
-+	length = (uint64_t)dwmmc_part_blocks * DWMMC_SECTOR;
++	offset = (uint64_t)buf_blkno(bp) * dwmmc_secsize[w];
++	length = (uint64_t)dwmmc_blocks[w] * DWMMC_SECTOR;
 +
 +	/*
 +	 * At the end of the window is end-of-file and leaves resid == count;
@@ -2820,7 +2915,7 @@ rd=mmc0 names it.
 +	 */
 +	lck_mtx_lock(dwmmc_lock);
 +	for (i = 0; i < sectors; i++) {
-+		uint32_t lba = dwmmc_part_lba
++		uint32_t lba = dwmmc_lba[w]
 +		    + (uint32_t)(offset / DWMMC_SECTOR) + i;
 +
 +		if (reading) {
@@ -2866,10 +2961,16 @@ rd=mmc0 names it.
 +}
 +
 +static int
-+dwmmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++dwmmc_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag,
 +    struct proc *p)
 +{
 +	int error;
++	int w = dwmmc_window(dev);
++
++	if (w < 0) {
++		error = ENXIO;
++		goto out;
++	}
 +
 +	/*
 +	 * Refused for a caller without privilege, as memdev refuses, and
@@ -2884,7 +2985,7 @@ rd=mmc0 names it.
 +
 +	switch (cmd) {
 +	case DKIOCGETBLOCKSIZE:
-+		*(uint32_t *)(void *)data = dwmmc_secsize;
++		*(uint32_t *)(void *)data = dwmmc_secsize[w];
 +		break;
 +
 +	/*
@@ -2913,14 +3014,14 @@ rd=mmc0 names it.
 +			error = EINVAL;
 +			break;
 +		}
-+		dwmmc_secsize = *(uint32_t *)(void *)data;
++		dwmmc_secsize[w] = *(uint32_t *)(void *)data;
 +		break;
 +	case DKIOCGETBLOCKCOUNT:
-+		*(uint64_t *)(void *)data =
-+		    (uint64_t)dwmmc_part_blocks * DWMMC_SECTOR / dwmmc_secsize;
++		*(uint64_t *)(void *)data = (uint64_t)dwmmc_blocks[w]
++		    * DWMMC_SECTOR / dwmmc_secsize[w];
 +		break;
 +	case DKIOCISWRITABLE:
-+		*(uint32_t *)(void *)data = dwmmc_writable;
++		*(uint32_t *)(void *)data = dwmmc_writable[w];
 +		break;
 +	case DKIOCGETMAXBLOCKCOUNTREAD:
 +	case DKIOCGETMAXBLOCKCOUNTWRITE:
@@ -2955,8 +3056,12 @@ rd=mmc0 names it.
 +dwmmc_rw(dev_t dev, struct uio *uio, __unused int ioflag)
 +{
 +	int reading = (uio_rw(uio) == UIO_READ);
++	int w = dwmmc_window(dev);
 +
-+	if (!reading && !dwmmc_writable) {
++	if (w < 0) {
++		return ENXIO;
++	}
++	if (!reading && !dwmmc_writable[w]) {
 +		return EROFS;
 +	}
 +	return physio(dwmmc_strategy, NULL, dev, reading ? B_READ : B_WRITE,
@@ -3001,7 +3106,7 @@ rd=mmc0 names it.
 +dev_t
 +dwmmc_lookup(void)
 +{
-+	return (dwmmc_part_blocks != 0) ? dwmmc_bdev : (dev_t)NODEV;
++	return (dwmmc_blocks[0] != 0) ? dwmmc_bdev : (dev_t)NODEV;
 +}
 +
 +static void
@@ -3071,19 +3176,41 @@ rd=mmc0 names it.
 +	/*
 +	 * And as the whole disk. Nothing has asked for it yet, but anything
 +	 * that wants to look at the device rather than the volume will ask
-+	 * for disk0, and it is the same window either way.
++	 * for disk0, and the root window is the one it means.
 +	 */
 +	(void)devfs_make_node(dwmmc_bdev, DEVFS_BLOCK,
 +	    UID_ROOT, GID_OPERATOR, 0640, "disk0");
 +	(void)devfs_make_node(makedev(dwmmc_cmajor, 0), DEVFS_CHAR,
 +	    UID_ROOT, GID_OPERATOR, 0640, "rdisk0");
 +
++	/*
++	 * The data partition, on minor 1, and only if a window was given for
++	 * it. A node that exists and answers ENXIO is worse than no node at
++	 * all here: fsck would stat it, open it, fail, and report a disk it
++	 * could not read rather than one that is not there.
++	 */
++	if (dwmmc_blocks[1] != 0) {
++		(void)devfs_make_node(makedev(dwmmc_bmajor, 1), DEVFS_BLOCK,
++		    UID_ROOT, GID_OPERATOR, 0640, "disk0s2");
++		(void)devfs_make_node(makedev(dwmmc_cmajor, 1), DEVFS_CHAR,
++		    UID_ROOT, GID_OPERATOR, 0640, "rdisk0s2");
++	}
++
 +	printf("dwmmc: mmc0 is major %d, minor 0: LBA %u + %u sectors "
-+	    "(%u MiB), %s\n", dwmmc_bmajor, dwmmc_part_lba,
-+	    dwmmc_part_blocks, dwmmc_part_blocks / 2048,
-+	    dwmmc_writable ? "WRITABLE" : "read-only");
++	    "(%u MiB), %s\n", dwmmc_bmajor, dwmmc_lba[0],
++	    dwmmc_blocks[0], dwmmc_blocks[0] / 2048,
++	    dwmmc_writable[0] ? "WRITABLE" : "read-only");
 +	printf("dwmmc: also /dev/disk0s1 and /dev/rdisk0s1, which is what "
 +	    "iOS looks for\n");
++	if (dwmmc_blocks[1] != 0) {
++		printf("dwmmc: minor 1 is /dev/disk0s2: LBA %u + %u sectors "
++		    "(%u MiB), %s\n", dwmmc_lba[1], dwmmc_blocks[1],
++		    dwmmc_blocks[1] / 2048,
++		    dwmmc_writable[1] ? "WRITABLE" : "read-only");
++	} else {
++		printf("dwmmc: no /dev/disk0s2; give dwmmc_part2_lba and "
++		    "dwmmc_part2_blocks for one\n");
++	}
 +	printf("dwmmc: boot with rd=mmc0 to use it as the root device\n");
 +}
 --- a/bsd/conf/files
