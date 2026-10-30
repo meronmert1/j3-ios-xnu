@@ -382,6 +382,7 @@ build_deps() {
         -I"$FAKEROOT/usr/local/include/firehose" \
         -I"$FAKEROOT/usr/local/include/kernel" \
         -I"$FAKEROOT/usr/local/include" \
+        -I"$(xcrun --sdk macosx --show-sdk-path)/usr/include" \
         -c "$ldd/src/firehose/firehose_buffer.c" \
         -o firehose_buffer.o >>"$LOG_DIR/deps.log" 2>&1 \
      && xcrun ar rcs "$FAKEROOT/usr/local/lib/kernel/libfirehose_kernel.a" \
