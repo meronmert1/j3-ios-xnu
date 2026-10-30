@@ -53,7 +53,7 @@ JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 DTRACE_REF="${DTRACE_REF:-}"             # empty = newest tag
 BOOTSTRAP_CMDS_REF="${BOOTSTRAP_CMDS_REF:-}"
 AVAILABILITY_REF="${AVAILABILITY_REF:-}"
-LIBDISPATCH_REF="${LIBDISPATCH_REF:-libdispatch-1008}"   # prefix match, 10.14 train
+LIBDISPATCH_REF="${LIBDISPATCH_REF:-libdispatch-1008.270.1}" # companion to xnu-4903.270.47
 LIBPLATFORM_REF="${LIBPLATFORM_REF:-libplatform-177}"
 LIBPTHREAD_REF="${LIBPTHREAD_REF:-libpthread-330.250.2}"   # 10.14.6 train, matches xnu-4903
 HFS_REF="${HFS_REF:-hfs-407.30.1}"                  # the 10.14 tag that still ships core/
@@ -343,14 +343,30 @@ build_deps() {
         >>"$LOG_DIR/deps.log" 2>&1) \
         || die "xnu installhdrs failed (see $LOG_DIR/deps.log)"
 
-    say "libfirehose_kernel (stub)"
-    # The real firehose needs private headers that only exist in the current
-    # SDK, written for a much newer libdispatch; mixing the two leaves every
-    # inline entry point undeclared. os_log is not how we read this kernel,
-    # so link against a stub instead. See scripts/firehose-stub.c.
+    say "libfirehose_kernel"
+    # The real one, built from libdispatch, not the stub it used to be.
+    #
+    # logd needs it. It maps the kernel's os_log buffer with LOGBUFFERMAP and
+    # traps -- "BUG IN LIBDISPATCH: Unexpected kernel buffer size" -- unless
+    # the size it gets back is between FIREHOSE_BUFFER_KERNEL_MIN_CHUNK_COUNT
+    # and MAX times FIREHOSE_CHUNK_SIZE, which is 64 KiB to 256 KiB. The stub
+    # returned NULL from __firehose_buffer_create(), which left
+    # kernel_firehose_addr zero and the size zero, and logd died on every
+    # boot, taking the system log with it.
+    #
+    # The stub existed because the firehose private headers were taken from
+    # the SDK, where they belong to a much newer libdispatch. They do not have
+    # to come from there. libdispatch-1008.270.1 is the companion release to
+    # xnu-4903.270.47 -- the same Darwin 18.7.0, the same .270. -- it is
+    # already fetched here for its os/*.h, and it carries the source Apple
+    # builds as libfirehose_kernel. Built against xnu's own installed headers
+    # in $FAKEROOT rather than the SDK's, there is no version to mismatch.
+    #
+    # The flags are Apple's, from xcodeconfig/libfirehose_kernel.xcconfig, with
+    # $SDKROOT replaced by $FAKEROOT. OS_FIREHOSE_SPI is passed because the
+    # body of firehose_buffer.c is wrapped in it and no xcconfig defines it for
+    # compilation; Apple writes its intended value in the unifdef flags.
     mkdir -p "$FAKEROOT/usr/local/lib/kernel"
-    # xnu still includes <os/firehose_buffer_private.h>; take it from
-    # libdispatch even though we are not building the library.
     local ldd; ldd="$(fetch_oss libdispatch "$LIBDISPATCH_REF")" || exit 1
     mkdir -p "$FAKEROOT/usr/local/include/kernel/os"
     cp "$ldd"/os/*.h "$FAKEROOT/usr/local/include/kernel/os/" 2>/dev/null
@@ -358,12 +374,19 @@ build_deps() {
     # it without ever defining that, so the file arrives empty.
     sed -i '' -e 's/^#if OS_FIREHOSE_SPI$/#if 1 \/* OS_FIREHOSE_SPI, which xnu never defines *\//' \
         "$FAKEROOT/usr/local/include/kernel/os/firehose_buffer_private.h"
-    (cd "$WORK_DIR" && xcrun clang -arch arm64 -mkernel -ffreestanding \
-        -fno-builtin -Wall -c "$PWD_AT_START/scripts/firehose-stub.c" \
-        -o firehose-stub.o >>"$LOG_DIR/deps.log" 2>&1 \
+    (cd "$WORK_DIR" && xcrun clang -arch arm64 -mkernel -nostdinc -Wno-packed \
+        -Wall -DKERNEL=1 -DOS_FIREHOSE_SPI=1 -DDISPATCH_USE_DTRACE=0 \
+        -I"$ldd" -I"$ldd/os" -I"$ldd/src/firehose" \
+        -I"$FAKEROOT/System/Library/Frameworks/Kernel.framework/PrivateHeaders" \
+        -I"$FAKEROOT/System/Library/Frameworks/Kernel.framework/Headers" \
+        -I"$FAKEROOT/usr/local/include/firehose" \
+        -I"$FAKEROOT/usr/local/include/kernel" \
+        -I"$FAKEROOT/usr/local/include" \
+        -c "$ldd/src/firehose/firehose_buffer.c" \
+        -o firehose_buffer.o >>"$LOG_DIR/deps.log" 2>&1 \
      && xcrun ar rcs "$FAKEROOT/usr/local/lib/kernel/libfirehose_kernel.a" \
-        firehose-stub.o >>"$LOG_DIR/deps.log" 2>&1) \
-        || die "firehose stub build failed (see $LOG_DIR/deps.log)"
+        firehose_buffer.o >>"$LOG_DIR/deps.log" 2>&1) \
+        || die "libfirehose_kernel build failed (see $LOG_DIR/deps.log)"
 }
 
 # ----------------------------------------------------------------------- kernel
