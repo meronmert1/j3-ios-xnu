@@ -1,0 +1,141 @@
+Say why a process died, and stop narrating the pages that were let through.
+
+Two changes to the console, for the same reason the bootstrap trace became
+switchable: what is printed is not what is wanted, and what is wanted is
+buried under it.
+
+The first boot that got past fsck started launchd, and launchd started iOS:
+SpringBoard, backboardd, mediaserverd, logd, fairplayd, xpcproxy. Then all
+of them died, were restarted, and died again, and the console said only
+
+    Process[1017] crashed: SpringBoard. Too many corpses being created.
+
+which is the corpse allocator refusing to make another one. It is a
+consequence of the crashes, not a reason for any of them, and the reason
+was never printed: launchd prints an exit reason, but only for pid 1 and
+only on its way to a panic.
+
+Every process carries one. os_reason has a namespace and a code, and a
+string description in its kcdata that launchd_exit_reason_get_string_desc()
+already knows how to find -- that function exists in this file and is used
+for pid 1. Namespace 6 is dyld, whose codes distinguish a missing dylib
+from a missing symbol and whose description names which one. That is the
+difference between a daemon that cannot find a library and one that
+segfaulted, and it is one line per dying process. exittrace=0 turns it off.
+
+The second change is the flood it would otherwise appear in. With
+cs_enforcement_disable=1 every page of every unsigned binary takes the
+"allowing (remove VALID)" path in cs_invalid_page(), and every one of them
+prints. A boot that reaches launchd produces thousands, each wrapping to
+three lines on a 720-pixel console with no scrollback. They report that the
+thing that was asked for happened.
+
+Only that case goes quiet. A page that is denied, and one that comes with a
+SIGKILL, still print: those are refusals, and a refusal says something that
+was not already known. csverbose=1 brings the rest back.
+--- a/bsd/kern/kern_cs.c
++++ b/bsd/kern/kern_cs.c
+@@ -79,6 +79,23 @@
+ int cs_force_kill = 0;
+ int cs_force_hard = 0;
+ int cs_debug = 0;
++
++/*
++ * Bring-up: whether cs_invalid_page() narrates the pages it lets through.
++ *
++ * With cs_enforcement_disable=1 every page of every unsigned binary takes
++ * the "allowing (remove VALID)" path, and each one prints a line. A boot
++ * that reaches launchd produces thousands, three lines deep on a 720-pixel
++ * console with no scrollback, and whatever a daemon says before it dies is
++ * buried under them. The pages are being let through deliberately, so the
++ * narration is a report of the thing that was asked for.
++ *
++ * Only the quiet case goes quiet. A page that is denied, or one that comes
++ * with a SIGKILL, still prints: those are refusals rather than permissions
++ * and they say something that was not already known. csverbose=1 brings the
++ * rest back.
++ */
++static int cs_invalid_page_verbose = -1;
+ // If set, AMFI will error out early on unsigned code, before evaluation the normal policy.
+ int cs_debug_fail_on_unsigned_code = 0;
+ // If the previous mode is enabled, we count the resulting failures here.
+@@ -274,6 +291,16 @@
+ 	csflags = p->p_csflags;
+ 	proc_unlock(p);
+ 
++	if (cs_invalid_page_verbose < 0) {
++		uint32_t on = 0;
++
++		(void)PE_parse_boot_argn("csverbose", &on, sizeof(on));
++		cs_invalid_page_verbose = (int)on;
++	}
++	if (verbose && !retval && !send_kill && !cs_invalid_page_verbose) {
++		verbose = 0;
++	}
++
+ 	if (verbose) {
+ 		printf("CODE SIGNING: cs_invalid_page(0x%llx): "
+ 		    "p=%d[%s] final status 0x%x, %s page%s\n",
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -596,6 +596,27 @@
+ 	return (char *)kcdata_iter_payload(iter);
+ }
+ 
++/*
++ * Bring-up: whether every dying process says why.
++ *
++ * launchd already prints an exit reason, but only for pid 1, and only on
++ * the way to a panic. Everything else dies silently: the console shows
++ * "Process[1017] crashed: SpringBoard. Too many corpses being created.",
++ * which is the corpse allocator giving up rather than the reason the
++ * process died, and says nothing about why there were corpses to make.
++ *
++ * The reason is already attached to the process and already has a string
++ * description sitting in its kcdata; launchd_exit_reason_get_string_desc()
++ * pulls it out. Namespace 6 is dyld, whose codes name a missing dylib or a
++ * missing symbol and whose description names which one, and that is the
++ * difference between a daemon that cannot find a library and one that
++ * segfaults. One line per dying process, which on a boot that is working
++ * is nearly none.
++ *
++ * exittrace=0 turns it off.
++ */
++static int exit_trace = -1;
++
+ static __attribute__((noinline)) void
+ launchd_crashed_panic(proc_t p, int rv)
+ {
+@@ -938,6 +959,32 @@
+ 		/* NOTREACHED */
+ 	}
+ 
++	if (exit_trace < 0) {
++		uint32_t on = 1;
++
++		(void)PE_parse_boot_argn("exittrace", &on, sizeof(on));
++		exit_trace = (int)on;
++	}
++	if (exit_trace && (WTERMSIG(rv) != 0 || PROC_HAS_EXITREASON(p))) {
++		if (PROC_HAS_EXITREASON(p)) {
++			char *desc = launchd_exit_reason_get_string_desc(
++				p->p_exit_reason);
++
++			printf("exit: %s[%d] namespace %d code 0x%llx -- %s "
++			    "(signal %d, status %d)\n",
++			    p->p_comm, p->p_pid,
++			    p->p_exit_reason->osr_namespace,
++			    (unsigned long long)p->p_exit_reason->osr_code,
++			    desc ? desc : "no description",
++			    WTERMSIG(rv), WEXITSTATUS(rv));
++		} else {
++			printf("exit: %s[%d] no exit reason "
++			    "(signal %d, status %d)\n",
++			    p->p_comm, p->p_pid, WTERMSIG(rv),
++			    WEXITSTATUS(rv));
++		}
++	}
++
+ 	/*
+ 	 * Generate a corefile/crashlog if:
+ 	 *      The process doesn't have an exit reason that indicates no crash report should be created
