@@ -115,6 +115,25 @@ place for that to be wrong.
 GetID returns 1. CADisplay keeps whatever it gets and hands it back as the
 display it wants, so the value matters only in being non-zero and stable.
 The rest are accepted and dropped.
+
+And the boot after that named two more.
+
+The six above are answered and gone from the console. In their place:
+
+    IOMobileFramebuffer: unimplemented selector 33 (in 1, out 0 scalars)
+    IOMobileFramebuffer: unimplemented selector 74 (in 1 scalar, out 1 scalar/64 bytes)
+
+with backboardd back to SIGABRT, which is to say past the null pointer and
+asserting again somewhere further on.
+
+    33   kern_EnableDisableVideoPowerSavings   in 1
+    74   kern_SupportedFrameInfo               in 1, out 1 + 64 bytes
+
+33 is accepted and dropped. 74 is the first one whose answer is a structure
+rather than a number, and the layout of those 64 bytes is not known here, so
+none is invented: it answers none supported, with the structure zeroed, and
+logs the scalar that came in. If that turns out to be the wrong answer, the
+kind being asked about is the first thing worth knowing.
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
 @@ -111,3 +111,6 @@
@@ -155,7 +174,7 @@ The rest are accepted and dropped.
  
 --- /dev/null
 +++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,347 @@
 +/*
 + * IOMobileFramebufferShim.cpp -- enough of IOMobileFramebuffer that iOS
 + * believes this handset has a display.
@@ -219,14 +238,18 @@ The rest are accepted and dropped.
 + *     15   kern_SetDebugFlags      in 2, out 1
 + *     18   kern_IsMainDisplay      out 1
 + *     22   kern_SetDisplayDevice   in 1
++ *     33   kern_EnableDisableVideoPowerSavings   in 1
 + *     57   kern_GetColorRemapMode  out 1
++ *     74   kern_SupportedFrameInfo in 1, out 1 + 64 bytes
 + */
 +#define kIOMFBGetID             7
 +#define kIOMFBGetDisplaySize    8
 +#define kIOMFBSetDebugFlags     15
 +#define kIOMFBIsMainDisplay     18
 +#define kIOMFBSetDisplayDevice  22
++#define kIOMFBVideoPowerSavings 33
 +#define kIOMFBGetColorRemapMode 57
++#define kIOMFBSupportedFrameInfo 74
 +
 +/*
 + * The one display. CADisplay keeps whatever GetID returns and hands it back
@@ -441,6 +464,43 @@ The rest are accepted and dropped.
 +		/* There is one device and it is already selected. */
 +		arguments->scalarOutputCount = 0;
 +		return kIOReturnSuccess;
++
++	case kIOMFBVideoPowerSavings:
++		/* Nothing is saving power. Accepted and dropped. */
++		arguments->scalarOutputCount = 0;
++		return kIOReturnSuccess;
++
++	case kIOMFBSupportedFrameInfo: {
++		/*
++		 * kern_SupportedFrameInfo passes one scalar in and takes back
++		 * a count and 64 bytes:
++		 *
++		 *     IOConnectCallMethod(connect, 74, &kind, 1, NULL, 0,
++		 *                         &count, &one, info, &sixtyfour);
++		 *     *outCount = count;
++		 *
++		 * The layout of those 64 bytes is not known here, so none is
++		 * invented: the answer is none supported, with the structure
++		 * zeroed. The scalar that came in is logged, because if this
++		 * turns out to be the wrong answer then which kind was being
++		 * asked about is the first thing worth knowing.
++		 */
++		IOLog("IOMobileFramebuffer: SupportedFrameInfo kind %llu, "
++		    "answering none\n",
++		    (unsigned long long)(arguments->scalarInputCount >= 1 ?
++		    arguments->scalarInput[0] : 0));
++
++		if (arguments->scalarOutputCount >= 1) {
++			arguments->scalarOutput[0] = 0;
++			arguments->scalarOutputCount = 1;
++		}
++		if (arguments->structureOutput != NULL &&
++		    arguments->structureOutputSize > 0) {
++			bzero(arguments->structureOutput,
++			    arguments->structureOutputSize);
++		}
++		return kIOReturnSuccess;
++	}
 +
 +	default:
 +		break;
