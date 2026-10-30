@@ -80,6 +80,41 @@ its own is how they stay out of each other's way there.
 A line is logged on every successful open as well as at start, because
 start() prints before launchd exists and has scrolled away long before
 anything asks for a display.
+
+The first boot with it running named the next six things to do.
+
+backboardd found the service, opened the client, and asked for six selectors
+that were not there:
+
+    IOMobileFramebuffer: user client opened
+    IOMobileFramebuffer: unimplemented selector 57 (in 0, out 1 scalars)
+    IOMobileFramebuffer: unimplemented selector 7  (in 0, out 1 scalars)
+    IOMobileFramebuffer: unimplemented selector 15 (in 2, out 1 scalars)
+    IOMobileFramebuffer: unimplemented selector 22 (in 1, out 0 scalars)
+    IOMobileFramebuffer: unimplemented selector 8  (in 0, out 2 scalars)
+
+and then died of SIGSEGV instead of the SIGABRT it had been dying of, which
+is the assertion gone and a null pointer in its place.
+
+Each number was looked up by finding the IOConnectCallScalarMethod in
+IOMobileFramebuffer.framework that passes it:
+
+     7   kern_GetID              out 1
+     8   kern_GetDisplaySize     out 2
+    15   kern_SetDebugFlags      in 2, out 1
+    22   kern_SetDisplayDevice   in 1
+    57   kern_GetColorRemapMode  out 1
+
+GetDisplaySize returns width then height: kern_GetDisplaySize loads the two
+scalars together and runs ucvtf.2d over the pair, so what reaches the caller
+is a CGSize of two doubles in that order. The numbers come from
+PE_current_console() rather than from constants, because the shim already
+told the kernel what the panel is and there is no sense in having a second
+place for that to be wrong.
+
+GetID returns 1. CADisplay keeps whatever it gets and hands it back as the
+display it wants, so the value matters only in being non-zero and stable.
+The rest are accepted and dropped.
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
 @@ -111,3 +111,6 @@
@@ -120,7 +155,7 @@ anything asks for a display.
  
 --- /dev/null
 +++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,306 @@
 +/*
 + * IOMobileFramebufferShim.cpp -- enough of IOMobileFramebuffer that iOS
 + * believes this handset has a display.
@@ -171,9 +206,34 @@ anything asks for a display.
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOUserClient.h>
 +#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
 +
-+/* IsMainDisplay, from IOMobileFramebufferIsMainDisplay. */
++/*
++ * The selectors, named from the framework's own callers. Each was found by
++ * running with none of them implemented and reading the numbers the console
++ * printed back, then looking for the IOConnectCallScalarMethod that passes
++ * that number:
++ *
++ *      7   kern_GetID              out 1
++ *      8   kern_GetDisplaySize     out 2
++ *     15   kern_SetDebugFlags      in 2, out 1
++ *     18   kern_IsMainDisplay      out 1
++ *     22   kern_SetDisplayDevice   in 1
++ *     57   kern_GetColorRemapMode  out 1
++ */
++#define kIOMFBGetID             7
++#define kIOMFBGetDisplaySize    8
++#define kIOMFBSetDebugFlags     15
 +#define kIOMFBIsMainDisplay     18
++#define kIOMFBSetDisplayDevice  22
++#define kIOMFBGetColorRemapMode 57
++
++/*
++ * The one display. CADisplay keeps whatever GetID returns and hands it back
++ * to the window server as the display it wants, so the value matters only in
++ * that it is not zero and does not change.
++ */
++#define kIOMFBDisplayID         1
 +
 +class IOMobileFramebuffer : public IOService
 +{
@@ -220,8 +280,7 @@ anything asks for a display.
 +	 */
 +	registerService();
 +
-+	IOLog("IOMobileFramebuffer: registered (user client type 0, "
-+	    "selector %d answers is-main-display)\n", kIOMFBIsMainDisplay);
++	IOLog("IOMobileFramebuffer: registered\n");
 +	return true;
 +}
 +
@@ -309,18 +368,82 @@ anything asks for a display.
 +    IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch,
 +    OSObject *target, void *reference)
 +{
-+	if (selector == kIOMFBIsMainDisplay) {
-+		if (arguments == NULL || arguments->scalarOutputCount < 1) {
-+			return kIOReturnBadArgument;
-+		}
++	if (arguments == NULL) {
++		return kIOReturnBadArgument;
++	}
++
++	switch (selector) {
++	case kIOMFBIsMainDisplay:
 +		/*
 +		 * There is one display and this is it. The framework compares
 +		 * this against the 1 that GetMainDisplay asked for and keeps
 +		 * the first service that says yes.
 +		 */
++		if (arguments->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
 +		arguments->scalarOutput[0] = 1;
 +		arguments->scalarOutputCount = 1;
 +		return kIOReturnSuccess;
++
++	case kIOMFBGetID:
++		if (arguments->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		arguments->scalarOutput[0] = kIOMFBDisplayID;
++		arguments->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++
++	case kIOMFBGetDisplaySize: {
++		/*
++		 * Two scalars, width then height: kern_GetDisplaySize loads
++		 * both at once and runs ucvtf.2d over the pair, so what the
++		 * caller ends up with is a CGSize of two doubles in that
++		 * order.
++		 *
++		 * The numbers come from the console the shim set up rather
++		 * than from constants here. It is the same framebuffer either
++		 * way and there is no second place for them to disagree.
++		 */
++		PE_Video video;
++
++		if (arguments->scalarOutputCount < 2) {
++			return kIOReturnBadArgument;
++		}
++		if (PE_current_console(&video) != 0 ||
++		    video.v_width == 0 || video.v_height == 0) {
++			return kIOReturnNotReady;
++		}
++		arguments->scalarOutput[0] = video.v_width;
++		arguments->scalarOutput[1] = video.v_height;
++		arguments->scalarOutputCount = 2;
++		return kIOReturnSuccess;
++	}
++
++	case kIOMFBGetColorRemapMode:
++		/* Nothing is remapped. */
++		if (arguments->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		arguments->scalarOutput[0] = 0;
++		arguments->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++
++	case kIOMFBSetDebugFlags:
++		/* Accepted and dropped; the answer is the flags as they were. */
++		if (arguments->scalarOutputCount >= 1) {
++			arguments->scalarOutput[0] = 0;
++			arguments->scalarOutputCount = 1;
++		}
++		return kIOReturnSuccess;
++
++	case kIOMFBSetDisplayDevice:
++		/* There is one device and it is already selected. */
++		arguments->scalarOutputCount = 0;
++		return kIOReturnSuccess;
++
++	default:
++		break;
 +	}
 +
 +	/*
@@ -331,10 +454,10 @@ anything asks for a display.
 +	IOLog("IOMobileFramebuffer: unimplemented selector %u "
 +	    "(in %u scalars/%u bytes, out %u scalars/%u bytes)\n",
 +	    (unsigned)selector,
-+	    (unsigned)(arguments ? arguments->scalarInputCount : 0),
-+	    (unsigned)(arguments ? arguments->structureInputSize : 0),
-+	    (unsigned)(arguments ? arguments->scalarOutputCount : 0),
-+	    (unsigned)(arguments ? arguments->structureOutputSize : 0));
++	    (unsigned)arguments->scalarInputCount,
++	    (unsigned)arguments->structureInputSize,
++	    (unsigned)arguments->scalarOutputCount,
++	    (unsigned)arguments->structureOutputSize);
 +
 +	return super::externalMethod(selector, arguments, dispatch, target,
 +	           reference);
