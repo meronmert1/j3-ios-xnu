@@ -54,7 +54,7 @@ DTRACE_REF="${DTRACE_REF:-}"             # empty = newest tag
 BOOTSTRAP_CMDS_REF="${BOOTSTRAP_CMDS_REF:-}"
 AVAILABILITY_REF="${AVAILABILITY_REF:-}"
 LIBDISPATCH_REF="${LIBDISPATCH_REF:-libdispatch-1008.270.1}" # companion to xnu-4903.270.47
-LIBPLATFORM_REF="${LIBPLATFORM_REF:-libplatform-177}"
+LIBPLATFORM_REF="${LIBPLATFORM_REF:-libplatform-177.270.1}" # companion to xnu-4903.270.47
 LIBPTHREAD_REF="${LIBPTHREAD_REF:-libpthread-330.250.2}"   # 10.14.6 train, matches xnu-4903
 HFS_REF="${HFS_REF:-hfs-407.30.1}"                  # the 10.14 tag that still ships core/
 
@@ -368,6 +368,7 @@ build_deps() {
     # compilation; Apple writes its intended value in the unifdef flags.
     mkdir -p "$FAKEROOT/usr/local/lib/kernel"
     local ldd; ldd="$(fetch_oss libdispatch "$LIBDISPATCH_REF")" || exit 1
+    local lpf; lpf="$(fetch_oss libplatform "$LIBPLATFORM_REF")" || exit 1
     mkdir -p "$FAKEROOT/usr/local/include/kernel/os"
     cp "$ldd"/os/*.h "$FAKEROOT/usr/local/include/kernel/os/" 2>/dev/null
     # libdispatch wraps the whole header in #if OS_FIREHOSE_SPI; xnu includes
@@ -377,6 +378,7 @@ build_deps() {
     (cd "$WORK_DIR" && xcrun clang -arch arm64 -mkernel -nostdinc -Wno-packed \
         -Wall -DKERNEL=1 -DOS_FIREHOSE_SPI=1 -DDISPATCH_USE_DTRACE=0 \
         -I"$ldd" -I"$ldd/os" -I"$ldd/src/firehose" \
+        -I"$lpf/private/os" \
         -I"$FAKEROOT/System/Library/Frameworks/Kernel.framework/PrivateHeaders" \
         -I"$FAKEROOT/System/Library/Frameworks/Kernel.framework/Headers" \
         -I"$FAKEROOT/usr/local/include/firehose" \
