@@ -1,0 +1,61 @@
+Do not let the panic header's assertion eat the panic.
+
+A kernel that panics early now says only this, four times, and restarts:
+
+    pexpert/arm/pe_init.c:557 Assertion failed: location > (char *) panic_info
+
+That is PE_get_offset_into_panic_region() being handed debug_buf_base, from
+PE_init_panicheader(), on the panic path. On embedded debug_buf_base starts
+as NULL and is pointed into the panic region by debug_log_init(), which runs
+from machine_init() -- kernel_bootstrap() line 367, where oslog_init() is at
+line 304. Anything that panics in the sixty lines between the two arrives
+with the pointer still NULL, the assertion is true, and it fires.
+
+What it costs is the panic that was being reported. The assertion panics in
+its turn, nests, and the original message never reaches the console; the
+screen fills with four copies of a complaint about an uninitialised pointer
+and nothing about what went wrong. The last useful line before it was
+"oslog_init completed, 16 chunks, 8 io pages", and the next step was never
+named, which is all anyone could tell.
+
+So PE_init_panicheader() now returns when debug_buf_base is not yet inside
+the panic region. There is no header to write before the log has somewhere
+to live. The console path is separate and still prints, so the panic is
+reported as it would be at any other time; only the copy in VRAM is lost,
+and nothing on this handset was ever going to collect that.
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -567,6 +567,33 @@
+ 		return;
+ 	}
+ 
++	/*
++	 * Bring-up: and not before debug_log_init() has placed the log.
++	 *
++	 * debug_buf_base starts life NULL on embedded and is pointed into the
++	 * panic region by debug_log_init(), which runs from machine_init() --
++	 * line 367 of kernel_bootstrap(), while oslog_init() is at line 304.
++	 * Anything that panics in the sixty lines between the two arrives here
++	 * with debug_buf_base still NULL, and the assertion inside
++	 * PE_get_offset_into_panic_region() fires on it:
++	 *
++	 *     pe_init.c:557 Assertion failed: location > (char *) panic_info
++	 *
++	 * That is a true statement about an uninitialised pointer and a useless
++	 * thing to say, because it replaces the panic that was being reported
++	 * with one about the reporting, and then nests. The real message never
++	 * reaches the console.
++	 *
++	 * There is no header to write before the log has somewhere to live, so
++	 * there is nothing to do here but leave. The console path is separate
++	 * and still prints; only the copy in VRAM is lost, and iBoot is not
++	 * going to collect it from this handset anyway.
++	 */
++	if (debug_buf_base == NULL ||
++	    debug_buf_base <= (char *)panic_info) {
++		return;
++	}
++
+ 	bzero(panic_info, sizeof(struct embedded_panic_header));
+ 
+ 	/*
