@@ -1,0 +1,304 @@
+Give iOS a display to find.
+
+backboardd dies on every boot and takes SpringBoard with it:
+
+    Exception Type: EXC_CRASH (SIGABRT)
+    Application Specific Information: abort() called
+    ...
+    11  Foundation      0x1a7981898
+    12  backboardd      0x101002e3c
+    13  backboardd      0x100feca9c
+
+Those two frames are +0x1EE3C and +0x8A9C, and the first of them is this:
+
+    adr x5, ... ; @"No window server display found"
+    mov w4, #0x1a1
+    bl  -[NSAssertionHandler handleFailureInFunction:file:lineNumber:description:]
+
+-- backboarddaemon-195.65.1/megatrond/BKDisplay.m line 417, at the end of
+BKDisplayStartWindowServer(), which does
+
+    CADisplay *main = [CADisplay mainDisplay];
+    id dispId       = [main displayId];
+    id disp         = [server displayWithDisplayId:dispId];
+    if (disp == nil) <assert>
+
+SpringBoard is a bystander: FrontBoard throws because it cannot reach a
+backboardd that is not there.
+
++[CADisplay mainDisplay] goes through IOMobileFramebuffer.framework, and the
+framework wants very little. _IOMobileFramebufferGetDisplay reads:
+
+    IOServiceGetMatchingServices(port, IOServiceMatching("IOMobileFramebuffer"), &it);
+    while ((service = IOIteratorNext(it))) {
+            if (service is AppleWirelessDisplay or AppleADBE1) continue;
+            if (IOMobileFramebufferOpen(service, mach_task_self(), 0, &ref)) continue;
+            if (IOMobileFramebufferIsMainDisplay(ref, &isMain)) continue;
+            if (isMain == wanted) return ref;
+    }
+
+There is no property to match on and no score to beat: the first service of
+that class which is not the wireless display and which answers is the main
+display. IOMobileFramebufferOpen is IOServiceOpen with user client type 0,
+and IsMainDisplay is a single call:
+
+    IOConnectCallScalarMethod(connect, 18, NULL, 0, &out, &outCount);
+    isMain = (out == 1);
+
+So: a registered IOService of class IOMobileFramebuffer, a user client for
+type 0, and selector 18 answering one scalar. That is the whole of it, and
+that is the whole of this patch.
+
+It is started from gIOKernelConfigTables rather than by a call from
+anywhere, because that table is how a kernel with no kexts carries a
+personality, and IOPlatformExpertDevice is the provider everything else in
+it matches against too.
+
+What this is not: a framebuffer. Nothing here touches the pixels -- those
+belong to the shim's own console at 0x67000000 and still do. This is the
+smallest thing that can fail differently, which is the point. Every other
+selector returns kIOReturnUnsupported and logs its number, so whatever the
+framework reaches for next is named on the next boot instead of guessed at
+on this one.
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -111,3 +111,6 @@
+ iokit/Kernel/IOPerfControl.cpp		optional iokitcpp
+ 
+ iokit/bsddev/skywalk/IOSkywalkSupport.cpp		optional iokitcpp
++
++# Display
++iokit/Kernel/IOMobileFramebufferShim.cpp		optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -38,6 +38,16 @@
+     "     'IOClass'         = IOPanicPlatform;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+     "     'IOProbeScore'    = 0:32;"
++    "   },"
++    /*
++     * The display iOS insists on. See iokit/Kernel/IOMobileFramebufferShim.cpp
++     * for what it has to answer and why; this is how it gets started, since
++     * there is no kext here to carry a personality of its own.
++     */
++    "   {"
++    "     'IOClass'         = IOMobileFramebuffer;"
++    "     'IOProviderClass' = IOPlatformExpertDevice;"
++    "     'IOProbeScore'    = 1000:32;"
+     "   }"
+     ")";
+ 
+--- /dev/null
++++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
+@@ -0,0 +1,211 @@
++/*
++ * IOMobileFramebufferShim.cpp -- enough of IOMobileFramebuffer that iOS
++ * believes this handset has a display.
++ *
++ * backboardd dies on every boot with
++ *
++ *     Assertion failed: No window server display found
++ *     backboarddaemon-195.65.1/megatrond/BKDisplay.m:417
++ *
++ * from BKDisplayStartWindowServer(), and SpringBoard follows it down because
++ * FrontBoard cannot reach a backboardd that is not there. The assertion is
++ * the tail of this:
++ *
++ *     CADisplay *main = [CADisplay mainDisplay];
++ *     id dispId       = [main displayId];
++ *     id disp         = [server displayWithDisplayId:dispId];
++ *     if (disp == nil) <assert>
++ *
++ * and +[CADisplay mainDisplay] goes through IOMobileFramebuffer.framework,
++ * which does exactly three things that matter here. From
++ * _IOMobileFramebufferGetDisplay:
++ *
++ *     IOServiceGetMatchingServices(port, IOServiceMatching("IOMobileFramebuffer"), &it);
++ *     while ((service = IOIteratorNext(it))) {
++ *             if (service is AppleWirelessDisplay or AppleADBE1) continue;
++ *             if (IOMobileFramebufferOpen(service, mach_task_self(), 0, &ref)) continue;
++ *             if (IOMobileFramebufferIsMainDisplay(ref, &isMain)) continue;
++ *             if (isMain == wanted) return ref;
++ *     }
++ *
++ * IOMobileFramebufferOpen is IOServiceOpen with user client type 0, and
++ * IsMainDisplay is one call:
++ *
++ *     IOConnectCallScalarMethod(connect, 18, NULL, 0, &out, &outCount);
++ *     isMain = (out == 1);
++ *
++ * So the whole contract for being found is: a registered IOService of class
++ * IOMobileFramebuffer, a user client for type 0, and selector 18 answering
++ * one scalar. That is what this file is, and no more. There is no
++ * framebuffer behind it yet -- the pixels this kernel prints to are the ones
++ * the shim set up at boot and nothing here touches them.
++ *
++ * It is deliberately the smallest thing that can fail differently. Every
++ * other selector returns kIOReturnUnsupported, and what the framework asks
++ * for next is a question for the next boot rather than a guess made now.
++ */
++
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++
++/* IsMainDisplay, from IOMobileFramebufferIsMainDisplay. */
++#define kIOMFBIsMainDisplay     18
++
++class IOMobileFramebuffer : public IOService
++{
++	OSDeclareDefaultStructors(IOMobileFramebuffer);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID,
++	    UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++class IOMobileFramebufferUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
++
++	IOMobileFramebuffer      *fOwner;
++	task_t                    fTask;
++
++public:
++	virtual bool initWithTask(task_t owningTask, void *securityID,
++	    UInt32 type) APPLE_KEXT_OVERRIDE;
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector,
++	    IOExternalMethodArguments *arguments,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++#define super IOService
++OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
++
++bool
++IOMobileFramebuffer::start(IOService *provider)
++{
++	if (!super::start(provider)) {
++		return false;
++	}
++
++	/*
++	 * Matched from gIOKernelConfigTables against IOPlatformExpertDevice,
++	 * so there is no kext and no Info.plist; registerService() is what
++	 * puts it where IOServiceGetMatchingServices can find it.
++	 */
++	registerService();
++
++	IOLog("IOMobileFramebuffer: registered (user client type 0, "
++	    "selector %d answers is-main-display)\n", kIOMFBIsMainDisplay);
++	return true;
++}
++
++IOReturn
++IOMobileFramebuffer::newUserClient(task_t owningTask, void *securityID,
++    UInt32 type, IOUserClient **handler)
++{
++	IOMobileFramebufferUserClient *client;
++
++	/*
++	 * Type 0 is the only one the framework asks for. Anything else is
++	 * refused rather than quietly answered, so that a second kind of
++	 * client shows up as a refusal instead of as wrong behaviour.
++	 */
++	if (type != 0) {
++		IOLog("IOMobileFramebuffer: refusing user client type %u\n",
++		    (unsigned)type);
++		return kIOReturnBadArgument;
++	}
++
++	client = OSTypeAlloc(IOMobileFramebufferUserClient);
++	if (client == NULL) {
++		return kIOReturnNoMemory;
++	}
++
++	if (!client->initWithTask(owningTask, securityID, type)) {
++		client->release();
++		return kIOReturnBadArgument;
++	}
++
++	if (!client->attach(this) || !client->start(this)) {
++		client->detach(this);
++		client->release();
++		return kIOReturnNotAttached;
++	}
++
++	*handler = client;
++	return kIOReturnSuccess;
++}
++
++#undef super
++#define super IOUserClient
++OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
++
++bool
++IOMobileFramebufferUserClient::initWithTask(task_t owningTask,
++    void *securityID, UInt32 type)
++{
++	if (!super::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fOwner = NULL;
++	return true;
++}
++
++bool
++IOMobileFramebufferUserClient::start(IOService *provider)
++{
++	fOwner = OSDynamicCast(IOMobileFramebuffer, provider);
++	if (fOwner == NULL) {
++		return false;
++	}
++	return super::start(provider);
++}
++
++IOReturn
++IOMobileFramebufferUserClient::clientClose(void)
++{
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOMobileFramebufferUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch,
++    OSObject *target, void *reference)
++{
++	if (selector == kIOMFBIsMainDisplay) {
++		if (arguments == NULL || arguments->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		/*
++		 * There is one display and this is it. The framework compares
++		 * this against the 1 that GetMainDisplay asked for and keeps
++		 * the first service that says yes.
++		 */
++		arguments->scalarOutput[0] = 1;
++		arguments->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++	}
++
++	/*
++	 * Everything else, loudly. The next thing the framework wants is
++	 * worth knowing by number rather than guessing at in advance, and a
++	 * line per unimplemented selector is how it gets named.
++	 */
++	IOLog("IOMobileFramebuffer: unimplemented selector %u "
++	    "(in %u scalars/%u bytes, out %u scalars/%u bytes)\n",
++	    (unsigned)selector,
++	    (unsigned)(arguments ? arguments->scalarInputCount : 0),
++	    (unsigned)(arguments ? arguments->structureInputSize : 0),
++	    (unsigned)(arguments ? arguments->scalarOutputCount : 0),
++	    (unsigned)(arguments ? arguments->structureOutputSize : 0));
++
++	return super::externalMethod(selector, arguments, dispatch, target,
++	           reference);
++}
