@@ -33,6 +33,46 @@ thing that was asked for happened.
 Only that case goes quiet. A page that is denied, and one that comes with a
 SIGKILL, still print: those are refusals, and a refusal says something that
 was not already known. csverbose=1 brings the rest back.
+
+And then the line that says a process died of a signal turned out not to be
+enough, because the thing it does not say is where.
+
+backboardd aborts on every boot. What it aborts on is in its crash report,
+and on this handset there is no crash report to read. The kernel allows five
+corpses in flight; backboardd and SpringBoard are both in a crash loop and
+keep all five; ReportCrash only ever sees a corpse, so it writes nothing.
+The reports that do exist on the data partition are all from one quiet boot
+hours earlier, and every one of them is the same assertion -- which is
+exactly the question, since the whole point is to find out whether it is
+still that one.
+
+The backtrace needs none of that machinery. The thread that took the signal
+is still here and its user state is saved where the kernel can read it, so:
+
+    regs = find_user_regs(current_thread());
+    pc = get_saved_state_pc(regs); lr = get_saved_state_lr(regs);
+    for (fp = get_saved_state_fp(regs); fp; fp = frame[0])
+            copyin(fp, frame, 16), print frame[1];
+
+On arm64 a frame is two words -- [fp] the next frame, [fp + 8] the return
+address -- and copyin fails safely on a bad one, so a corrupt stack ends the
+walk rather than the kernel. The chain is required to climb, which ends a
+loop. Twelve frames, one line, printed while it happens:
+
+    crash: backboardd[329] sig 6 pc 0x... lr 0x... bt 0x... 0x... 0x...
+
+These are addresses, not symbols: nothing in the kernel knows where the
+binary was loaded. That is enough to work with, because the distance between
+two frames inside one binary survives the slide. The assertion that has been
+killing backboardd since the first boot puts its two frames 0x163A0 apart,
+in every report of it, whatever the slide was that day. If the next boot
+prints two backboardd frames that are still 0x163A0 apart, nothing has
+moved; if it prints anything else, it has, and the new numbers say where to
+look.
+
+exitbt=0 turns it off. exitbtname=backboardd narrows it to one process,
+which on a console with no scrollback and four daemons crash-looping is the
+difference between reading the line and watching it go past.
 --- a/bsd/kern/kern_cs.c
 +++ b/bsd/kern/kern_cs.c
 @@ -79,6 +79,23 @@
@@ -78,7 +118,16 @@ was not already known. csverbose=1 brings the rest back.
  		    "p=%d[%s] final status 0x%x, %s page%s\n",
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -596,6 +596,27 @@
+@@ -115,6 +115,8 @@
+ #include <mach/mach_types.h>
+ #include <mach/task.h>
+ #include <mach/thread_act.h>
++#include <mach/thread_status.h>    /* saved user state, for exitbt */
++#include <string.h>                /* strncmp, for exitbtname */
+ 
+ #include <kern/exc_resource.h>
+ #include <kern/kern_types.h>
+@@ -596,6 +598,131 @@
  	return (char *)kcdata_iter_payload(iter);
  }
  
@@ -103,10 +152,114 @@ was not already known. csverbose=1 brings the rest back.
 + */
 +static int exit_trace = -1;
 +
++/*
++ * exitbt: the dying process's own backtrace, on the console.
++ *
++ * The line above says a process died of a signal and no more. What it died
++ * of is in its crash report, and on a handset that is losing backboardd and
++ * SpringBoard in a loop there is no crash report to read: the kernel allows
++ * five corpses in flight, the loop keeps all five, ReportCrash only ever
++ * sees a corpse, and so it writes nothing. The reports that do survive are
++ * from whichever boot was quiet enough, which is never the one being
++ * debugged.
++ *
++ * The backtrace does not need any of that. The thread that took the signal
++ * is still here, its user state is saved where the kernel can read it, and
++ * on arm64 the frame chain is two words per frame -- [fp] is the next frame
++ * and [fp + 8] the return address. Walking it with copyin, which fails
++ * safely on a bad address, gives the same list of addresses that a crash
++ * report prints as "Last Exception Backtrace", one line, while it happens.
++ *
++ * It is the addresses and not the symbols: nothing here knows where the
++ * binary was loaded. That is enough to work with, because the distance
++ * between two frames in the same binary survives the slide -- the two
++ * backboardd frames of one assertion sit 0x163A0 apart in every report of
++ * it, whatever the slide was that boot.
++ *
++ * exitbt=0 turns it off. exitbtname=backboardd narrows it to one process,
++ * which on a console with no scrollback is the difference between reading
++ * the line and watching it go past.
++ */
++static int exit_bt = -1;
++static char exit_bt_name[32];
++
++#if defined(__arm64__)
++
++#define EXIT_BT_FRAMES  12
++
++extern arm_saved_state_t *find_user_regs(thread_t);
++
++static void
++exit_user_backtrace(proc_t p, int sig)
++{
++	arm_saved_state_t *regs;
++	user_addr_t fp, next;
++	uint64_t frame[2];
++	char line[256];
++	size_t off;
++	int i, wrote;
++
++	regs = find_user_regs(current_thread());
++	if (regs == NULL) {
++		return;
++	}
++
++	wrote = snprintf(line, sizeof(line),
++	    "crash: %s[%d] sig %d pc 0x%llx lr 0x%llx bt",
++	    p->p_comm, p->p_pid, sig,
++	    (unsigned long long)get_saved_state_pc(regs),
++	    (unsigned long long)get_saved_state_lr(regs));
++	if (wrote < 0 || (size_t)wrote >= sizeof(line)) {
++		return;
++	}
++	off = (size_t)wrote;
++
++	fp = (user_addr_t)get_saved_state_fp(regs);
++	for (i = 0; i < EXIT_BT_FRAMES; i++) {
++		if (fp == 0 || (fp & 7) != 0) {
++			break;
++		}
++		if (copyin(fp, (char *)frame, sizeof(frame)) != 0) {
++			break;
++		}
++		if (frame[1] == 0) {
++			break;
++		}
++		wrote = snprintf(line + off, sizeof(line) - off, " 0x%llx",
++		    (unsigned long long)frame[1]);
++		if (wrote < 0 || (size_t)wrote >= sizeof(line) - off) {
++			break;
++		}
++		off += (size_t)wrote;
++
++		/*
++		 * The chain has to climb. A frame pointer that does not is a
++		 * loop or a corrupt stack, and either way there is nothing
++		 * further up worth printing.
++		 */
++		next = (user_addr_t)frame[0];
++		if (next <= fp) {
++			break;
++		}
++		fp = next;
++	}
++
++	printf("%s\n", line);
++}
++
++#else  /* !__arm64__ */
++
++static void
++exit_user_backtrace(__unused proc_t p, __unused int sig)
++{
++}
++
++#endif /* __arm64__ */
++
  static __attribute__((noinline)) void
  launchd_crashed_panic(proc_t p, int rv)
  {
-@@ -938,6 +959,32 @@
+@@ -938,6 +1065,46 @@
  		/* NOTREACHED */
  	}
  
@@ -115,6 +268,15 @@ was not already known. csverbose=1 brings the rest back.
 +
 +		(void)PE_parse_boot_argn("exittrace", &on, sizeof(on));
 +		exit_trace = (int)on;
++	}
++	if (exit_bt < 0) {
++		uint32_t on = 1;
++
++		(void)PE_parse_boot_argn("exitbt", &on, sizeof(on));
++		exit_bt = (int)on;
++		exit_bt_name[0] = '\0';
++		(void)PE_parse_boot_argn("exitbtname", exit_bt_name,
++		    sizeof(exit_bt_name));
 +	}
 +	if (exit_trace && (WTERMSIG(rv) != 0 || PROC_HAS_EXITREASON(p))) {
 +		if (PROC_HAS_EXITREASON(p)) {
@@ -134,6 +296,11 @@ was not already known. csverbose=1 brings the rest back.
 +			    p->p_comm, p->p_pid, WTERMSIG(rv),
 +			    WEXITSTATUS(rv));
 +		}
++	}
++	if (exit_bt && WTERMSIG(rv) != 0 &&
++	    (exit_bt_name[0] == '\0' ||
++	    strncmp(p->p_comm, exit_bt_name, sizeof(exit_bt_name)) == 0)) {
++		exit_user_backtrace(p, WTERMSIG(rv));
 +	}
 +
  	/*
