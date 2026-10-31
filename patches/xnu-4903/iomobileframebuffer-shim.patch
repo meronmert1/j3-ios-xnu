@@ -315,6 +315,36 @@ with releaseNotificationPort, as IOUserClient.h requires, on replacement and
 in free(). Nothing is sent yet. This is the remembering, not the telling.
 
 iomfbnotify=0 puts both refusals back.
+
+Both were accepted, and the next boot named the next one:
+
+    IOMobileFramebuffer: [426] selector 74 in 1{0}/0b out 1->1{1}/64b ret 0x0
+    IOMobileFramebuffer: [426] registerNotificationPort type 3 refCon 0 ret 0x0
+    IOMobileFramebuffer: [426] notifications on for type 3
+    IOMobileFramebuffer: [426] selector 72 in 4{8048945764,4383430656,3,0}/0b ret 0x0
+    IOMobileFramebuffer: [426] unimplemented selector 73
+    IOMobileFramebuffer: [426] selector 73 in 2{3,0}/0b out 0->0{}/0b ret 0xe00002c7
+
+73 is kern_ChangeFrameInfo(ref, mask), which sends { 3, mask }: the 3 is the
+frame-info notification type, hard coded in the framework, and the mask says
+which fields to collect. QuartzCore builds that mask from the names it
+recognised, it recognises none of the one this driver advertises, and so the
+mask is 0. There is nothing to turn on and nothing to answer with.
+
+That is three in a row -- 74 uncovered 72, 72 uncovered 73 -- each costing a
+build, a flash and a boot, and each the same kind of call: a setter, with no
+scalars and no structure asked for in return. A selector like that cannot be
+a question. It is the caller changing something, and the only two answers
+are "done" and "this driver is broken". Refusing says the second, and that
+is the wrong one, because there is no hardware here to configure and the
+caller has nothing to do differently.
+
+So the rest of that kind are answered without being named first: an unknown
+selector that asks for nothing back is accepted and dropped. One that does
+want something back is still refused, which is the honest answer there --
+inventing a zero width or a zero surface for a caller that asked for one is
+a wrong answer that travels, while a refusal stops where it happens and
+prints its own number. iomfbaccept=0 goes back to refusing both.
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
 @@ -111,3 +111,6 @@
@@ -355,7 +385,7 @@ iomfbnotify=0 puts both refusals back.
  
 --- /dev/null
 +++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
-@@ -0,0 +1,846 @@
+@@ -0,0 +1,904 @@
 +/*
 + * IOMobileFramebufferShim.cpp -- enough of IOMobileFramebuffer that iOS
 + * believes this handset has a display.
@@ -512,6 +542,7 @@ iomfbnotify=0 puts both refusals back.
 +#define kIOMFBVideoPowerSavings 33
 +#define kIOMFBGetColorRemapMode 57
 +#define kIOMFBNotifications     72
++#define kIOMFBChangeFrameInfo   73
 +#define kIOMFBSupportedFrameInfo 74
 +
 +/*
@@ -546,6 +577,14 @@ iomfbnotify=0 puts both refusals back.
 + * which is what this driver did before.
 + */
 +static int iomfb_notify = 1;
++
++/*
++ * Boot-arg iomfbaccept, on unless it is turned off. It decides what happens
++ * to a selector this file does not name: on, one that asks for nothing back
++ * is accepted and dropped; off, every unnamed selector is refused the way
++ * they all used to be.
++ */
++static int iomfb_accept = 1;
 +
 +/*
 + * The single frame-info field SupportedFrameInfo advertises, and the reason
@@ -699,6 +738,10 @@ iomfbnotify=0 puts both refusals back.
 +	if (PE_parse_boot_argn("iomfbnotify", &on, sizeof(on))) {
 +		iomfb_notify = (int)on;
 +	}
++	on = 1;
++	if (PE_parse_boot_argn("iomfbaccept", &on, sizeof(on))) {
++		iomfb_accept = (int)on;
++	}
 +
 +	/*
 +	 * Matched from gIOKernelConfigTables against IOResources, so there is
@@ -708,10 +751,11 @@ iomfbnotify=0 puts both refusals back.
 +	registerService();
 +
 +	IOLog("IOMobileFramebuffer: registered (trace %s, frame info %s, "
-+	    "notifications %s)\n",
++	    "notifications %s, setters %s)\n",
 +	    iomfb_trace ? "on" : "off",
 +	    iomfb_frameinfo ? "one field" : "none",
-+	    iomfb_notify ? "accepted" : "refused");
++	    iomfb_notify ? "accepted" : "refused",
++	    iomfb_accept ? "accepted" : "refused");
 +	return true;
 +}
 +
@@ -1103,6 +1147,21 @@ iomfbnotify=0 puts both refusals back.
 +		return kIOReturnSuccess;
 +	}
 +
++	case kIOMFBChangeFrameInfo:
++		/*
++		 * kern_ChangeFrameInfo(ref, mask) sends { 3, mask }: the 3 is
++		 * the frame-info notification type, hard coded in the
++		 * framework, and the mask says which of the fields the caller
++		 * wants collected. QuartzCore builds that mask out of the
++		 * names it recognised in the list SupportedFrameInfo returned,
++		 * and it recognises none of ours, so the mask is 0 and there
++		 * is nothing here to turn on.
++		 *
++		 * Accepted and dropped, like the other setters.
++		 */
++		arguments->scalarOutputCount = 0;
++		return kIOReturnSuccess;
++
 +	case kIOMFBSupportedFrameInfo: {
 +		/*
 +		 * One field, named so that nothing matches it -- and the whole
@@ -1193,9 +1252,38 @@ iomfbnotify=0 puts both refusals back.
 +	}
 +
 +	/*
-+	 * Everything else, loudly and by number. The trace line above carries
-+	 * the shape of the call; this one is the word to look for.
++	 * Everything else is decided by its shape rather than by its number.
++	 *
++	 * A selector that asks for nothing back -- no scalars, no structure --
++	 * cannot be a question. It is the caller setting something, and the
++	 * only two answers available are "done" and "this driver is broken".
++	 * Refusing is the second one, and it is the wrong one: there is no
++	 * hardware here to configure, so the setting is already as true as it
++	 * will ever be, and the caller has nothing to do differently.
++	 *
++	 * This was learned one boot at a time. Selector 74 was answered,
++	 * which uncovered 72; 72 was answered, which uncovered 73; and 73 is
++	 * kern_ChangeFrameInfo turning on frame-info fields that do not
++	 * exist. All three are the same kind of call, and each cost a build,
++	 * a flash and a boot to find. The rest of that kind are answered here
++	 * without being named first.
++	 *
++	 * A selector that does want something back is a different matter and
++	 * still gets a refusal. Inventing a number for a caller that asked
++	 * for one is worse than failing in front of it: a zero width, a zero
++	 * surface or a zero timestamp is a wrong answer that travels, while a
++	 * refusal stops where it happens and prints its own number.
++	 *
++	 * iomfbaccept=0 goes back to refusing both kinds.
 +	 */
++	if (iomfb_accept && arguments->scalarOutputCount == 0 &&
++	    arguments->structureOutputSize == 0) {
++		IOLog("IOMobileFramebuffer: [%u] selector %u accepted and "
++		    "dropped (nothing asked for)\n",
++		    (unsigned)fSerial, (unsigned)selector);
++		return kIOReturnSuccess;
++	}
++
 +	IOLog("IOMobileFramebuffer: [%u] unimplemented selector %u\n",
 +	    (unsigned)fSerial, (unsigned)selector);
 +
