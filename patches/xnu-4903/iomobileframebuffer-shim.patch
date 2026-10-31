@@ -274,6 +274,47 @@ passes over the rest in silence. One unrecognised name gets the list past
 the test without claiming a field this driver has no value to put in.
 iomfbframeinfo=0 puts the old answer back, so the two can be compared from
 the command line rather than from a second build.
+
+That got past it, and the trace moved one link on:
+
+    IOMobileFramebuffer: [20] selector 74 in 1{0}/0b out 1->1{1}/64b ret 0x0
+    IOMobileFramebuffer: [20] registerNotificationPort type 3 refCon 0 ret 0xe00002c7
+    IOMobileFramebuffer: [20] unimplemented selector 72
+    IOMobileFramebuffer: [20] getTargetAndMethodForIndex 72
+    IOMobileFramebuffer: [20] selector 72 in 4{7715023460,4311005440,3,0}/0b out 0->0{}/0b ret 0xe00002c7
+
+Type 3 is what settles which branch ran. The frame-info path asks for the
+run loop source of type 3; the vsync path, which sits after the jump that
+used to be taken, asks for type 5. So this is the branch that had been
+skipped, now taken, and everything in it ran: GetRunLoopSource returned a
+source -- _kern_GetRunLoopSource builds it from IONotificationPortCreate and
+never looks at what IOConnectSetNotificationPort returned -- then
+add_runloop_source started the IOMFBServer's thread, then FrameInfo asked
+for notifications and was told no.
+
+Being told no there is survivable too: QuartzCore turns a failed FrameInfo
+into one cleared flag bit. But these two are now the only answers in this
+conversation that are refusals, and a driver that keeps neither the port nor
+the callback can never send a notification, which is the next thing that has
+to work at all. So both are accepted and remembered.
+
+Selector 72 is two framework calls wearing one number, told apart by the
+first scalar:
+
+    kern_EnableNotifications(ref, type, cb, ctx)
+        { trampoline[type], ref, type, 0 }
+    kern_DisableNotifications(ref, type)
+        { 0,                0,   type, 0 }
+
+The first two scalars are a function and a context in the caller's address
+space; they are what goes into the mach message a real driver sends to the
+port registered for that type, where IONotificationPort's dispatcher calls
+the one with the other. The port arrives through registerNotificationPort,
+which IOUserClient refuses by default and which this now keeps -- balanced
+with releaseNotificationPort, as IOUserClient.h requires, on replacement and
+in free(). Nothing is sent yet. This is the remembering, not the telling.
+
+iomfbnotify=0 puts both refusals back.
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
 @@ -111,3 +111,6 @@
@@ -314,7 +355,7 @@ the command line rather than from a second build.
  
 --- /dev/null
 +++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
-@@ -0,0 +1,695 @@
+@@ -0,0 +1,846 @@
 +/*
 + * IOMobileFramebufferShim.cpp -- enough of IOMobileFramebuffer that iOS
 + * believes this handset has a display.
@@ -416,8 +457,29 @@ the command line rather than from a second build.
 + * externalMethod below for why: the branch it skipped is the one that
 + * starts the IOMFBServer's thread.
 + *
-+ * Boot with iomfbtrace=0 for none of the chatter and iomfbframeinfo=0 for
-+ * the old answer to 74.
++ * Answering 74 with one field moved it on, and the trace then read:
++ *
++ *     [20] selector 74 in 1{0}/0b out 1->1{1}/64b ret 0x0
++ *     [20] registerNotificationPort type 3 refCon 0 ret 0xe00002c7
++ *     [20] unimplemented selector 72
++ *     [20] selector 72 in 4{7715023460,4311005440,3,0}/0b ret 0xe00002c7
++ *
++ * Type 3 is what settles it. The frame-info branch asks for the run loop
++ * source of type 3 and the vsync one asks for type 5, so this is the branch
++ * that had been skipped, now taken -- which means GetRunLoopSource returned
++ * a source, add_runloop_source ran, and the server's thread started. It
++ * also means the refusals are not fatal on their own: _kern_GetRunLoopSource
++ * never looks at what IOConnectSetNotificationPort returned, and QuartzCore
++ * turns a failed FrameInfo into one cleared flag bit.
++ *
++ * They are still the only two things in this conversation that are answered
++ * with no, and a driver that keeps neither the port nor the callback can
++ * never send a notification, which is the next thing that has to work. So
++ * both are now accepted and remembered -- see registerNotificationPort and
++ * selector 72 below. Nothing is sent yet.
++ *
++ * Boot with iomfbtrace=0 for none of the chatter, iomfbframeinfo=0 for the
++ * old answer to 74, and iomfbnotify=0 to refuse notifications again.
 + */
 +
 +#include <IOKit/IOService.h>
@@ -449,7 +511,15 @@ the command line rather than from a second build.
 +#define kIOMFBSetDisplayDevice  22
 +#define kIOMFBVideoPowerSavings 33
 +#define kIOMFBGetColorRemapMode 57
++#define kIOMFBNotifications     72
 +#define kIOMFBSupportedFrameInfo 74
++
++/*
++ * Notification types, as the framework numbers them. 3 is frame info and 5
++ * is vsync; the rest are not used by anything seen so far. Eight is room
++ * for all of them and a bounds check that cannot be argued with.
++ */
++#define kIOMFBNotifyTypes       8
 +
 +/*
 + * The one display. This is what GetID answers. It is not the number the
@@ -469,6 +539,13 @@ the command line rather than from a second build.
 + * two can be compared from the command line rather than from the build.
 + */
 +static int iomfb_frameinfo = 1;
++
++/*
++ * Boot-arg iomfbnotify, on unless it is turned off. Off refuses the
++ * notification port and selector 72 the way IOUserClient does by default,
++ * which is what this driver did before.
++ */
++static int iomfb_notify = 1;
 +
 +/*
 + * The single frame-info field SupportedFrameInfo advertises, and the reason
@@ -505,6 +582,19 @@ the command line rather than from a second build.
 +	task_t                    fTask;
 +	uint32_t                  fSerial;
 +
++	/*
++	 * What the framework asks us to remember about notifications. The port
++	 * is ours once registerNotificationPort has returned success and has
++	 * to be balanced with releaseNotificationPort; the callback and the
++	 * context are the two values selector 72 hands over, which a real
++	 * driver puts in the mach message it sends when the event happens.
++	 * Nothing is sent yet -- this is the remembering, not the telling.
++	 */
++	mach_port_t               fNotifyPort[kIOMFBNotifyTypes];
++	io_user_reference_t       fNotifyRefCon[kIOMFBNotifyTypes];
++	uint64_t                  fNotifyCallback[kIOMFBNotifyTypes];
++	uint64_t                  fNotifyContext[kIOMFBNotifyTypes];
++
 +	IOReturn handleMethod(uint32_t selector,
 +	    IOExternalMethodArguments *arguments,
 +	    IOExternalMethodDispatch *dispatch, OSObject *target,
@@ -514,6 +604,7 @@ the command line rather than from a second build.
 +	virtual bool initWithTask(task_t owningTask, void *securityID,
 +	    UInt32 type) APPLE_KEXT_OVERRIDE;
 +	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn clientDied(void) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn externalMethod(uint32_t selector,
@@ -604,6 +695,10 @@ the command line rather than from a second build.
 +	if (PE_parse_boot_argn("iomfbframeinfo", &on, sizeof(on))) {
 +		iomfb_frameinfo = (int)on;
 +	}
++	on = 1;
++	if (PE_parse_boot_argn("iomfbnotify", &on, sizeof(on))) {
++		iomfb_notify = (int)on;
++	}
 +
 +	/*
 +	 * Matched from gIOKernelConfigTables against IOResources, so there is
@@ -612,9 +707,11 @@ the command line rather than from a second build.
 +	 */
 +	registerService();
 +
-+	IOLog("IOMobileFramebuffer: registered (trace %s, frame info %s)\n",
++	IOLog("IOMobileFramebuffer: registered (trace %s, frame info %s, "
++	    "notifications %s)\n",
 +	    iomfb_trace ? "on" : "off",
-+	    iomfb_frameinfo ? "one field" : "none");
++	    iomfb_frameinfo ? "one field" : "none",
++	    iomfb_notify ? "accepted" : "refused");
 +	return true;
 +}
 +
@@ -668,6 +765,10 @@ the command line rather than from a second build.
 +	}
 +	fTask = owningTask;
 +	fOwner = NULL;
++	bzero(fNotifyPort, sizeof(fNotifyPort));
++	bzero(fNotifyRefCon, sizeof(fNotifyRefCon));
++	bzero(fNotifyCallback, sizeof(fNotifyCallback));
++	bzero(fNotifyContext, sizeof(fNotifyContext));
 +
 +	/*
 +	 * Numbered from one on the way in rather than on the way out, so that
@@ -720,12 +821,53 @@ the command line rather than from a second build.
 +IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port,
 +    UInt32 type, UInt32 refCon)
 +{
-+	IOReturn ret = super::registerNotificationPort(port, type, refCon);
++	IOReturn ret;
++
++	/*
++	 * Accepted and kept, where IOUserClient refuses by default.
++	 *
++	 * _kern_GetRunLoopSource makes an IONotificationPort, hands its mach
++	 * port here, and then hands the run loop source back to QuartzCore.
++	 * It does not look at what this returns -- so refusing did not stop it
++	 * on its own -- but the pair of refusals, this one and selector 72,
++	 * is the whole of what the framework was told about notifications,
++	 * and a driver that keeps neither can never send one.
++	 *
++	 * The port is a reference, and the contract in IOUserClient.h is that
++	 * every registerNotificationPort is balanced by a releaseNotificationPort.
++	 * So the previous port for this type goes back before the new one is
++	 * kept, and free() returns the rest. On a refusal nothing is released:
++	 * MIG disposes of the right itself when the routine fails.
++	 */
++	if (!iomfb_notify || type >= kIOMFBNotifyTypes) {
++		ret = kIOReturnUnsupported;
++	} else {
++		if (fNotifyPort[type] != MACH_PORT_NULL) {
++			releaseNotificationPort(fNotifyPort[type]);
++		}
++		fNotifyPort[type] = port;
++		fNotifyRefCon[type] = refCon;
++		ret = kIOReturnSuccess;
++	}
 +
 +	IOLog("IOMobileFramebuffer: [%u] registerNotificationPort type %u "
 +	    "refCon %u ret 0x%x\n", (unsigned)fSerial, (unsigned)type,
 +	    (unsigned)refCon, ret);
 +	return ret;
++}
++
++void
++IOMobileFramebufferUserClient::free(void)
++{
++	uint32_t i;
++
++	for (i = 0; i < kIOMFBNotifyTypes; i++) {
++		if (fNotifyPort[i] != MACH_PORT_NULL) {
++			releaseNotificationPort(fNotifyPort[i]);
++			fNotifyPort[i] = MACH_PORT_NULL;
++		}
++	}
++	super::free();
 +}
 +
 +IOReturn
@@ -910,6 +1052,56 @@ the command line rather than from a second build.
 +		/* Nothing is saving power. Accepted and dropped. */
 +		arguments->scalarOutputCount = 0;
 +		return kIOReturnSuccess;
++
++	case kIOMFBNotifications: {
++		/*
++		 * kern_EnableNotifications and kern_DisableNotifications are
++		 * the same selector, told apart by the first scalar:
++		 *
++		 *     enable(ref, type, cb, ctx):
++		 *         { trampoline[type], ref, type, 0 }
++		 *     disable(ref, type):
++		 *         { 0,                0,   type, 0 }
++		 *
++		 * The first two are a function and a context in the caller's
++		 * address space. They are not called from here -- they are what
++		 * goes into the mach message a real driver sends to the port
++		 * registered for that type, where IONotificationPort's
++		 * dispatcher calls the one with the other.
++		 *
++		 * Nothing sends those messages yet, so what this does is agree
++		 * and remember. The agreeing is the part that matters today:
++		 * the framework asked twice about notifications and was
++		 * refused twice, and a refusal is not an answer a driver with
++		 * a display is supposed to give.
++		 */
++		uint64_t type;
++
++		if (arguments->scalarInputCount < 3) {
++			return kIOReturnBadArgument;
++		}
++		type = arguments->scalarInput[2];
++		if (type >= kIOMFBNotifyTypes) {
++			IOLog("IOMobileFramebuffer: [%u] notifications for "
++			    "unknown type %llu\n", (unsigned)fSerial,
++			    (unsigned long long)type);
++			return kIOReturnBadArgument;
++		}
++		if (!iomfb_notify) {
++			return kIOReturnUnsupported;
++		}
++
++		fNotifyCallback[type] = arguments->scalarInput[0];
++		fNotifyContext[type] = arguments->scalarInput[1];
++
++		IOLog("IOMobileFramebuffer: [%u] notifications %s for type "
++		    "%llu\n", (unsigned)fSerial,
++		    fNotifyCallback[type] ? "on" : "off",
++		    (unsigned long long)type);
++
++		arguments->scalarOutputCount = 0;
++		return kIOReturnSuccess;
++	}
 +
 +	case kIOMFBSupportedFrameInfo: {
 +		/*
