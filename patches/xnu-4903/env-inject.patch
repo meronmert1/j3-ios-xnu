@@ -1,0 +1,184 @@
+Give a process an environment variable it was not started with.
+
+backboardd has aborted on every boot since the first one, always at the same
+two addresses, and what it aborts on is inside QuartzCore. Everything the
+kernel can see has been made to work: the IOMobileFramebuffer driver now
+answers every selector the framework asks for, the notification port and
+selectors 72 and 73 included, and the trace has no refusals left in it. The
+assertion did not move. So the next thing to read is QuartzCore's own
+account of what it did, and QuartzCore keeps one.
+
+x_log_init reads QUARTZCORE_LOG_FILE, or X_LOG_FILE, and when either names a
+file it installs the hook that x_log_hook_p tests. That hook is what decides
+whether CA::Render::Server::register_name prints
+
+    unable to register bootstrap port com.apple.CARenderServer: %x
+
+to somewhere readable or quietly to os_log, and that one line is the
+difference between the display list being empty because nothing answered the
+mach call and being empty for some other reason.
+
+The file can be /dev/console. devfs creates it mode 0622 -- writable by
+anyone, which includes the mobile user backboardd runs as -- so the log
+arrives on the same screen as the kernel's own printf, with no disk, no
+crash report, and no trip through recovery to fetch it.
+
+What was in the way is that a launchd job's environment comes from its
+plist, and this plist is inside a 5632 MiB root image. Rewriting the image
+for one line, and reflashing it, is not a thing to do twice. The environment
+is assembled in the kernel anyway -- exec_extract_strings copies argv and
+then envv into the new process's strings and counts them -- so one more
+string goes in there, with the same accounting the loop above it uses: the
+string into ip_strings, one pointer's worth off ip_argspace, one more envc.
+That costs a boot image, which is the cheap one.
+
+It is not specific to QuartzCore, which is the point of putting it here
+rather than hard-coding the variable. DYLD_PRINT_LIBRARIES on a daemon that
+dies before main, OBJC_PRINT_EXCEPTIONS on one that throws, anything else a
+dylib reads at startup -- all of it goes in by the same route now.
+
+    envproc=backboardd envname=X_LOG_FILE envvalue=/dev/console
+
+All three are required. The name and the value are separate boot-args so
+that the "=" between them never has to survive boot-arg parsing, and they
+are joined in the kernel.
+
+Matching is on the last path component of argv[0], which for a launchd job
+is the program path out of its plist, so the boot-arg is a name rather than
+a path. The scan for the last slash is bounded by what has actually been
+written into the string buffer rather than by a NUL, because an unterminated
+buffer there is not worth walking off the end of. Nothing is injected unless
+all three boot-args are present, so a kernel built with this and booted
+without them behaves exactly as it did before.
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -4174,6 +4174,102 @@
+ 
+ 
+ /*
++ * envinject: hand a process an environment variable it was not started with.
++ *
++ * backboardd aborts on every boot and the reason is inside QuartzCore, which
++ * keeps its own log and will write it to a file named by X_LOG_FILE. That
++ * file can be /dev/console, which devfs creates mode 0622 -- writable by
++ * anyone, including the mobile user backboardd runs as -- so the log lands
++ * on the same screen as the kernel's own printf and needs no disk, no crash
++ * report and no trip through recovery to read.
++ *
++ * The one thing in the way is that the variable has to reach the process,
++ * and a launchd job's environment comes from its plist. Editing the plist
++ * means rewriting 5632 MiB of root image for one line. The environment is
++ * assembled here instead, in the same place and the same way as the strings
++ * the caller passed, which costs one boot image.
++ *
++ * It is not specific to QuartzCore. DYLD_PRINT_LIBRARIES, OBJC_PRINT_*, and
++ * anything else a dylib reads at startup go in by the same route.
++ *
++ *     envproc=backboardd envname=X_LOG_FILE envvalue=/dev/console
++ *
++ * All three are needed; the name and the value are separate boot-args so
++ * that the "=" between them never has to survive boot-arg parsing.
++ */
++static int      env_inject_parsed = 0;
++static char     env_inject_proc[32];
++static char     env_inject_pair[224];
++
++static void
++exec_env_inject_setup(void)
++{
++	char name[64];
++	char value[128];
++
++	env_inject_parsed = 1;
++	env_inject_proc[0] = '\0';
++	env_inject_pair[0] = '\0';
++	name[0] = '\0';
++	value[0] = '\0';
++
++	if (!PE_parse_boot_argn("envproc", env_inject_proc,
++	    sizeof(env_inject_proc))) {
++		return;
++	}
++	if (!PE_parse_boot_argn("envname", name, sizeof(name)) ||
++	    !PE_parse_boot_argn("envvalue", value, sizeof(value))) {
++		env_inject_proc[0] = '\0';
++		return;
++	}
++	snprintf(env_inject_pair, sizeof(env_inject_pair), "%s=%s", name, value);
++	printf("envinject: %s gets %s\n", env_inject_proc, env_inject_pair);
++}
++
++static boolean_t
++exec_env_inject_wanted(struct image_params *imgp)
++{
++	const char *path, *name;
++	size_t len, i;
++
++	if (!env_inject_parsed) {
++		exec_env_inject_setup();
++	}
++	if (env_inject_proc[0] == '\0' || env_inject_pair[0] == '\0') {
++		return FALSE;
++	}
++
++	/*
++	 * The first string collected is argv[0], which for a launchd job is
++	 * the program path out of its plist. The name is whatever follows the
++	 * last slash: matching on the whole path would mean spelling the path
++	 * out in a boot-arg, and boot-args are short.
++	 *
++	 * The scan is bounded by what has actually been written rather than by
++	 * a NUL, because an unterminated buffer here is not worth walking off
++	 * the end of.
++	 */
++	path = imgp->ip_strings;
++	if (path == NULL || imgp->ip_strendp <= path) {
++		return FALSE;
++	}
++	len = (size_t)(imgp->ip_strendp - path);
++	name = path;
++	for (i = 0; i < len && path[i] != '\0'; i++) {
++		if (path[i] == '/') {
++			name = &path[i + 1];
++		}
++	}
++	if (i >= len) {
++		return FALSE;
++	}
++	if (strncmp(name, env_inject_proc, sizeof(env_inject_proc)) != 0) {
++		return FALSE;
++	}
++	return TRUE;
++}
++
++/*
+  * exec_extract_strings
+  *
+  * Copy arguments and environment from user space into work area; we may
+@@ -4372,6 +4468,26 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++	/*
++	 * One more variable than the caller asked for, when the boot-args say
++	 * this process should have it. Same accounting as the loop above: the
++	 * string into ip_strings, one pointer's worth off ip_argspace, one
++	 * more envc.
++	 */
++	if (exec_env_inject_wanted(imgp)) {
++		error = exec_add_user_string(imgp,
++		    CAST_USER_ADDR_T(env_inject_pair), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
