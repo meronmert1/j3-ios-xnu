@@ -1,0 +1,939 @@
+Give the window server somewhere to draw.
+
+The display shim got iOS as far as a display that CAWindowServer finds,
+builds and adds, and then the trace stopped dead:
+
+    IOMobileFramebuffer: [2] selector 74 ... 72 ... 73
+
+and never a 3, 4, 5 or 6. Those are GetLayerDefaultSurface, SwapBegin,
+SwapEnd and SwapWait -- the swap path -- and none of them can be reached
+without a surface to swap. There is no IOSurface in open-source xnu and no
+kext here to bring one, so IOServiceNameMatching("IOCoreSurfaceRoot") finds
+nothing and the whole path above it stays folded up.
+
+This adds the service, the five selectors that matter, and the swap.
+
+Everything about the user client was read out of
+/System/Library/Frameworks/IOSurface.framework on the device image, the same
+way the display shim's selectors were. Calls inside a dylib extracted from
+the shared cache branch straight to the callee's absolute address rather
+than through a stub, so the sites were found by resolving __la_symbol_ptr
+first -- IOConnectCallMethod is at 0x181124f48 -- and each site names itself
+through the framework's own C symbols. The file's own comment carries the
+table and the output struct layout; what matters here is that the framework
+never imports IOConnectMapMemory, so create_surface has to map the memory
+and return the address inside its reply, and the reply's shape was taken
+from the parser at 0x1821dc424 and cross-checked against the accessors.
+
+The swap end of it is three cases in the display shim. There is no scanout
+to repoint -- the controller was pointed at the console framebuffer by the
+bootloader and nothing in this tree moves it -- so a swap is a copy, from
+the surface layer 0 names to the pixels already on screen. A full-screen
+memcpy per frame on one Cortex-A53 is the price of having no GPU, and it is
+replaceable later without anything above noticing.
+
+Selector 3 is left refused on purpose. It hands back a surface the driver
+owns and this driver owns none; a zero there would send a caller off with an
+id that resolves to nothing, which is the kind of wrong answer that travels.
+
+Boot with iosurftrace=0 for none of the new chatter.
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -112,5 +112,6 @@
+ 
+ iokit/bsddev/skywalk/IOSkywalkSupport.cpp		optional iokitcpp
+ 
+ # Display
+ iokit/Kernel/IOMobileFramebufferShim.cpp		optional iokitcpp
++iokit/Kernel/IOSurfaceShim.cpp		optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -57,7 +57,19 @@
+     "     'IOClass'         = IOMobileFramebuffer;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOMobileFramebuffer;"
+     "     'IOProbeScore'    = 1000:32;"
++    "   },"
++    /*
++     * The surface allocator, started the same way and for the same reason:
++     * no kext, so no personality of its own. IOResources again, and a match
++     * category of its own so that it and the framebuffer do not compete for
++     * the one driver IOKit starts per nub.
++     */
++    "   {"
++    "     'IOClass'         = IOCoreSurfaceRoot;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOCoreSurfaceRoot;"
++    "     'IOProbeScore'    = 1000:32;"
+     "   }"
+     ")";
+ 
+--- /dev/null
++++ b/iokit/Kernel/IOSurfaceShim.cpp
+@@ -0,0 +1,709 @@
++/*
++ * IOSurfaceShim.cpp -- enough of IOSurface that the window server can be
++ * handed somewhere to draw.
++ *
++ * There is no IOSurface in open-source xnu and there is no kext here to
++ * bring one, so the service the framework looks for simply does not exist
++ * on this handset. The display shim next door got as far as a display being
++ * found, built and added to CAWindowServer, and then the trace stopped: no
++ * selector 3, 4, 5 or 6 ever arrived, because a swap needs a surface and a
++ * surface needs this.
++ *
++ * Everything below was read out of
++ * /System/Library/Frameworks/IOSurface.framework on the device image. Calls
++ * inside a dylib extracted from the shared cache branch straight to the
++ * absolute address of the callee rather than through a stub, so the call
++ * sites were found by resolving __la_symbol_ptr first: IOConnectCallMethod
++ * is at 0x181124f48, and every site that branches there names itself
++ * through the framework's own C symbols.
++ *
++ * The service is opened in _iosConnectInitalize -- Apple's spelling, not a
++ * typo here:
++ *
++ *     IOServiceGetMatchingService(port, IOServiceNameMatching("IOCoreSurfaceRoot"))
++ *     IOServiceOpen(service, mach_task_self(), 0, &conn)
++ *
++ * so it is IOCoreSurfaceRoot on iOS, not the IOSurfaceRoot of the desktop,
++ * and the user client type is 0.
++ *
++ * The selectors, each named by the framework function that passes it:
++ *
++ *      0  IOSurfaceClientCreate      struct in, struct out
++ *      1  _ioSurfaceClientRelease    one scalar
++ *      2  IOSurfaceClientLock        0xc byte struct in
++ *      3  IOSurfaceClientUnlock      0xc byte struct in
++ *      4  IOSurfaceClientLookup      one scalar, the surface id
++ *      5  SetYCbCrMatrix
++ *      9  SetValue   10 CopyAllValues   11 RemoveValue
++ *     13  used once during _iosConnectInitalize
++ *     17/18  set and remove surface notify
++ *     19  IOSurfaceLog               20 SetPurgeable
++ *     21/22  set tiled, is tiled      23 SetTimestamp
++ *     25  CopyDataValueBytes         26 SetBulkAttachments
++ *     29  surface descriptions, for the debug description class
++ *     33/34  lookup from mach port, create mach port
++ *     35..41 the shared-event family
++ *
++ * Only the first five are implemented. The rest follow the rule the display
++ * shim already uses: one that asks for nothing back is accepted and
++ * dropped, one that wants an answer is refused so that the refusal stops
++ * where it happens and prints its own number.
++ *
++ * How the memory reaches the caller is the part worth being careful about.
++ * The framework does not import IOConnectMapMemory at all, so there is no
++ * second call that maps a surface: create_surface has to map it and hand
++ * the address back inside its output struct. That struct is unpacked by the
++ * parser at 0x1821dc424, which reads the plane count at +0x38 and then
++ * copies 0xdd0 - (0x20 - planes) * 0x6c bytes, treating zero planes as one.
++ * So the layout is a 0x50 byte header followed by up to 32 plane
++ * descriptors of 0x6c bytes each, and a non-planar surface is 0xbc bytes.
++ *
++ * The field offsets come from the accessors. Each of them unwraps the
++ * Objective-C object to the client record and tail-calls a two-instruction
++ * helper, and the client holds this struct at +0x58, so subtracting 0x58
++ * from the accessor's offset gives the offset here. The plane count landing
++ * on +0x38 that way is the same +0x38 the parser reads, which is the check
++ * that the whole mapping is right:
++ *
++ *     +0x00  base address of the mapping, in the caller's address space
++ *     +0x08  pointer to the shared state page; the seed is at its +0xc
++ *     +0x18  surface id
++ *     +0x1c  allocation size
++ *     +0x20  width
++ *     +0x24  height
++ *     +0x28  bytes per row
++ *     +0x2c  offset of plane 0 inside the mapping
++ *     +0x30  pixel format, a fourcc
++ *     +0x38  plane count
++ *     +0x40  bytes per element, 2 bytes
++ *     +0x42  element width, +0x43 element height, one byte each
++ *
++ * IOSurfaceGetBaseAddress returns +0x00 plus +0x2c and IOSurfaceGetBytesPerRow
++ * returns +0x28, both only while no plane is marked tiled. A single untiled
++ * plane is therefore the simple case and the one the window server asks for
++ * first, so that is the only case built here: plane count zero, one
++ * allocation, pixels starting one page in.
++ *
++ * That one page in front is not padding. +0x08 has to be a pointer the
++ * caller can read -- IOSurfaceGetSeed dereferences it -- so the allocation
++ * is a page of shared state followed by the pixels, both inside the same
++ * mapping, and +0x2c is the page size. One mapping, two uses, nothing to
++ * keep in step.
++ *
++ * The properties the caller asks for arrive as a dictionary serialized the
++ * binary way -- IOCFSerialize(props, 1) -- and OSUnserializeXML already
++ * routes that to OSUnserializeBinary on sight of the signature, so there is
++ * no parser to write here.
++ *
++ * Boot with iosurftrace=0 for none of the chatter.
++ */
++
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/c++/OSSerialize.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>          /* proc_selfpid, to name who opened a client */
++
++#define kIOSurfaceCreate        0
++#define kIOSurfaceRelease       1
++#define kIOSurfaceLock          2
++#define kIOSurfaceUnlock        3
++#define kIOSurfaceLookup        4
++
++/*
++ * The output struct: 0x50 of header and one 0x6c plane descriptor, which is
++ * what the parser copies when the plane count is zero.
++ */
++#define kIOSurfaceInfoSize      0xbc
++
++#define kIOSurfaceInfoBase      0x00
++#define kIOSurfaceInfoState     0x08
++#define kIOSurfaceInfoID        0x18
++#define kIOSurfaceInfoAllocSize 0x1c
++#define kIOSurfaceInfoWidth     0x20
++#define kIOSurfaceInfoHeight    0x24
++#define kIOSurfaceInfoStride    0x28
++#define kIOSurfaceInfoPlaneOff  0x2c
++#define kIOSurfaceInfoFormat    0x30
++#define kIOSurfaceInfoPlanes    0x38
++#define kIOSurfaceInfoBPE       0x40
++#define kIOSurfaceInfoElemW     0x42
++#define kIOSurfaceInfoElemH     0x43
++
++/*
++ * Sixty-four is not a measured figure. The window server wants a handful
++ * per display and nothing seen so far asks for more; the limit is here so
++ * that a client that leaks them runs into a refusal instead of into the
++ * kernel's memory.
++ */
++#define kIOSurfaceMaxSurfaces   64
++
++/* Mappings one client may hold. Same reasoning, smaller number. */
++#define kIOSurfaceMaxMaps       32
++
++/* Boot-arg iosurftrace, on unless it is turned off. */
++static int iosurf_trace = 1;
++
++struct iosurface_rec {
++	uint32_t                  id;
++	uint32_t                  width;
++	uint32_t                  height;
++	uint32_t                  stride;
++	uint32_t                  format;
++	uint32_t                  pixelBytes;      /* without the state page */
++	IOBufferMemoryDescriptor *md;
++};
++
++static struct iosurface_rec iosurf_table[kIOSurfaceMaxSurfaces];
++static IOLock                *iosurf_lock;
++static uint32_t               iosurf_next_id = 1;
++
++/* One number per user client, so one caller can be told from another. */
++static volatile SInt32 iosurf_client_count;
++
++static struct iosurface_rec *
++iosurf_find(uint32_t id)
++{
++	int i;
++
++	for (i = 0; i < kIOSurfaceMaxSurfaces; i++) {
++		if (iosurf_table[i].md != NULL && iosurf_table[i].id == id) {
++			return &iosurf_table[i];
++		}
++	}
++	return NULL;
++}
++
++/*
++ * What the display shim needs: the kernel-side address of a surface's
++ * pixels, so that a swap can copy them to the framebuffer. The pixels start
++ * one page into the allocation, behind the shared state page.
++ *
++ * Returned without a reference and without the lock held. Both callers are
++ * on the same thread as the swap that named the surface, and a surface
++ * cannot be released while the client that owns it is inside a call on it.
++ */
++extern "C" void *
++IOSurfaceShimBytes(uint32_t id, uint32_t *width, uint32_t *height,
++    uint32_t *stride)
++{
++	struct iosurface_rec *rec;
++	void *bytes = NULL;
++
++	if (iosurf_lock == NULL) {
++		return NULL;
++	}
++
++	IOLockLock(iosurf_lock);
++	rec = iosurf_find(id);
++	if (rec != NULL) {
++		bytes = (void *)((uintptr_t)rec->md->getBytesNoCopy() +
++		    PAGE_SIZE);
++		if (width != NULL) {
++			*width = rec->width;
++		}
++		if (height != NULL) {
++			*height = rec->height;
++		}
++		if (stride != NULL) {
++			*stride = rec->stride;
++		}
++	}
++	IOLockUnlock(iosurf_lock);
++
++	return bytes;
++}
++
++class IOCoreSurfaceRoot : public IOService
++{
++	OSDeclareDefaultStructors(IOCoreSurfaceRoot);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID,
++	    UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++class IOCoreSurfaceRootUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(IOCoreSurfaceRootUserClient);
++
++	IOCoreSurfaceRoot *fOwner;
++	task_t             fTask;
++	uint32_t           fSerial;
++
++	/*
++	 * The mappings this client holds, so that they go away with it. A
++	 * surface outlives the mapping -- another client can look the same id
++	 * up and get a mapping of its own -- which is why the id is kept
++	 * beside the map rather than inside the surface.
++	 */
++	uint32_t      fMapID[kIOSurfaceMaxMaps];
++	IOMemoryMap  *fMap[kIOSurfaceMaxMaps];
++
++	IOReturn fillInfo(struct iosurface_rec *rec, void *out,
++	    mach_vm_address_t addr);
++	IOMemoryMap *mapFor(struct iosurface_rec *rec);
++
++public:
++	virtual bool initWithTask(task_t owningTask, void *securityID,
++	    UInt32 type) APPLE_KEXT_OVERRIDE;
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientDied(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector,
++	    IOExternalMethodArguments *arguments,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++#define super IOService
++OSDefineMetaClassAndStructors(IOCoreSurfaceRoot, IOService);
++
++bool
++IOCoreSurfaceRoot::start(IOService *provider)
++{
++	uint32_t on = 1;
++
++	if (!super::start(provider)) {
++		return false;
++	}
++
++	if (PE_parse_boot_argn("iosurftrace", &on, sizeof(on))) {
++		iosurf_trace = (on != 0);
++	}
++
++	if (iosurf_lock == NULL) {
++		iosurf_lock = IOLockAlloc();
++		if (iosurf_lock == NULL) {
++			return false;
++		}
++	}
++
++	/*
++	 * The framework looks this up by name, not by class, so the name has
++	 * to be set rather than left to default.
++	 */
++	setName("IOCoreSurfaceRoot");
++	registerService();
++
++	IOLog("IOCoreSurfaceRoot: started\n");
++	return true;
++}
++
++IOReturn
++IOCoreSurfaceRoot::newUserClient(task_t owningTask, void *securityID,
++    UInt32 type, IOUserClient **handler)
++{
++	IOCoreSurfaceRootUserClient *client;
++
++	if (type != 0) {
++		IOLog("IOCoreSurfaceRoot: refused user client type %u\n",
++		    (unsigned)type);
++		return kIOReturnBadArgument;
++	}
++
++	client = new IOCoreSurfaceRootUserClient;
++	if (client == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (!client->initWithTask(owningTask, securityID, type) ||
++	    !client->attach(this) || !client->start(this)) {
++		client->detach(this);
++		client->release();
++		return kIOReturnError;
++	}
++
++	*handler = client;
++	return kIOReturnSuccess;
++}
++
++#undef super
++#define super IOUserClient
++OSDefineMetaClassAndStructors(IOCoreSurfaceRootUserClient, IOUserClient);
++
++bool
++IOCoreSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID,
++    UInt32 type)
++{
++	int i;
++
++	if (!super::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++
++	fTask = owningTask;
++	fOwner = NULL;
++	fSerial = (uint32_t)OSIncrementAtomic(&iosurf_client_count) + 1;
++	for (i = 0; i < kIOSurfaceMaxMaps; i++) {
++		fMapID[i] = 0;
++		fMap[i] = NULL;
++	}
++
++	if (iosurf_trace) {
++		IOLog("IOCoreSurfaceRoot: [%u] opened by pid %d\n",
++		    fSerial, proc_selfpid());
++	}
++	return true;
++}
++
++bool
++IOCoreSurfaceRootUserClient::start(IOService *provider)
++{
++	if (!super::start(provider)) {
++		return false;
++	}
++	fOwner = OSDynamicCast(IOCoreSurfaceRoot, provider);
++	return fOwner != NULL;
++}
++
++void
++IOCoreSurfaceRootUserClient::free(void)
++{
++	int i;
++
++	for (i = 0; i < kIOSurfaceMaxMaps; i++) {
++		if (fMap[i] != NULL) {
++			fMap[i]->release();
++			fMap[i] = NULL;
++			fMapID[i] = 0;
++		}
++	}
++	super::free();
++}
++
++IOReturn
++IOCoreSurfaceRootUserClient::clientClose(void)
++{
++	if (iosurf_trace) {
++		IOLog("IOCoreSurfaceRoot: [%u] closed\n", fSerial);
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOCoreSurfaceRootUserClient::clientDied(void)
++{
++	if (iosurf_trace) {
++		IOLog("IOCoreSurfaceRoot: [%u] client died\n", fSerial);
++	}
++	return super::clientDied();
++}
++
++/*
++ * The mapping this client has of a surface, made on first use. Returned
++ * without a reference: the client holds the only one and drops it in free.
++ */
++IOMemoryMap *
++IOCoreSurfaceRootUserClient::mapFor(struct iosurface_rec *rec)
++{
++	IOMemoryMap *map;
++	int i, slot = -1;
++
++	for (i = 0; i < kIOSurfaceMaxMaps; i++) {
++		if (fMap[i] != NULL && fMapID[i] == rec->id) {
++			return fMap[i];
++		}
++		if (fMap[i] == NULL && slot < 0) {
++			slot = i;
++		}
++	}
++	if (slot < 0) {
++		return NULL;
++	}
++
++	map = rec->md->createMappingInTask(fTask, 0, kIOMapAnywhere);
++	if (map == NULL) {
++		return NULL;
++	}
++
++	fMap[slot] = map;
++	fMapID[slot] = rec->id;
++	return map;
++}
++
++IOReturn
++IOCoreSurfaceRootUserClient::fillInfo(struct iosurface_rec *rec, void *out,
++    mach_vm_address_t addr)
++{
++	uint8_t *p = (uint8_t *)out;
++
++	bzero(p, kIOSurfaceInfoSize);
++
++	*(uint64_t *)(p + kIOSurfaceInfoBase)  = (uint64_t)addr;
++	*(uint64_t *)(p + kIOSurfaceInfoState) = (uint64_t)addr;
++	*(uint32_t *)(p + kIOSurfaceInfoID)    = rec->id;
++	*(uint32_t *)(p + kIOSurfaceInfoAllocSize) = rec->pixelBytes;
++	*(uint32_t *)(p + kIOSurfaceInfoWidth)  = rec->width;
++	*(uint32_t *)(p + kIOSurfaceInfoHeight) = rec->height;
++	*(uint32_t *)(p + kIOSurfaceInfoStride) = rec->stride;
++	*(uint32_t *)(p + kIOSurfaceInfoPlaneOff) = (uint32_t)PAGE_SIZE;
++	*(uint32_t *)(p + kIOSurfaceInfoFormat) = rec->format;
++	*(uint32_t *)(p + kIOSurfaceInfoPlanes) = 0;
++	*(uint16_t *)(p + kIOSurfaceInfoBPE)   = 4;
++	p[kIOSurfaceInfoElemW] = 1;
++	p[kIOSurfaceInfoElemH] = 1;
++
++	return kIOReturnSuccess;
++}
++
++/* A uint32 out of the serialized property dictionary, or a default. */
++static uint32_t
++iosurf_number(OSDictionary *props, const char *key, uint32_t dflt)
++{
++	OSNumber *n;
++
++	if (props == NULL) {
++		return dflt;
++	}
++	n = OSDynamicCast(OSNumber, props->getObject(key));
++	if (n == NULL) {
++		return dflt;
++	}
++	return n->unsigned32BitValue();
++}
++
++IOReturn
++IOCoreSurfaceRootUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch,
++    OSObject *target, void *reference)
++{
++	IOReturn ret = kIOReturnUnsupported;
++
++	switch (selector) {
++	case kIOSurfaceCreate: {
++		OSObject             *obj = NULL;
++		OSDictionary         *props = NULL;
++		struct iosurface_rec *rec = NULL;
++		IOBufferMemoryDescriptor *md;
++		IOMemoryMap          *map;
++		uint32_t              w, h, stride, format, bytes, total;
++		int                   i, slot = -1;
++
++		if (arguments->structureOutputSize < kIOSurfaceInfoSize) {
++			return kIOReturnBadArgument;
++		}
++
++		if (arguments->structureInput != NULL &&
++		    arguments->structureInputSize > 0) {
++			obj = OSUnserializeXML(
++				(const char *)arguments->structureInput,
++				arguments->structureInputSize, NULL);
++			props = OSDynamicCast(OSDictionary, obj);
++		}
++
++		w = iosurf_number(props, "IOSurfaceWidth", 0);
++		h = iosurf_number(props, "IOSurfaceHeight", 0);
++		stride = iosurf_number(props, "IOSurfaceBytesPerRow", 0);
++		format = iosurf_number(props, "IOSurfacePixelFormat", 0);
++
++		/*
++		 * A caller that gives a size but no stride means the obvious
++		 * one; a caller that gives neither is asking for something
++		 * this file cannot invent.
++		 */
++		if (stride == 0) {
++			stride = w * 4;
++		}
++		if (w == 0 || h == 0 || stride == 0) {
++			if (obj != NULL) {
++				obj->release();
++			}
++			IOLog("IOCoreSurfaceRoot: [%u] create without a size\n",
++			    fSerial);
++			return kIOReturnBadArgument;
++		}
++
++		bytes = iosurf_number(props, "IOSurfaceAllocSize", stride * h);
++		if (bytes < stride * h) {
++			bytes = stride * h;
++		}
++		total = (uint32_t)(PAGE_SIZE + round_page(bytes));
++
++		md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++			kIODirectionInOut | kIOMemoryKernelUserShared,
++			total, PAGE_SIZE);
++		if (md == NULL) {
++			if (obj != NULL) {
++				obj->release();
++			}
++			return kIOReturnNoMemory;
++		}
++		bzero(md->getBytesNoCopy(), total);
++
++		IOLockLock(iosurf_lock);
++		for (i = 0; i < kIOSurfaceMaxSurfaces; i++) {
++			if (iosurf_table[i].md == NULL) {
++				slot = i;
++				break;
++			}
++		}
++		if (slot >= 0) {
++			rec = &iosurf_table[slot];
++			rec->id = iosurf_next_id++;
++			rec->width = w;
++			rec->height = h;
++			rec->stride = stride;
++			rec->format = format;
++			rec->pixelBytes = bytes;
++			rec->md = md;
++		}
++		IOLockUnlock(iosurf_lock);
++
++		if (obj != NULL) {
++			obj->release();
++		}
++		if (rec == NULL) {
++			md->release();
++			IOLog("IOCoreSurfaceRoot: [%u] out of surface slots\n",
++			    fSerial);
++			return kIOReturnNoResources;
++		}
++
++		map = mapFor(rec);
++		if (map == NULL) {
++			IOLockLock(iosurf_lock);
++			rec->md = NULL;
++			IOLockUnlock(iosurf_lock);
++			md->release();
++			return kIOReturnNoMemory;
++		}
++
++		fillInfo(rec, arguments->structureOutput, map->getAddress());
++		arguments->structureOutputSize = kIOSurfaceInfoSize;
++
++		if (iosurf_trace) {
++			IOLog("IOCoreSurfaceRoot: [%u] created id %u "
++			    "%ux%u stride %u fmt 0x%x at 0x%llx\n",
++			    fSerial, rec->id, w, h, stride, format,
++			    (unsigned long long)map->getAddress());
++		}
++		return kIOReturnSuccess;
++	}
++
++	case kIOSurfaceLookup: {
++		struct iosurface_rec *rec;
++		IOMemoryMap *map;
++		uint32_t id;
++
++		if (arguments->scalarInputCount < 1 ||
++		    arguments->structureOutputSize < kIOSurfaceInfoSize) {
++			return kIOReturnBadArgument;
++		}
++		id = (uint32_t)arguments->scalarInput[0];
++
++		IOLockLock(iosurf_lock);
++		rec = iosurf_find(id);
++		IOLockUnlock(iosurf_lock);
++		if (rec == NULL) {
++			if (iosurf_trace) {
++				IOLog("IOCoreSurfaceRoot: [%u] lookup of "
++				    "unknown id %u\n", fSerial, id);
++			}
++			return kIOReturnNotFound;
++		}
++
++		map = mapFor(rec);
++		if (map == NULL) {
++			return kIOReturnNoMemory;
++		}
++
++		fillInfo(rec, arguments->structureOutput, map->getAddress());
++		arguments->structureOutputSize = kIOSurfaceInfoSize;
++
++		if (iosurf_trace) {
++			IOLog("IOCoreSurfaceRoot: [%u] looked up id %u\n",
++			    fSerial, id);
++		}
++		return kIOReturnSuccess;
++	}
++
++	case kIOSurfaceRelease: {
++		struct iosurface_rec *rec;
++		IOBufferMemoryDescriptor *md = NULL;
++		uint32_t id;
++		int i;
++
++		if (arguments->scalarInputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		id = (uint32_t)arguments->scalarInput[0];
++
++		for (i = 0; i < kIOSurfaceMaxMaps; i++) {
++			if (fMap[i] != NULL && fMapID[i] == id) {
++				fMap[i]->release();
++				fMap[i] = NULL;
++				fMapID[i] = 0;
++			}
++		}
++
++		IOLockLock(iosurf_lock);
++		rec = iosurf_find(id);
++		if (rec != NULL) {
++			md = rec->md;
++			rec->md = NULL;
++		}
++		IOLockUnlock(iosurf_lock);
++
++		if (md != NULL) {
++			md->release();
++		}
++		if (iosurf_trace) {
++			IOLog("IOCoreSurfaceRoot: [%u] released id %u%s\n",
++			    fSerial, id, md ? "" : " (unknown)");
++		}
++		return kIOReturnSuccess;
++	}
++
++	case kIOSurfaceLock:
++	case kIOSurfaceUnlock:
++		/*
++		 * Nothing here moves a surface or changes its caching, so
++		 * there is nothing to do between a lock and an unlock. The
++		 * call still has to succeed: the framework treats a failure
++		 * as the surface being gone.
++		 */
++		if (arguments->structureOutput != NULL &&
++		    arguments->structureOutputSize > 0) {
++			bzero(arguments->structureOutput,
++			    arguments->structureOutputSize);
++		}
++		return kIOReturnSuccess;
++
++	default:
++		/*
++		 * The same rule the display shim settled on: a selector that
++		 * asks for nothing back is accepted and dropped, one that
++		 * wants an answer is refused so that the refusal stops where
++		 * it happens.
++		 */
++		if (arguments->scalarOutputCount == 0 &&
++		    arguments->structureOutputSize == 0) {
++			if (iosurf_trace) {
++				IOLog("IOCoreSurfaceRoot: [%u] selector %u "
++				    "accepted and dropped\n",
++				    fSerial, selector);
++			}
++			return kIOReturnSuccess;
++		}
++		IOLog("IOCoreSurfaceRoot: [%u] unimplemented selector %u "
++		    "(in %u scalars/%u bytes, out %u scalars/%u bytes)\n",
++		    fSerial, selector,
++		    (unsigned)arguments->scalarInputCount,
++		    (unsigned)arguments->structureInputSize,
++		    (unsigned)arguments->scalarOutputCount,
++		    (unsigned)arguments->structureOutputSize);
++		break;
++	}
++
++	return ret;
++}
+--- a/iokit/Kernel/IOMobileFramebufferShim.cpp
++++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
+@@ -132,6 +132,15 @@
+ #include <sys/proc.h>          /* proc_selfpid, to name who opened a client */
+ 
+ /*
++ * From iokit/Kernel/IOSurfaceShim.cpp: the kernel-side address of a
++ * surface's pixels, by the id the swap request carries. Declared here
++ * rather than in a header because the two files are the only things in
++ * this tree that know about each other.
++ */
++extern "C" void *IOSurfaceShimBytes(uint32_t id, uint32_t *width,
++    uint32_t *height, uint32_t *stride);
++
++/*
+  * The selectors, named from the framework's own callers. Each was found by
+  * running with none of them implemented and reading the numbers the console
+  * printed back, then looking for the IOConnectCallScalarMethod that passes
+@@ -158,6 +167,33 @@
+ #define kIOMFBSupportedFrameInfo 74
+ 
+ /*
++ * The swap path, named the same way -- from the framework's own symbols.
++ * kern_SwapBegin takes nothing and answers one scalar, the swap id;
++ * kern_SwapEnd sends the whole request as a 0x278 byte structure;
++ * kern_SwapWait passes three scalars and wants nothing back.
++ *
++ * Selector 3, kern_GetLayerDefaultSurface, is deliberately not here. It
++ * hands back a surface the driver owns, and this one owns none; refusing
++ * it says so, where answering with a zero would send a caller off with a
++ * surface id that resolves to nothing.
++ */
++#define kIOMFBSwapBegin         4
++#define kIOMFBSwapEnd           5
++#define kIOMFBSwapWait          6
++
++/*
++ * Inside the 0x278 byte swap request, read out of kern_SwapBegin and
++ * kern_SwapSetLayer in the framework. SwapBegin zeroes the region and
++ * stores the id it was given at +0x40; SwapSetLayer reduces each
++ * IOSurfaceRef to IOSurfaceGetID(surface) and puts the three layers at
++ * +0x44, +0x48 and +0x4c, so the kernel only ever sees ids. Layer 0 is
++ * the one the window server draws the screen into.
++ */
++#define kIOMFBSwapRequestSize   0x278
++#define kIOMFBSwapReqID         0x40
++#define kIOMFBSwapReqLayer0     0x44
++
++/*
+  * Notification types, as the framework numbers them. 3 is frame info and 5
+  * is vsync; the rest are not used by anything seen so far. Eight is room
+  * for all of them and a bounds check that cannot be argued with.
+@@ -234,6 +270,13 @@
+ 	uint32_t                  fSerial;
+ 
+ 	/*
++	 * The id handed out by SwapBegin and quoted back in the request.
++	 * Nothing checks it yet; it is kept per client so that two clients
++	 * swapping at once cannot be confused for one.
++	 */
++	uint32_t                  fSwapID;
++
++	/*
+ 	 * What the framework asks us to remember about notifications. The port
+ 	 * is ours once registerNotificationPort has returned success and has
+ 	 * to be balanced with releaseNotificationPort; the callback and the
+@@ -859,6 +902,90 @@
+ 		return kIOReturnSuccess;
+ 	}
+ 
++	case kIOMFBSwapBegin:
++		/*
++		 * One scalar out, the id for the swap that is starting. The
++		 * framework stores it in the request it is about to build and
++		 * sends it back with SwapEnd.
++		 */
++		if (arguments->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		arguments->scalarOutput[0] = ++fSwapID;
++		arguments->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++
++	case kIOMFBSwapEnd: {
++		/*
++		 * The swap itself. There is no scanout to repoint here -- the
++		 * display controller was pointed at the console framebuffer by
++		 * the bootloader and nothing in this tree moves it -- so the
++		 * swap is a copy: the surface named by layer 0 goes to the
++		 * pixels the console is already showing.
++		 *
++		 * That makes every frame cost a full-screen memcpy on one
++		 * Cortex-A53, which is the price of having no GPU and no
++		 * second scanout buffer. It is also the thing that can be
++		 * replaced later without anything above noticing.
++		 */
++		const uint8_t *req = (const uint8_t *)arguments->structureInput;
++		PE_Video video;
++		uint32_t id, sw, sh, sstride;
++		const uint8_t *src;
++		uint8_t *dst;
++		uint32_t rows, cols, y;
++
++		if (req == NULL ||
++		    arguments->structureInputSize < kIOMFBSwapRequestSize) {
++			return kIOReturnBadArgument;
++		}
++
++		id = *(const uint32_t *)(req + kIOMFBSwapReqLayer0);
++		if (id == 0) {
++			/* A swap with no layer 0 has nothing to show. */
++			return kIOReturnSuccess;
++		}
++
++		src = (const uint8_t *)IOSurfaceShimBytes(id, &sw, &sh,
++			&sstride);
++		if (src == NULL) {
++			IOLog("IOMobileFramebuffer: [%u] swap names surface "
++			    "%u, which is not one of ours\n", fSerial, id);
++			return kIOReturnNotFound;
++		}
++
++		if (PE_current_console(&video) != 0 ||
++		    video.v_baseAddr == 0) {
++			return kIOReturnNotReady;
++		}
++
++		dst = (uint8_t *)video.v_baseAddr;
++		rows = (sh < video.v_height) ? sh : video.v_height;
++		cols = (sw < video.v_width) ? sw : video.v_width;
++
++		for (y = 0; y < rows; y++) {
++			memcpy(dst + (size_t)y * video.v_rowBytes,
++			    src + (size_t)y * sstride, (size_t)cols * 4);
++		}
++
++		if (iomfb_trace) {
++			IOLog("IOMobileFramebuffer: [%u] swap %u surface %u "
++			    "%ux%u -> %ux%u\n", fSerial,
++			    *(const uint32_t *)(req + kIOMFBSwapReqID),
++			    id, sw, sh,
++			    (unsigned)video.v_width,
++			    (unsigned)video.v_height);
++		}
++		return kIOReturnSuccess;
++	}
++
++	case kIOMFBSwapWait:
++		/*
++		 * The copy above finished before SwapEnd returned, so there
++		 * is never anything to wait for.
++		 */
++		return kIOReturnSuccess;
++
+ 	default:
+ 		break;
+ 	}
