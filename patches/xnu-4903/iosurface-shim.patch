@@ -1,129 +1,192 @@
-Give the window server somewhere to draw.
+Say where a living process is stuck.
 
-The display shim got iOS as far as a display that CAWindowServer finds,
-builds and adds, and then the trace stopped dead:
+The display path is now complete on the kernel side and the window server
+agrees. backboardd opens the framebuffer, runs the whole mode set --
+selectors 18, 57, 7, 15, 22, 8, 33, 74 -- registers both notification
+types, takes the frame clock, and turns hardware vsync on:
 
-    IOMobileFramebuffer: [2] selector 74 ... 72 ... 73
+    IOMobileFramebuffer: [2] notifications on for type 5
+    IOMobileFramebuffer: [2] selector 72 in 4{9018240232,5268125696,5,0}
 
-and never a 3, 4, 5 or 6. Those are GetLayerDefaultSurface, SwapBegin,
-SwapEnd and SwapWait -- the swap path -- and none of them can be reached
-without a surface to swap. There is no IOSurface in open-source xnu and no
-kext here to bring one, so IOServiceNameMatching("IOCoreSurfaceRoot") finds
-nothing and the whole path above it stays folded up.
+and then nothing, for as long as the handset is left on. No selector 3, no
+swap, and -- the part that says where the fault really is -- not one
+IOCoreSurfaceRoot open, by any process, ever. On a live system dozens of
+processes hold surfaces by this point. Here nobody has asked for one.
 
-This adds the service, the five selectors that matter, and the swap.
+Three things were tried against the window server and all three landed
+without changing that. CA::WindowServer::IOMFBServer::add_vsync_source
+ends with a gate on a client count that is zero, so hardware vsync was
+never switched on; removing the gate switched it on, and reading
+vsync_callback afterwards showed why it changed nothing -- the count is a
+one-shot render request that the callback itself decrements, so forcing
+the clock on produces a clock with nothing to drive. Then the display
+itself: CA::WindowServer::IOMFBDisplay::can_update() calls is_enabled()
+through the vtable and returns false the moment it is false, and
+AppleDisplay's constructor builds its flag word out of 0x9004, which does
+not include the enabled bit, while the only thing that sets that bit is
+-[CAWindowServerDisplay setDisabled:] reached from a MIG message nothing
+here sends. Making the display be born enabled, and then making
+is_enabled() unconditional, changed nothing either.
 
-Everything about the user client was read out of
-/System/Library/Frameworks/IOSurface.framework on the device image, the same
-way the display shim's selectors were. Calls inside a dylib extracted from
-the shared cache branch straight to the callee's absolute address rather
-than through a stub, so the sites were found by resolving __la_symbol_ptr
-first -- IOConnectCallMethod is at 0x181124f48 -- and each site names itself
-through the framework's own C symbols. The file's own comment carries the
-table and the output struct layout; what matters here is that the framework
-never imports IOConnectMapMemory, so create_surface has to map the memory
-and return the address inside its reply, and the reply's shape was taken
-from the parser at 0x1821dc424 and cross-checked against the accessors.
+That exhausts what can be learned by reading the window server. Everything
+it is supposed to do, it has done; what is missing is a client. SpringBoard
+is alive in every roll call, at the same pid, for many minutes, and it
+never crashes and never allocates a surface, so it is not failing -- it is
+waiting. backboardd may be waiting too: if its main thread is still inside
+-[CAWindowServer _detectDisplays] then the Mach services it is supposed to
+register do not exist yet, and SpringBoard blocking on a bootstrap lookup
+of one of them would look exactly like this from outside.
 
-The swap end of it is three cases in the display shim. There is no scanout
-to repoint -- the controller was pointed at the console framebuffer by the
-bootloader and nothing in this tree moves it -- so a swap is a copy, from
-the surface layer 0 names to the pixels already on screen. A full-screen
-memcpy per frame on one Cortex-A53 is the price of having no GPU, and it is
-replaceable later without anything above noticing.
+A wait leaves no corpse, so exitbt has nothing to print. But a blocked
+thread keeps its user state in the same place a dying one does, and
+backtrace_thread_user() in osfmk already knows how to walk another task's
+stack: it takes a reference on the target's map, switches to it so copyin
+resolves there, walks the frame chain and switches back. What is missing
+is only the loop over a process's threads, which is the first half of this
+change: proc_user_backtrace(pid) collects the threads under the proc lock,
+references them so a libdispatch worker retiring mid-walk cannot be walked
+after it is freed, drops the lock, and prints one line of return addresses
+per thread.
 
-Selector 3 is left refused on purpose. It hands back a surface the driver
-owns and this driver owns none; a zero there would send a caller off with an
-id that resolves to nothing, which is the kind of wrong answer that travels.
+The second half hangs it off the roll call, which already walks the pid
+space and names what answers. btname is a comma separated list of name
+prefixes -- p_comm is truncated to sixteen characters, so a prefix is all
+there is to match against -- and it defaults to SpringBoard,backboardd,
+because backtracing seventy idle processes would bury the two lines that
+matter on a console with no scrollback. btname= with nothing after it
+turns it off.
 
-Boot with iosurftrace=0 for none of the new chatter.
-
-Two things the first boot with this made plain.
-
-The kernel console draws into the very framebuffer a swap copies into, so
-every IOLog repaints over the frame the window server just put there. A
-real display driver takes the framebuffer away from the console when it
-comes up; SwapEnd now does that, on the first copy that actually found its
-surface, so a swap naming a surface we do not have still leaves the console
-up to carry the diagnostic.
-
-The other is why no swap ever arrived. The trace stopped dead after
-
-    IOMobileFramebuffer: [2] registerNotificationPort type 3 refCon 0
-    IOMobileFramebuffer: [2] notifications on for type 3
-    IOMobileFramebuffer: [2] selector 72 ... 73
-
-and the reason is in this file: the port and the callback were remembered
-and nothing was ever sent to them. The window server adds the run loop
-source that port feeds and then waits on it. Reading QuartzCore out of the
-device image, what hangs off that wait is the whole of display bring-up --
-IOMFBServer::frame_info_callback reaches IOMFBDisplay::initialize_timings,
-and vsync itself only ever starts from IOMFBServer::did_set_mode or
-set_enabled, which are
-
-    remove_vsync_source -> initialize_timings -> add_vsync_source
-
-so with no first callback there is no timing, no mode, no frame clock, no
-composite and no swap. The EAGLServer constructor's own add_vsync_source is
-not a second chance: it is gated on IOMFBDisplay::framebuffer_id(), which
-reads a field at +0x240 that nothing in QuartzCore ever writes.
-
-So this gives the driver the clock it was pretending to have. A timer on
-the user client sends the frame-info notification, and the vsync one once
-anything arms it, through setAsyncReference64 and sendAsyncResult64 with
-the port, callback and context the framework already handed over. The
-shapes are the framework's: FrameInfoNotifyFunc drops anything with fewer
-than two arguments and says so, reading args[0] as a 64-bit swap id and
-args[1] as a 32-bit count; the vsync callback takes three times. There is
-no real vblank to follow, so the rate is made up -- 60 Hz, boot-arg
-iomfbtickhz, 0 to stop it.
-The first boot with that clock showed the other half of it. backboardd took
-the notification and died on the spot, sig 11, pc 0x54014a00 against a
-refcon of 0x154014A00 -- it had jumped to the low half of its own context.
-setAsyncReference64's four argument form leaves kIOUCAsync64Flag clear, so
-sendAsyncResult64 sends the msg32 layout with every reference slot REF32'd,
-and a 64-bit reader takes the func out of the wrong place. The five
-argument form, given the owning task, sets the flag.
-
-With that fixed the display configures and then nothing happens at all, and
-nothing is the hardest thing to read: the kernel prints a line when a
-process dies and none when one lives, so a daemon that is up and waiting
-looks exactly like one that never started. Boot-arg proclist=<seconds>
-prints the pid table, and repeats at a widening interval because a second
-on this device is not a second -- the first attempt asked for 600 and was
-answered while fsck was still running, three processes in.
-
---- a/iokit/conf/files
-+++ b/iokit/conf/files
-@@ -114,3 +114,4 @@
+These are addresses and not symbols, for the same reason exitbt's are:
+nothing in the kernel knows where any of it was loaded. That has been
+enough every time so far. A slide is a multiple of 0x4000, so the low
+fourteen bits of a frame name the call site whatever the slide is, and the
+distance between two frames inside one image is invariant; a frame that
+lands in a dylib already extracted from the shared cache pins the slide
+outright, and then every other frame in that cache can be named.
+diff -ruN a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+--- a/bsd/kern/kern_proc.c	2026-10-24 11:54:21.242330801 +0300
++++ b/bsd/kern/kern_proc.c	2026-11-06 23:43:49.298828162 +0300
+@@ -178,6 +178,7 @@
  
- # Display
- iokit/Kernel/IOMobileFramebufferShim.cpp		optional iokitcpp
-+iokit/Kernel/IOSurfaceShim.cpp		optional iokitcpp
---- a/iokit/KernelConfigTables.cpp
-+++ b/iokit/KernelConfigTables.cpp
-@@ -58,6 +58,18 @@
-     "     'IOProviderClass' = IOResources;"
-     "     'IOMatchCategory' = IOMobileFramebuffer;"
-     "     'IOProbeScore'    = 1000:32;"
-+    "   },"
-+    /*
-+     * The surface allocator, started the same way and for the same reason:
-+     * no kext, so no personality of its own. IOResources again, and a match
-+     * category of its own so that it and the framebuffer do not compete for
-+     * the one driver IOKit starts per nub.
-+     */
-+    "   {"
-+    "     'IOClass'         = IOCoreSurfaceRoot;"
-+    "     'IOProviderClass' = IOResources;"
-+    "     'IOMatchCategory' = IOCoreSurfaceRoot;"
-+    "     'IOProbeScore'    = 1000:32;"
-     "   }"
-     ")";
+ #if PROC_REF_DEBUG
+ #include <kern/backtrace.h>
++#include <kern/thread.h>      /* thread_reference, for proc_user_backtrace */
+ #endif
  
---- a/iokit/Kernel/IOMobileFramebufferShim.cpp
-+++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
-@@ -127,11 +127,35 @@
+ typedef uint64_t unaligned_u64 __attribute__((aligned(1)));
+@@ -908,6 +909,108 @@
+ 	}
+ }
+ 
++/*
++ * Bring-up: where a process that is not dying is stuck.
++ *
++ * exitbt prints the backtrace of a thread that has just taken a signal,
++ * which answers why a process died. It says nothing about one that is
++ * alive and idle, and that is the state the window server and SpringBoard
++ * are both in on this handset: present in every roll call, never crashing,
++ * never drawing. Whatever is holding them is a wait, not a fault, and a
++ * wait leaves no corpse to read.
++ *
++ * A blocked thread has its user state saved in exactly the same place a
++ * dying one does, so the same frame walk works, with one difference: the
++ * stack belongs to another task, so the copyin has to run with that task's
++ * map installed. backtrace_thread_user() already does that -- it switches
++ * the map, walks the chain and switches back -- so all this adds is the
++ * loop over the process's threads and a line each.
++ *
++ * The threads are collected under the proc lock and referenced before the
++ * lock is dropped, because the walk can fault and must not hold it, and a
++ * libdispatch worker that retires in between would otherwise be walked
++ * after it was freed.
++ *
++ * As with exitbt these are addresses and not symbols: nothing here knows
++ * where any of it was loaded. That is enough, because the distance between
++ * two frames inside one image survives the slide, which is what names the
++ * call site.
++ */
++#define PROC_BT_FRAMES          10
++#define PROC_BT_MAX_THREADS     12
++
++void
++proc_user_backtrace(int pid)
++{
++	thread_t threads[PROC_BT_MAX_THREADS];
++	uintptr_t bt[PROC_BT_FRAMES];
++	char line[256];
++	struct uthread *uth;
++	thread_t th;
++	proc_t p;
++	uint32_t frames;
++	bool user_64;
++	size_t off;
++	int count = 0;
++	int i, j, wrote;
++
++	if ((p = proc_find(pid)) == PROC_NULL) {
++		return;
++	}
++
++	proc_lock(p);
++	TAILQ_FOREACH(uth, &p->p_uthlist, uu_list) {
++		th = uth->uu_context.vc_thread;
++
++		if (count >= PROC_BT_MAX_THREADS) {
++			break;
++		}
++		if (th == THREAD_NULL) {
++			continue;
++		}
++		thread_reference(th);
++		threads[count++] = th;
++	}
++	proc_unlock(p);
++
++	printf("bt: %s[%d] %d thread(s)\n", &p->p_comm[0], pid, count);
++
++	for (i = 0; i < count; i++) {
++		/*
++		 * A non-zero return still leaves behind whatever frames it
++		 * did manage -- a stack that stops being walkable half way
++		 * up is the normal case, not a failure -- so the count is
++		 * what is read, not the status.
++		 */
++		frames = 0;
++		user_64 = false;
++		(void)backtrace_thread_user(threads[i], bt, PROC_BT_FRAMES,
++		    &frames, &user_64);
++
++		if (frames == 0) {
++			printf("  t%-2d (no user state)\n", i);
++			thread_deallocate(threads[i]);
++			continue;
++		}
++
++		wrote = snprintf(line, sizeof(line), "  t%-2d", i);
++		off = (wrote > 0) ? (size_t)wrote : 0;
++		for (j = 0; j < (int)frames; j++) {
++			wrote = snprintf(line + off, sizeof(line) - off,
++			    " 0x%llx", (unsigned long long)bt[j]);
++			if (wrote < 0 || (size_t)wrote >= sizeof(line) - off) {
++				break;
++			}
++			off += (size_t)wrote;
++		}
++		printf("%s\n", line);
++
++		thread_deallocate(threads[i]);
++	}
++
++	proc_rele(p);
++}
++
+ void
+ proc_name_kdp(task_t t, char * buf, int size)
+ {
+diff -ruN a/iokit/Kernel/IOMobileFramebufferShim.cpp b/iokit/Kernel/IOMobileFramebufferShim.cpp
+--- a/iokit/Kernel/IOMobileFramebufferShim.cpp	2026-11-06 23:40:25.402607943 +0300
++++ b/iokit/Kernel/IOMobileFramebufferShim.cpp	2026-11-06 23:42:40.253469750 +0300
+@@ -127,11 +127,43 @@
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOLib.h>
@@ -156,10 +219,18 @@ answered while fsck was still running, three processes in.
 +extern "C" int disableConsoleOutput;
 +
 +/*
++ * bsd/kern/kern_proc.c: the user backtrace of every thread of one live
++ * process. The roll call says a process exists; this says what it is
++ * waiting for, which is the only question left about a process that
++ * neither crashes nor draws.
++ */
++extern "C" void proc_user_backtrace(int pid);
++
++/*
   * The selectors, named from the framework's own callers. Each was found by
   * running with none of them implemented and reading the numbers the console
   * printed back, then looking for the IOConnectCallScalarMethod that passes
-@@ -158,6 +182,33 @@
+@@ -158,6 +190,33 @@
  #define kIOMFBSupportedFrameInfo 74
  
  /*
@@ -193,7 +264,7 @@ answered while fsck was still running, three processes in.
   * Notification types, as the framework numbers them. 3 is frame info and 5
   * is vsync; the rest are not used by anything seen so far. Eight is room
   * for all of them and a bounds check that cannot be argued with.
-@@ -165,6 +216,30 @@
+@@ -165,6 +224,30 @@
  #define kIOMFBNotifyTypes       8
  
  /*
@@ -224,7 +295,7 @@ answered while fsck was still running, three processes in.
   * The one display. This is what GetID answers. It is not the number the
   * window server matches on -- that one is a counter inside QuartzCore,
   * handed out when the CAWindowServerDisplay is built and carried back to
-@@ -215,10 +290,37 @@
+@@ -215,10 +298,86 @@
  /* One number per user client, so the probes can be told from the keeper. */
  static volatile SInt32 iomfb_client_count;
  
@@ -248,6 +319,55 @@ answered while fsck was still running, three processes in.
 +#define kIOMFBProcListMaxPid    8192
 +#define kIOMFBProcListPasses    6
 +
++/*
++ * btname: which processes the roll call backtraces as it names them.
++ *
++ * A comma separated list of name prefixes, matched against p_comm, which
++ * the kernel truncates to sixteen characters -- so a prefix is all there
++ * is to match on anyway. Backtracing everything would bury the two lines
++ * that matter under seventy processes' worth of idle runloops, and the
++ * console has no scrollback.
++ *
++ * With proclist set and btname absent this defaults to the two processes
++ * the display depends on. btname= with nothing after it turns it off.
++ */
++#define kIOMFBBtNameMax         128
++static char iomfb_bt_names[kIOMFBBtNameMax] = "SpringBoard,backboardd";
++
++static bool
++iomfb_bt_wanted(const char *name)
++{
++	const char *p = iomfb_bt_names;
++
++	if (name[0] == '\0') {
++		return false;
++	}
++
++	while (*p != '\0') {
++		const char *n = name;
++
++		while (*p != '\0' && *p != ',' && *p == *n) {
++			p++;
++			n++;
++		}
++		/*
++		 * A match is the whole list entry consumed: the entry is a
++		 * prefix of the name. Anything else means skipping to the
++		 * next comma and trying again.
++		 */
++		if (*p == '\0' || *p == ',') {
++			return true;
++		}
++		while (*p != '\0' && *p != ',') {
++			p++;
++		}
++		if (*p == ',') {
++			p++;
++		}
++	}
++	return false;
++}
++
  class IOMobileFramebuffer : public IOService
  {
  	OSDeclareDefaultStructors(IOMobileFramebuffer);
@@ -262,7 +382,7 @@ answered while fsck was still running, three processes in.
  public:
  	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	virtual IOReturn newUserClient(task_t owningTask, void *securityID,
-@@ -234,18 +336,45 @@
+@@ -234,18 +393,45 @@
  	uint32_t                  fSerial;
  
  	/*
@@ -309,7 +429,7 @@ answered while fsck was still running, three processes in.
  	IOReturn handleMethod(uint32_t selector,
  	    IOExternalMethodArguments *arguments,
  	    IOExternalMethodDispatch *dispatch, OSObject *target,
-@@ -354,6 +483,14 @@
+@@ -354,6 +540,15 @@
  	if (PE_parse_boot_argn("iomfbaccept", &on, sizeof(on))) {
  		iomfb_accept = (int)on;
  	}
@@ -321,10 +441,11 @@ answered while fsck was still running, three processes in.
 +	if (PE_parse_boot_argn("proclist", &on, sizeof(on))) {
 +		iomfb_proclist = (on > 100000) ? 100000 : on;
 +	}
++	PE_parse_boot_argn("btname", iomfb_bt_names, sizeof(iomfb_bt_names));
  
  	/*
  	 * Matched from gIOKernelConfigTables against IOResources, so there is
-@@ -368,9 +505,75 @@
+@@ -368,9 +563,83 @@
  	    iomfb_frameinfo ? "one field" : "none",
  	    iomfb_notify ? "accepted" : "refused",
  	    iomfb_accept ? "accepted" : "refused");
@@ -370,6 +491,14 @@ answered while fsck was still running, three processes in.
 +		IOLog("  pid %-5d %s\n", pid, name[0] ? name : "?");
 +		proc_rele(p);
 +		found++;
++		/*
++		 * Released first: proc_user_backtrace takes its own
++		 * reference, and holding two across a walk that can fault
++		 * buys nothing.
++		 */
++		if (iomfb_bt_wanted(name)) {
++			proc_user_backtrace(pid);
++		}
 +	}
 +	IOLog("IOMobileFramebuffer: ---- %d live ----\n", found);
 +}
@@ -400,7 +529,7 @@ answered while fsck was still running, three processes in.
  IOReturn
  IOMobileFramebuffer::newUserClient(task_t owningTask, void *securityID,
      UInt32 type, IOUserClient **handler)
-@@ -425,6 +628,9 @@
+@@ -425,6 +694,9 @@
  	bzero(fNotifyRefCon, sizeof(fNotifyRefCon));
  	bzero(fNotifyCallback, sizeof(fNotifyCallback));
  	bzero(fNotifyContext, sizeof(fNotifyContext));
@@ -410,7 +539,7 @@ answered while fsck was still running, three processes in.
  
  	/*
  	 * Numbered from one on the way in rather than on the way out, so that
-@@ -460,6 +666,8 @@
+@@ -460,6 +732,8 @@
  {
  	IOLog("IOMobileFramebuffer: [%u] closed\n", (unsigned)fSerial);
  
@@ -419,7 +548,7 @@ answered while fsck was still running, three processes in.
  	if (!isInactive()) {
  		terminate();
  	}
-@@ -512,11 +720,142 @@
+@@ -512,11 +786,142 @@
  	return ret;
  }
  
@@ -562,7 +691,7 @@ answered while fsck was still running, three processes in.
  	for (i = 0; i < kIOMFBNotifyTypes; i++) {
  		if (fNotifyPort[i] != MACH_PORT_NULL) {
  			releaseNotificationPort(fNotifyPort[i]);
-@@ -755,6 +1094,15 @@
+@@ -755,6 +1160,15 @@
  		    fNotifyCallback[type] ? "on" : "off",
  		    (unsigned long long)type);
  
@@ -578,7 +707,7 @@ answered while fsck was still running, three processes in.
  		arguments->scalarOutputCount = 0;
  		return kIOReturnSuccess;
  	}
-@@ -859,6 +1207,104 @@
+@@ -859,6 +1273,104 @@
  		return kIOReturnSuccess;
  	}
  
@@ -683,8 +812,9 @@ answered while fsck was still running, three processes in.
  	default:
  		break;
  	}
---- /dev/null
-+++ b/iokit/Kernel/IOSurfaceShim.cpp
+diff -ruN a/iokit/Kernel/IOSurfaceShim.cpp b/iokit/Kernel/IOSurfaceShim.cpp
+--- a/iokit/Kernel/IOSurfaceShim.cpp	1970-01-01 02:00:00.000000000 +0200
++++ b/iokit/Kernel/IOSurfaceShim.cpp	2026-11-06 23:40:25.483058997 +0300
 @@ -0,0 +1,709 @@
 +/*
 + * IOSurfaceShim.cpp -- enough of IOSurface that the window server can be
@@ -1395,3 +1525,33 @@ answered while fsck was still running, three processes in.
 +
 +	return ret;
 +}
+diff -ruN a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp	2026-11-06 23:40:25.402387939 +0300
++++ b/iokit/KernelConfigTables.cpp	2026-11-06 23:40:25.482746671 +0300
+@@ -58,6 +58,18 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOMobileFramebuffer;"
+     "     'IOProbeScore'    = 1000:32;"
++    "   },"
++    /*
++     * The surface allocator, started the same way and for the same reason:
++     * no kext, so no personality of its own. IOResources again, and a match
++     * category of its own so that it and the framebuffer do not compete for
++     * the one driver IOKit starts per nub.
++     */
++    "   {"
++    "     'IOClass'         = IOCoreSurfaceRoot;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOCoreSurfaceRoot;"
++    "     'IOProbeScore'    = 1000:32;"
+     "   }"
+     ")";
+ 
+diff -ruN a/iokit/conf/files b/iokit/conf/files
+--- a/iokit/conf/files	2026-11-06 23:40:25.402263789 +0300
++++ b/iokit/conf/files	2026-11-06 23:40:25.482633513 +0300
+@@ -114,3 +114,4 @@
+ 
+ # Display
+ iokit/Kernel/IOMobileFramebufferShim.cpp		optional iokitcpp
++iokit/Kernel/IOSurfaceShim.cpp		optional iokitcpp
