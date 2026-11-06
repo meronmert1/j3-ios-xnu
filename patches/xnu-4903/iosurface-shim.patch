@@ -77,6 +77,13 @@ than two arguments and says so, reading args[0] as a 64-bit swap id and
 args[1] as a 32-bit count; the vsync callback takes three times. There is
 no real vblank to follow, so the rate is made up -- 60 Hz, boot-arg
 iomfbtickhz, 0 to stop it.
+The first boot with that clock showed the other half of it. backboardd took
+the notification and died on the spot, sig 11, pc 0x54014a00 against a
+refcon of 0x154014A00 -- it had jumped to the low half of its own context.
+setAsyncReference64's four argument form leaves kIOUCAsync64Flag clear, so
+sendAsyncResult64 sends the msg32 layout with every reference slot REF32'd,
+and a 64-bit reader takes the func out of the wrong place. The five
+argument form, given the owning task, sets the flag.
 
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
@@ -285,7 +292,7 @@ iomfbtickhz, 0 to stop it.
  	if (!isInactive()) {
  		terminate();
  	}
-@@ -512,11 +622,131 @@
+@@ -512,11 +622,142 @@
  	return ret;
  }
  
@@ -312,9 +319,20 @@ iomfbtickhz, 0 to stop it.
 +	}
 +
 +	bzero(ref, sizeof(ref));
++
++	/*
++	 * The task matters. The four argument form of this leaves
++	 * kIOUCAsync64Flag clear, and sendAsyncResult64 then takes its msg32
++	 * branch and REF32s every slot of the reference on the way out. A
++	 * 64-bit caller reads that back as the 64-bit layout, so the whole
++	 * array shifts by half a slot and it calls the low half of the refcon
++	 * as the function. That is a jump to a number, and it is exactly what
++	 * backboardd did: refcon 0x154014A00, pc 0x54014A00. The five
++	 * argument form sets the flag when the task's map is 64-bit.
++	 */
 +	IOUserClient::setAsyncReference64(ref, fNotifyPort[type],
 +	    (mach_vm_address_t)fNotifyCallback[type],
-+	    (io_user_reference_t)fNotifyContext[type]);
++	    (io_user_reference_t)fNotifyContext[type], fTask);
 +
 +	sendAsyncResult64(ref, kIOReturnSuccess, args, numArgs);
 +}
@@ -417,7 +435,7 @@ iomfbtickhz, 0 to stop it.
  	for (i = 0; i < kIOMFBNotifyTypes; i++) {
  		if (fNotifyPort[i] != MACH_PORT_NULL) {
  			releaseNotificationPort(fNotifyPort[i]);
-@@ -755,6 +985,15 @@
+@@ -755,6 +996,15 @@
  		    fNotifyCallback[type] ? "on" : "off",
  		    (unsigned long long)type);
  
@@ -433,7 +451,7 @@ iomfbtickhz, 0 to stop it.
  		arguments->scalarOutputCount = 0;
  		return kIOReturnSuccess;
  	}
-@@ -859,6 +1098,104 @@
+@@ -859,6 +1109,104 @@
  		return kIOReturnSuccess;
  	}
  
