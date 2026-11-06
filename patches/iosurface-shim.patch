@@ -1,0 +1,1557 @@
+Say where a living process is stuck.
+
+The display path is now complete on the kernel side and the window server
+agrees. backboardd opens the framebuffer, runs the whole mode set --
+selectors 18, 57, 7, 15, 22, 8, 33, 74 -- registers both notification
+types, takes the frame clock, and turns hardware vsync on:
+
+    IOMobileFramebuffer: [2] notifications on for type 5
+    IOMobileFramebuffer: [2] selector 72 in 4{9018240232,5268125696,5,0}
+
+and then nothing, for as long as the handset is left on. No selector 3, no
+swap, and -- the part that says where the fault really is -- not one
+IOCoreSurfaceRoot open, by any process, ever. On a live system dozens of
+processes hold surfaces by this point. Here nobody has asked for one.
+
+Three things were tried against the window server and all three landed
+without changing that. CA::WindowServer::IOMFBServer::add_vsync_source
+ends with a gate on a client count that is zero, so hardware vsync was
+never switched on; removing the gate switched it on, and reading
+vsync_callback afterwards showed why it changed nothing -- the count is a
+one-shot render request that the callback itself decrements, so forcing
+the clock on produces a clock with nothing to drive. Then the display
+itself: CA::WindowServer::IOMFBDisplay::can_update() calls is_enabled()
+through the vtable and returns false the moment it is false, and
+AppleDisplay's constructor builds its flag word out of 0x9004, which does
+not include the enabled bit, while the only thing that sets that bit is
+-[CAWindowServerDisplay setDisabled:] reached from a MIG message nothing
+here sends. Making the display be born enabled, and then making
+is_enabled() unconditional, changed nothing either.
+
+That exhausts what can be learned by reading the window server. Everything
+it is supposed to do, it has done; what is missing is a client. SpringBoard
+is alive in every roll call, at the same pid, for many minutes, and it
+never crashes and never allocates a surface, so it is not failing -- it is
+waiting. backboardd may be waiting too: if its main thread is still inside
+-[CAWindowServer _detectDisplays] then the Mach services it is supposed to
+register do not exist yet, and SpringBoard blocking on a bootstrap lookup
+of one of them would look exactly like this from outside.
+
+A wait leaves no corpse, so exitbt has nothing to print. But a blocked
+thread keeps its user state in the same place a dying one does, and
+backtrace_thread_user() in osfmk already knows how to walk another task's
+stack: it takes a reference on the target's map, switches to it so copyin
+resolves there, walks the frame chain and switches back. What is missing
+is only the loop over a process's threads, which is the first half of this
+change: proc_user_backtrace(pid) collects the threads under the proc lock,
+references them so a libdispatch worker retiring mid-walk cannot be walked
+after it is freed, drops the lock, and prints one line of return addresses
+per thread.
+
+The second half hangs it off the roll call, which already walks the pid
+space and names what answers. btname is a comma separated list of name
+prefixes -- p_comm is truncated to sixteen characters, so a prefix is all
+there is to match against -- and it defaults to SpringBoard,backboardd,
+because backtracing seventy idle processes would bury the two lines that
+matter on a console with no scrollback. btname= with nothing after it
+turns it off.
+
+These are addresses and not symbols, for the same reason exitbt's are:
+nothing in the kernel knows where any of it was loaded. That has been
+enough every time so far. A slide is a multiple of 0x4000, so the low
+fourteen bits of a frame name the call site whatever the slide is, and the
+distance between two frames inside one image is invariant; a frame that
+lands in a dylib already extracted from the shared cache pins the slide
+outright, and then every other frame in that cache can be named.
+diff -ruN a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+--- a/bsd/kern/kern_proc.c	2026-10-24 11:54:21.242330801 +0300
++++ b/bsd/kern/kern_proc.c	2026-11-06 23:43:49.298828162 +0300
+@@ -178,6 +178,7 @@
+ 
+ #if PROC_REF_DEBUG
+ #include <kern/backtrace.h>
++#include <kern/thread.h>      /* thread_reference, for proc_user_backtrace */
+ #endif
+ 
+ typedef uint64_t unaligned_u64 __attribute__((aligned(1)));
+@@ -908,6 +909,108 @@
+ 	}
+ }
+ 
++/*
++ * Bring-up: where a process that is not dying is stuck.
++ *
++ * exitbt prints the backtrace of a thread that has just taken a signal,
++ * which answers why a process died. It says nothing about one that is
++ * alive and idle, and that is the state the window server and SpringBoard
++ * are both in on this handset: present in every roll call, never crashing,
++ * never drawing. Whatever is holding them is a wait, not a fault, and a
++ * wait leaves no corpse to read.
++ *
++ * A blocked thread has its user state saved in exactly the same place a
++ * dying one does, so the same frame walk works, with one difference: the
++ * stack belongs to another task, so the copyin has to run with that task's
++ * map installed. backtrace_thread_user() already does that -- it switches
++ * the map, walks the chain and switches back -- so all this adds is the
++ * loop over the process's threads and a line each.
++ *
++ * The threads are collected under the proc lock and referenced before the
++ * lock is dropped, because the walk can fault and must not hold it, and a
++ * libdispatch worker that retires in between would otherwise be walked
++ * after it was freed.
++ *
++ * As with exitbt these are addresses and not symbols: nothing here knows
++ * where any of it was loaded. That is enough, because the distance between
++ * two frames inside one image survives the slide, which is what names the
++ * call site.
++ */
++#define PROC_BT_FRAMES          10
++#define PROC_BT_MAX_THREADS     12
++
++void
++proc_user_backtrace(int pid)
++{
++	thread_t threads[PROC_BT_MAX_THREADS];
++	uintptr_t bt[PROC_BT_FRAMES];
++	char line[256];
++	struct uthread *uth;
++	thread_t th;
++	proc_t p;
++	uint32_t frames;
++	bool user_64;
++	size_t off;
++	int count = 0;
++	int i, j, wrote;
++
++	if ((p = proc_find(pid)) == PROC_NULL) {
++		return;
++	}
++
++	proc_lock(p);
++	TAILQ_FOREACH(uth, &p->p_uthlist, uu_list) {
++		th = uth->uu_context.vc_thread;
++
++		if (count >= PROC_BT_MAX_THREADS) {
++			break;
++		}
++		if (th == THREAD_NULL) {
++			continue;
++		}
++		thread_reference(th);
++		threads[count++] = th;
++	}
++	proc_unlock(p);
++
++	printf("bt: %s[%d] %d thread(s)\n", &p->p_comm[0], pid, count);
++
++	for (i = 0; i < count; i++) {
++		/*
++		 * A non-zero return still leaves behind whatever frames it
++		 * did manage -- a stack that stops being walkable half way
++		 * up is the normal case, not a failure -- so the count is
++		 * what is read, not the status.
++		 */
++		frames = 0;
++		user_64 = false;
++		(void)backtrace_thread_user(threads[i], bt, PROC_BT_FRAMES,
++		    &frames, &user_64);
++
++		if (frames == 0) {
++			printf("  t%-2d (no user state)\n", i);
++			thread_deallocate(threads[i]);
++			continue;
++		}
++
++		wrote = snprintf(line, sizeof(line), "  t%-2d", i);
++		off = (wrote > 0) ? (size_t)wrote : 0;
++		for (j = 0; j < (int)frames; j++) {
++			wrote = snprintf(line + off, sizeof(line) - off,
++			    " 0x%llx", (unsigned long long)bt[j]);
++			if (wrote < 0 || (size_t)wrote >= sizeof(line) - off) {
++				break;
++			}
++			off += (size_t)wrote;
++		}
++		printf("%s\n", line);
++
++		thread_deallocate(threads[i]);
++	}
++
++	proc_rele(p);
++}
++
+ void
+ proc_name_kdp(task_t t, char * buf, int size)
+ {
+diff -ruN a/iokit/Kernel/IOMobileFramebufferShim.cpp b/iokit/Kernel/IOMobileFramebufferShim.cpp
+--- a/iokit/Kernel/IOMobileFramebufferShim.cpp	2026-11-06 23:40:25.402607943 +0300
++++ b/iokit/Kernel/IOMobileFramebufferShim.cpp	2026-11-06 23:42:40.253469750 +0300
+@@ -127,11 +127,43 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <mach/mach_time.h>    /* mach_absolute_time, for the vsync stamps */
++#include <sys/proc.h>          /* proc_find/proc_name/proc_rele, for the roll call */
+ #include <libkern/OSAtomic.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/proc.h>          /* proc_selfpid, to name who opened a client */
+ 
+ /*
++ * From iokit/Kernel/IOSurfaceShim.cpp: the kernel-side address of a
++ * surface's pixels, by the id the swap request carries. Declared here
++ * rather than in a header because the two files are the only things in
++ * this tree that know about each other.
++ */
++extern "C" void *IOSurfaceShimBytes(uint32_t id, uint32_t *width,
++    uint32_t *height, uint32_t *stride);
++
++/*
++ * The kernel console draws into this same framebuffer. Until the display is
++ * claimed, every IOLog repaints over whatever the window server just swapped
++ * in, so the first frame that actually reaches the panel is immediately
++ * overwritten by the next line of boot spam. A real display driver takes the
++ * framebuffer away from the console when it comes up; this is that moment,
++ * deferred to the first good swap so a failing surface path still prints.
++ * Defined in bsd/dev/arm/km.c, read by conslog_putc/cnputc in printf.c.
++ */
++extern "C" int disableConsoleOutput;
++
++/*
++ * bsd/kern/kern_proc.c: the user backtrace of every thread of one live
++ * process. The roll call says a process exists; this says what it is
++ * waiting for, which is the only question left about a process that
++ * neither crashes nor draws.
++ */
++extern "C" void proc_user_backtrace(int pid);
++
++/*
+  * The selectors, named from the framework's own callers. Each was found by
+  * running with none of them implemented and reading the numbers the console
+  * printed back, then looking for the IOConnectCallScalarMethod that passes
+@@ -158,6 +190,33 @@
+ #define kIOMFBSupportedFrameInfo 74
+ 
+ /*
++ * The swap path, named the same way -- from the framework's own symbols.
++ * kern_SwapBegin takes nothing and answers one scalar, the swap id;
++ * kern_SwapEnd sends the whole request as a 0x278 byte structure;
++ * kern_SwapWait passes three scalars and wants nothing back.
++ *
++ * Selector 3, kern_GetLayerDefaultSurface, is deliberately not here. It
++ * hands back a surface the driver owns, and this one owns none; refusing
++ * it says so, where answering with a zero would send a caller off with a
++ * surface id that resolves to nothing.
++ */
++#define kIOMFBSwapBegin         4
++#define kIOMFBSwapEnd           5
++#define kIOMFBSwapWait          6
++
++/*
++ * Inside the 0x278 byte swap request, read out of kern_SwapBegin and
++ * kern_SwapSetLayer in the framework. SwapBegin zeroes the region and
++ * stores the id it was given at +0x40; SwapSetLayer reduces each
++ * IOSurfaceRef to IOSurfaceGetID(surface) and puts the three layers at
++ * +0x44, +0x48 and +0x4c, so the kernel only ever sees ids. Layer 0 is
++ * the one the window server draws the screen into.
++ */
++#define kIOMFBSwapRequestSize   0x278
++#define kIOMFBSwapReqID         0x40
++#define kIOMFBSwapReqLayer0     0x44
++
++/*
+  * Notification types, as the framework numbers them. 3 is frame info and 5
+  * is vsync; the rest are not used by anything seen so far. Eight is room
+  * for all of them and a bounds check that cannot be argued with.
+@@ -165,6 +224,30 @@
+ #define kIOMFBNotifyTypes       8
+ 
+ /*
++ * The two that matter, by the index the framework's own NotifyCallbackFuncs
++ * table gives them: 3 reaches FrameInfoNotifyFunc and 5 reaches
++ * IOMobileFramebufferVsyncNotifyFunc.
++ *
++ * FrameInfoNotifyFunc drops anything with fewer than two arguments -- it
++ * says so, "dropped notification, numArgs is %u, expected %u" -- and reads
++ * args[0] as a 64-bit swap id and args[1] as a 32-bit count, which it then
++ * turns into the CFDictionary that IOMFBServer::frame_info_callback takes.
++ * The vsync callback takes three, all of them times.
++ */
++#define kIOMFBNotifyFrameInfo   3
++#define kIOMFBNotifyVsync       5
++
++/*
++ * How often the panel is told to have finished a frame. There is no real
++ * vblank to follow here: the controller was pointed at the framebuffer by
++ * the bootloader and nothing in this tree drives it, so the clock has to be
++ * made rather than observed. 60 is the panel's rate; boot-arg iomfbtickhz
++ * changes it, and 0 stops the clock entirely.
++ */
++#define kIOMFBTickHzDefault     60
++static uint32_t iomfb_tick_hz = kIOMFBTickHzDefault;
++
++/*
+  * The one display. This is what GetID answers. It is not the number the
+  * window server matches on -- that one is a counter inside QuartzCore,
+  * handed out when the CAWindowServerDisplay is built and carried back to
+@@ -215,10 +298,86 @@
+ /* One number per user client, so the probes can be told from the keeper. */
+ static volatile SInt32 iomfb_client_count;
+ 
++/*
++ * Repeating roll call, boot-arg proclist=<seconds>, 0 to leave it off.
++ *
++ * Everything below the window server is invisible from here: the kernel
++ * prints a line when a process dies and nothing at all when one lives, so
++ * a daemon that is up and quietly waiting looks exactly like a daemon that
++ * was never started. Those two want opposite fixes.
++ *
++ * It repeats rather than firing once because a second on this device is
++ * not a second. The timebase is wrong by a large and unmeasured factor --
++ * the first attempt at this asked for 600 and was answered while fsck was
++ * still running, three processes in -- so any single delay is a guess.
++ * A handful of passes at a widening interval lands one of them on the
++ * settled system whatever the factor turns out to be, and the gap between
++ * two passes measures the churn as a bonus.
++ */
++static uint32_t iomfb_proclist;
++#define kIOMFBProcListMaxPid    8192
++#define kIOMFBProcListPasses    6
++
++/*
++ * btname: which processes the roll call backtraces as it names them.
++ *
++ * A comma separated list of name prefixes, matched against p_comm, which
++ * the kernel truncates to sixteen characters -- so a prefix is all there
++ * is to match on anyway. Backtracing everything would bury the two lines
++ * that matter under seventy processes' worth of idle runloops, and the
++ * console has no scrollback.
++ *
++ * With proclist set and btname absent this defaults to the two processes
++ * the display depends on. btname= with nothing after it turns it off.
++ */
++#define kIOMFBBtNameMax         128
++static char iomfb_bt_names[kIOMFBBtNameMax] = "SpringBoard,backboardd";
++
++static bool
++iomfb_bt_wanted(const char *name)
++{
++	const char *p = iomfb_bt_names;
++
++	if (name[0] == '\0') {
++		return false;
++	}
++
++	while (*p != '\0') {
++		const char *n = name;
++
++		while (*p != '\0' && *p != ',' && *p == *n) {
++			p++;
++			n++;
++		}
++		/*
++		 * A match is the whole list entry consumed: the entry is a
++		 * prefix of the name. Anything else means skipping to the
++		 * next comma and trying again.
++		 */
++		if (*p == '\0' || *p == ',') {
++			return true;
++		}
++		while (*p != '\0' && *p != ',') {
++			p++;
++		}
++		if (*p == ',') {
++			p++;
++		}
++	}
++	return false;
++}
++
+ class IOMobileFramebuffer : public IOService
+ {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ 
++	IOWorkLoop         *fProcLoop;
++	IOTimerEventSource *fProcTimer;
++	uint32_t            fProcPass;
++
++	void        rollCall(void);
++	static void rollCallAction(OSObject *owner, IOTimerEventSource *sender);
++
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	virtual IOReturn newUserClient(task_t owningTask, void *securityID,
+@@ -234,18 +393,45 @@
+ 	uint32_t                  fSerial;
+ 
+ 	/*
++	 * The id handed out by SwapBegin and quoted back in the request.
++	 * Nothing checks it yet; it is kept per client so that two clients
++	 * swapping at once cannot be confused for one.
++	 */
++	uint32_t                  fSwapID;
++
++	/*
+ 	 * What the framework asks us to remember about notifications. The port
+ 	 * is ours once registerNotificationPort has returned success and has
+ 	 * to be balanced with releaseNotificationPort; the callback and the
+ 	 * context are the two values selector 72 hands over, which a real
+ 	 * driver puts in the mach message it sends when the event happens.
+-	 * Nothing is sent yet -- this is the remembering, not the telling.
++	 * Remembering these is only half of it. The window server adds the
++	 * run loop source this port feeds and then waits on it, so a driver
++	 * that registers the port and never sends anything leaves the whole
++	 * display bring-up folded up behind a callback that never arrives:
++	 * no frame info, so no initialize_timings, so no mode set, so no
++	 * add_vsync_source, so no frame clock and nothing ever drawn.
+ 	 */
+ 	mach_port_t               fNotifyPort[kIOMFBNotifyTypes];
+ 	io_user_reference_t       fNotifyRefCon[kIOMFBNotifyTypes];
+ 	uint64_t                  fNotifyCallback[kIOMFBNotifyTypes];
+ 	uint64_t                  fNotifyContext[kIOMFBNotifyTypes];
+ 
++	/*
++	 * The made-up frame clock that sends them. Started the moment a type
++	 * is armed and stopped when the client goes away.
++	 */
++	IOWorkLoop               *fTickLoop;
++	IOTimerEventSource       *fTick;
++	uint64_t                  fFrameSeq;
++
++	void     startTicking(void);
++	void     stopTicking(void);
++	void     deliverNotify(uint32_t type, io_user_reference_t *args,
++	    uint32_t numArgs);
++	void     tick(void);
++	static void tickAction(OSObject *owner, IOTimerEventSource *sender);
++
+ 	IOReturn handleMethod(uint32_t selector,
+ 	    IOExternalMethodArguments *arguments,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target,
+@@ -354,6 +540,15 @@
+ 	if (PE_parse_boot_argn("iomfbaccept", &on, sizeof(on))) {
+ 		iomfb_accept = (int)on;
+ 	}
++	on = kIOMFBTickHzDefault;
++	if (PE_parse_boot_argn("iomfbtickhz", &on, sizeof(on))) {
++		iomfb_tick_hz = (on > 240) ? 240 : on;
++	}
++	on = 0;
++	if (PE_parse_boot_argn("proclist", &on, sizeof(on))) {
++		iomfb_proclist = (on > 100000) ? 100000 : on;
++	}
++	PE_parse_boot_argn("btname", iomfb_bt_names, sizeof(iomfb_bt_names));
+ 
+ 	/*
+ 	 * Matched from gIOKernelConfigTables against IOResources, so there is
+@@ -368,9 +563,83 @@
+ 	    iomfb_frameinfo ? "one field" : "none",
+ 	    iomfb_notify ? "accepted" : "refused",
+ 	    iomfb_accept ? "accepted" : "refused");
++
++	if (iomfb_proclist != 0) {
++		fProcLoop = IOWorkLoop::workLoop();
++		if (fProcLoop != NULL) {
++			fProcTimer = IOTimerEventSource::timerEventSource(this,
++			    &rollCallAction);
++			if (fProcTimer != NULL &&
++			    fProcLoop->addEventSource(fProcTimer) ==
++			    kIOReturnSuccess) {
++				fProcTimer->setTimeoutMS(iomfb_proclist * 1000);
++			}
++		}
++	}
+ 	return true;
+ }
+ 
++/*
++ * Walk the pid space once and name everything that answers. proc_find takes
++ * a reference, so every hit is released before moving on; a pid nobody holds
++ * simply returns NULL and is skipped. Printed as one line per process so a
++ * photograph of the console is enough to read it.
++ */
++void
++IOMobileFramebuffer::rollCall(void)
++{
++	char name[64];
++	proc_t p;
++	int pid;
++	int found = 0;
++
++	IOLog("IOMobileFramebuffer: ---- roll call %u/%u ----\n",
++	    (unsigned)fProcPass + 1, (unsigned)kIOMFBProcListPasses);
++	for (pid = 1; pid < kIOMFBProcListMaxPid; pid++) {
++		p = proc_find(pid);
++		if (p == NULL) {
++			continue;
++		}
++		name[0] = '\0';
++		proc_name(pid, name, (int)sizeof(name));
++		IOLog("  pid %-5d %s\n", pid, name[0] ? name : "?");
++		proc_rele(p);
++		found++;
++		/*
++		 * Released first: proc_user_backtrace takes its own
++		 * reference, and holding two across a walk that can fault
++		 * buys nothing.
++		 */
++		if (iomfb_bt_wanted(name)) {
++			proc_user_backtrace(pid);
++		}
++	}
++	IOLog("IOMobileFramebuffer: ---- %d live ----\n", found);
++}
++
++void
++IOMobileFramebuffer::rollCallAction(OSObject *owner,
++    IOTimerEventSource *sender)
++{
++	IOMobileFramebuffer *me = OSDynamicCast(IOMobileFramebuffer, owner);
++
++	if (me == NULL) {
++		return;
++	}
++	me->rollCall();
++	me->fProcPass++;
++
++	/*
++	 * Each pass waits twice as long as the one before it, so six of them
++	 * span a factor of thirty-two. Whatever the clock is really doing,
++	 * one of those lands after the system has stopped moving.
++	 */
++	if (me->fProcPass < kIOMFBProcListPasses) {
++		sender->setTimeoutMS(iomfb_proclist * 1000 *
++		    (1U << me->fProcPass));
++	}
++}
++
+ IOReturn
+ IOMobileFramebuffer::newUserClient(task_t owningTask, void *securityID,
+     UInt32 type, IOUserClient **handler)
+@@ -425,6 +694,9 @@
+ 	bzero(fNotifyRefCon, sizeof(fNotifyRefCon));
+ 	bzero(fNotifyCallback, sizeof(fNotifyCallback));
+ 	bzero(fNotifyContext, sizeof(fNotifyContext));
++	fTickLoop = NULL;
++	fTick = NULL;
++	fFrameSeq = 0;
+ 
+ 	/*
+ 	 * Numbered from one on the way in rather than on the way out, so that
+@@ -460,6 +732,8 @@
+ {
+ 	IOLog("IOMobileFramebuffer: [%u] closed\n", (unsigned)fSerial);
+ 
++	stopTicking();
++
+ 	if (!isInactive()) {
+ 		terminate();
+ 	}
+@@ -512,11 +786,142 @@
+ 	return ret;
+ }
+ 
++/*
++ * Send one notification to whoever armed that type.
++ *
++ * IOConnectSetNotificationPort left the port here and selector 72 left the
++ * callback and the context, which is exactly the three things an async
++ * reference is built out of. setAsyncReference64 and sendAsyncResult64 are
++ * protected statics on IOUserClient, so a subclass may call them; what
++ * arrives on the other side is the framework's NotifyCallbackFuncs entry
++ * for the type, called as (refcon, result, args, numArgs).
++ */
++void
++IOMobileFramebufferUserClient::deliverNotify(uint32_t type,
++    io_user_reference_t *args, uint32_t numArgs)
++{
++	OSAsyncReference64 ref;
++
++	if (type >= kIOMFBNotifyTypes ||
++	    fNotifyPort[type] == MACH_PORT_NULL ||
++	    fNotifyCallback[type] == 0) {
++		return;
++	}
++
++	bzero(ref, sizeof(ref));
++
++	/*
++	 * The task matters. The four argument form of this leaves
++	 * kIOUCAsync64Flag clear, and sendAsyncResult64 then takes its msg32
++	 * branch and REF32s every slot of the reference on the way out. A
++	 * 64-bit caller reads that back as the 64-bit layout, so the whole
++	 * array shifts by half a slot and it calls the low half of the refcon
++	 * as the function. That is a jump to a number, and it is exactly what
++	 * backboardd did: refcon 0x154014A00, pc 0x54014A00. The five
++	 * argument form sets the flag when the task's map is 64-bit.
++	 */
++	IOUserClient::setAsyncReference64(ref, fNotifyPort[type],
++	    (mach_vm_address_t)fNotifyCallback[type],
++	    (io_user_reference_t)fNotifyContext[type], fTask);
++
++	sendAsyncResult64(ref, kIOReturnSuccess, args, numArgs);
++}
++
++void
++IOMobileFramebufferUserClient::tick(void)
++{
++	io_user_reference_t args[3];
++
++	fFrameSeq++;
++
++	/*
++	 * Frame info first, because that is the one the window server is
++	 * waiting on before it will set a mode. args[0] is the swap id the
++	 * framework reads as 64 bits, args[1] the count it reads as 32.
++	 */
++	args[0] = (io_user_reference_t)fFrameSeq;
++	args[1] = 0;
++	deliverNotify(kIOMFBNotifyFrameInfo, args, 2);
++
++	/*
++	 * Then vsync, which nothing arms until add_vsync_source has run, so
++	 * this is quiet until the chain above it has opened. Its three
++	 * arguments are times; there is no real vblank to timestamp, so the
++	 * clock that made this tick is the honest answer.
++	 */
++	args[0] = (io_user_reference_t)mach_absolute_time();
++	args[1] = args[0];
++	args[2] = (io_user_reference_t)fFrameSeq;
++	deliverNotify(kIOMFBNotifyVsync, args, 3);
++}
++
++void
++IOMobileFramebufferUserClient::tickAction(OSObject *owner,
++    IOTimerEventSource *sender)
++{
++	IOMobileFramebufferUserClient *me =
++	    OSDynamicCast(IOMobileFramebufferUserClient, owner);
++
++	if (me == NULL) {
++		return;
++	}
++	me->tick();
++	if (iomfb_tick_hz != 0) {
++		sender->setTimeoutMS(1000 / iomfb_tick_hz);
++	}
++}
++
++void
++IOMobileFramebufferUserClient::startTicking(void)
++{
++	if (fTick != NULL || iomfb_tick_hz == 0) {
++		return;
++	}
++
++	fTickLoop = IOWorkLoop::workLoop();
++	if (fTickLoop == NULL) {
++		return;
++	}
++	fTick = IOTimerEventSource::timerEventSource(this, &tickAction);
++	if (fTick == NULL ||
++	    fTickLoop->addEventSource(fTick) != kIOReturnSuccess) {
++		if (fTick != NULL) {
++			fTick->release();
++			fTick = NULL;
++		}
++		fTickLoop->release();
++		fTickLoop = NULL;
++		return;
++	}
++
++	IOLog("IOMobileFramebuffer: [%u] frame clock started at %u Hz\n",
++	    (unsigned)fSerial, (unsigned)iomfb_tick_hz);
++	fTick->setTimeoutMS(1000 / iomfb_tick_hz);
++}
++
++void
++IOMobileFramebufferUserClient::stopTicking(void)
++{
++	if (fTick != NULL) {
++		fTick->cancelTimeout();
++		if (fTickLoop != NULL) {
++			fTickLoop->removeEventSource(fTick);
++		}
++		fTick->release();
++		fTick = NULL;
++	}
++	if (fTickLoop != NULL) {
++		fTickLoop->release();
++		fTickLoop = NULL;
++	}
++}
++
+ void
+ IOMobileFramebufferUserClient::free(void)
+ {
+ 	uint32_t i;
+ 
++	stopTicking();
+ 	for (i = 0; i < kIOMFBNotifyTypes; i++) {
+ 		if (fNotifyPort[i] != MACH_PORT_NULL) {
+ 			releaseNotificationPort(fNotifyPort[i]);
+@@ -755,6 +1160,15 @@
+ 		    fNotifyCallback[type] ? "on" : "off",
+ 		    (unsigned long long)type);
+ 
++		/*
++		 * Armed, so start sending. Nothing downstream moves until the
++		 * first one arrives, and this is the earliest honest moment to
++		 * send it: the caller has just said where to send it to.
++		 */
++		if (fNotifyCallback[type] != 0) {
++			startTicking();
++		}
++
+ 		arguments->scalarOutputCount = 0;
+ 		return kIOReturnSuccess;
+ 	}
+@@ -859,6 +1273,104 @@
+ 		return kIOReturnSuccess;
+ 	}
+ 
++	case kIOMFBSwapBegin:
++		/*
++		 * One scalar out, the id for the swap that is starting. The
++		 * framework stores it in the request it is about to build and
++		 * sends it back with SwapEnd.
++		 */
++		if (arguments->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		arguments->scalarOutput[0] = ++fSwapID;
++		arguments->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++
++	case kIOMFBSwapEnd: {
++		/*
++		 * The swap itself. There is no scanout to repoint here -- the
++		 * display controller was pointed at the console framebuffer by
++		 * the bootloader and nothing in this tree moves it -- so the
++		 * swap is a copy: the surface named by layer 0 goes to the
++		 * pixels the console is already showing.
++		 *
++		 * That makes every frame cost a full-screen memcpy on one
++		 * Cortex-A53, which is the price of having no GPU and no
++		 * second scanout buffer. It is also the thing that can be
++		 * replaced later without anything above noticing.
++		 */
++		const uint8_t *req = (const uint8_t *)arguments->structureInput;
++		PE_Video video;
++		uint32_t id, sw, sh, sstride;
++		const uint8_t *src;
++		uint8_t *dst;
++		uint32_t rows, cols, y;
++
++		if (req == NULL ||
++		    arguments->structureInputSize < kIOMFBSwapRequestSize) {
++			return kIOReturnBadArgument;
++		}
++
++		id = *(const uint32_t *)(req + kIOMFBSwapReqLayer0);
++		if (id == 0) {
++			/* A swap with no layer 0 has nothing to show. */
++			return kIOReturnSuccess;
++		}
++
++		src = (const uint8_t *)IOSurfaceShimBytes(id, &sw, &sh,
++			&sstride);
++		if (src == NULL) {
++			IOLog("IOMobileFramebuffer: [%u] swap names surface "
++			    "%u, which is not one of ours\n", fSerial, id);
++			return kIOReturnNotFound;
++		}
++
++		if (PE_current_console(&video) != 0 ||
++		    video.v_baseAddr == 0) {
++			return kIOReturnNotReady;
++		}
++
++		dst = (uint8_t *)video.v_baseAddr;
++		rows = (sh < video.v_height) ? sh : video.v_height;
++		cols = (sw < video.v_width) ? sw : video.v_width;
++
++		for (y = 0; y < rows; y++) {
++			memcpy(dst + (size_t)y * video.v_rowBytes,
++			    src + (size_t)y * sstride, (size_t)cols * 4);
++		}
++
++		/*
++		 * The window server has drawn a real frame, so the display now
++		 * belongs to it. Stop the kernel console from painting over it.
++		 * Done once, and only after a copy that found its surface, so a
++		 * swap that named a surface we do not have leaves the console up
++		 * to carry the diagnostic. One line marks the handover; it is
++		 * the last thing the console shows.
++		 */
++		if (rows > 0 && !disableConsoleOutput) {
++			IOLog("IOMobileFramebuffer: [%u] display claimed by "
++			    "window server, console output off\n", fSerial);
++			disableConsoleOutput = 1;
++		}
++
++		if (iomfb_trace) {
++			IOLog("IOMobileFramebuffer: [%u] swap %u surface %u "
++			    "%ux%u -> %ux%u\n", fSerial,
++			    *(const uint32_t *)(req + kIOMFBSwapReqID),
++			    id, sw, sh,
++			    (unsigned)video.v_width,
++			    (unsigned)video.v_height);
++		}
++		return kIOReturnSuccess;
++	}
++
++	case kIOMFBSwapWait:
++		/*
++		 * The copy above finished before SwapEnd returned, so there
++		 * is never anything to wait for.
++		 */
++		return kIOReturnSuccess;
++
+ 	default:
+ 		break;
+ 	}
+diff -ruN a/iokit/Kernel/IOSurfaceShim.cpp b/iokit/Kernel/IOSurfaceShim.cpp
+--- a/iokit/Kernel/IOSurfaceShim.cpp	1970-01-01 02:00:00.000000000 +0200
++++ b/iokit/Kernel/IOSurfaceShim.cpp	2026-11-06 23:40:25.483058997 +0300
+@@ -0,0 +1,709 @@
++/*
++ * IOSurfaceShim.cpp -- enough of IOSurface that the window server can be
++ * handed somewhere to draw.
++ *
++ * There is no IOSurface in open-source xnu and there is no kext here to
++ * bring one, so the service the framework looks for simply does not exist
++ * on this handset. The display shim next door got as far as a display being
++ * found, built and added to CAWindowServer, and then the trace stopped: no
++ * selector 3, 4, 5 or 6 ever arrived, because a swap needs a surface and a
++ * surface needs this.
++ *
++ * Everything below was read out of
++ * /System/Library/Frameworks/IOSurface.framework on the device image. Calls
++ * inside a dylib extracted from the shared cache branch straight to the
++ * absolute address of the callee rather than through a stub, so the call
++ * sites were found by resolving __la_symbol_ptr first: IOConnectCallMethod
++ * is at 0x181124f48, and every site that branches there names itself
++ * through the framework's own C symbols.
++ *
++ * The service is opened in _iosConnectInitalize -- Apple's spelling, not a
++ * typo here:
++ *
++ *     IOServiceGetMatchingService(port, IOServiceNameMatching("IOCoreSurfaceRoot"))
++ *     IOServiceOpen(service, mach_task_self(), 0, &conn)
++ *
++ * so it is IOCoreSurfaceRoot on iOS, not the IOSurfaceRoot of the desktop,
++ * and the user client type is 0.
++ *
++ * The selectors, each named by the framework function that passes it:
++ *
++ *      0  IOSurfaceClientCreate      struct in, struct out
++ *      1  _ioSurfaceClientRelease    one scalar
++ *      2  IOSurfaceClientLock        0xc byte struct in
++ *      3  IOSurfaceClientUnlock      0xc byte struct in
++ *      4  IOSurfaceClientLookup      one scalar, the surface id
++ *      5  SetYCbCrMatrix
++ *      9  SetValue   10 CopyAllValues   11 RemoveValue
++ *     13  used once during _iosConnectInitalize
++ *     17/18  set and remove surface notify
++ *     19  IOSurfaceLog               20 SetPurgeable
++ *     21/22  set tiled, is tiled      23 SetTimestamp
++ *     25  CopyDataValueBytes         26 SetBulkAttachments
++ *     29  surface descriptions, for the debug description class
++ *     33/34  lookup from mach port, create mach port
++ *     35..41 the shared-event family
++ *
++ * Only the first five are implemented. The rest follow the rule the display
++ * shim already uses: one that asks for nothing back is accepted and
++ * dropped, one that wants an answer is refused so that the refusal stops
++ * where it happens and prints its own number.
++ *
++ * How the memory reaches the caller is the part worth being careful about.
++ * The framework does not import IOConnectMapMemory at all, so there is no
++ * second call that maps a surface: create_surface has to map it and hand
++ * the address back inside its output struct. That struct is unpacked by the
++ * parser at 0x1821dc424, which reads the plane count at +0x38 and then
++ * copies 0xdd0 - (0x20 - planes) * 0x6c bytes, treating zero planes as one.
++ * So the layout is a 0x50 byte header followed by up to 32 plane
++ * descriptors of 0x6c bytes each, and a non-planar surface is 0xbc bytes.
++ *
++ * The field offsets come from the accessors. Each of them unwraps the
++ * Objective-C object to the client record and tail-calls a two-instruction
++ * helper, and the client holds this struct at +0x58, so subtracting 0x58
++ * from the accessor's offset gives the offset here. The plane count landing
++ * on +0x38 that way is the same +0x38 the parser reads, which is the check
++ * that the whole mapping is right:
++ *
++ *     +0x00  base address of the mapping, in the caller's address space
++ *     +0x08  pointer to the shared state page; the seed is at its +0xc
++ *     +0x18  surface id
++ *     +0x1c  allocation size
++ *     +0x20  width
++ *     +0x24  height
++ *     +0x28  bytes per row
++ *     +0x2c  offset of plane 0 inside the mapping
++ *     +0x30  pixel format, a fourcc
++ *     +0x38  plane count
++ *     +0x40  bytes per element, 2 bytes
++ *     +0x42  element width, +0x43 element height, one byte each
++ *
++ * IOSurfaceGetBaseAddress returns +0x00 plus +0x2c and IOSurfaceGetBytesPerRow
++ * returns +0x28, both only while no plane is marked tiled. A single untiled
++ * plane is therefore the simple case and the one the window server asks for
++ * first, so that is the only case built here: plane count zero, one
++ * allocation, pixels starting one page in.
++ *
++ * That one page in front is not padding. +0x08 has to be a pointer the
++ * caller can read -- IOSurfaceGetSeed dereferences it -- so the allocation
++ * is a page of shared state followed by the pixels, both inside the same
++ * mapping, and +0x2c is the page size. One mapping, two uses, nothing to
++ * keep in step.
++ *
++ * The properties the caller asks for arrive as a dictionary serialized the
++ * binary way -- IOCFSerialize(props, 1) -- and OSUnserializeXML already
++ * routes that to OSUnserializeBinary on sight of the signature, so there is
++ * no parser to write here.
++ *
++ * Boot with iosurftrace=0 for none of the chatter.
++ */
++
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/c++/OSSerialize.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>          /* proc_selfpid, to name who opened a client */
++
++#define kIOSurfaceCreate        0
++#define kIOSurfaceRelease       1
++#define kIOSurfaceLock          2
++#define kIOSurfaceUnlock        3
++#define kIOSurfaceLookup        4
++
++/*
++ * The output struct: 0x50 of header and one 0x6c plane descriptor, which is
++ * what the parser copies when the plane count is zero.
++ */
++#define kIOSurfaceInfoSize      0xbc
++
++#define kIOSurfaceInfoBase      0x00
++#define kIOSurfaceInfoState     0x08
++#define kIOSurfaceInfoID        0x18
++#define kIOSurfaceInfoAllocSize 0x1c
++#define kIOSurfaceInfoWidth     0x20
++#define kIOSurfaceInfoHeight    0x24
++#define kIOSurfaceInfoStride    0x28
++#define kIOSurfaceInfoPlaneOff  0x2c
++#define kIOSurfaceInfoFormat    0x30
++#define kIOSurfaceInfoPlanes    0x38
++#define kIOSurfaceInfoBPE       0x40
++#define kIOSurfaceInfoElemW     0x42
++#define kIOSurfaceInfoElemH     0x43
++
++/*
++ * Sixty-four is not a measured figure. The window server wants a handful
++ * per display and nothing seen so far asks for more; the limit is here so
++ * that a client that leaks them runs into a refusal instead of into the
++ * kernel's memory.
++ */
++#define kIOSurfaceMaxSurfaces   64
++
++/* Mappings one client may hold. Same reasoning, smaller number. */
++#define kIOSurfaceMaxMaps       32
++
++/* Boot-arg iosurftrace, on unless it is turned off. */
++static int iosurf_trace = 1;
++
++struct iosurface_rec {
++	uint32_t                  id;
++	uint32_t                  width;
++	uint32_t                  height;
++	uint32_t                  stride;
++	uint32_t                  format;
++	uint32_t                  pixelBytes;      /* without the state page */
++	IOBufferMemoryDescriptor *md;
++};
++
++static struct iosurface_rec iosurf_table[kIOSurfaceMaxSurfaces];
++static IOLock                *iosurf_lock;
++static uint32_t               iosurf_next_id = 1;
++
++/* One number per user client, so one caller can be told from another. */
++static volatile SInt32 iosurf_client_count;
++
++static struct iosurface_rec *
++iosurf_find(uint32_t id)
++{
++	int i;
++
++	for (i = 0; i < kIOSurfaceMaxSurfaces; i++) {
++		if (iosurf_table[i].md != NULL && iosurf_table[i].id == id) {
++			return &iosurf_table[i];
++		}
++	}
++	return NULL;
++}
++
++/*
++ * What the display shim needs: the kernel-side address of a surface's
++ * pixels, so that a swap can copy them to the framebuffer. The pixels start
++ * one page into the allocation, behind the shared state page.
++ *
++ * Returned without a reference and without the lock held. Both callers are
++ * on the same thread as the swap that named the surface, and a surface
++ * cannot be released while the client that owns it is inside a call on it.
++ */
++extern "C" void *
++IOSurfaceShimBytes(uint32_t id, uint32_t *width, uint32_t *height,
++    uint32_t *stride)
++{
++	struct iosurface_rec *rec;
++	void *bytes = NULL;
++
++	if (iosurf_lock == NULL) {
++		return NULL;
++	}
++
++	IOLockLock(iosurf_lock);
++	rec = iosurf_find(id);
++	if (rec != NULL) {
++		bytes = (void *)((uintptr_t)rec->md->getBytesNoCopy() +
++		    PAGE_SIZE);
++		if (width != NULL) {
++			*width = rec->width;
++		}
++		if (height != NULL) {
++			*height = rec->height;
++		}
++		if (stride != NULL) {
++			*stride = rec->stride;
++		}
++	}
++	IOLockUnlock(iosurf_lock);
++
++	return bytes;
++}
++
++class IOCoreSurfaceRoot : public IOService
++{
++	OSDeclareDefaultStructors(IOCoreSurfaceRoot);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID,
++	    UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++class IOCoreSurfaceRootUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(IOCoreSurfaceRootUserClient);
++
++	IOCoreSurfaceRoot *fOwner;
++	task_t             fTask;
++	uint32_t           fSerial;
++
++	/*
++	 * The mappings this client holds, so that they go away with it. A
++	 * surface outlives the mapping -- another client can look the same id
++	 * up and get a mapping of its own -- which is why the id is kept
++	 * beside the map rather than inside the surface.
++	 */
++	uint32_t      fMapID[kIOSurfaceMaxMaps];
++	IOMemoryMap  *fMap[kIOSurfaceMaxMaps];
++
++	IOReturn fillInfo(struct iosurface_rec *rec, void *out,
++	    mach_vm_address_t addr);
++	IOMemoryMap *mapFor(struct iosurface_rec *rec);
++
++public:
++	virtual bool initWithTask(task_t owningTask, void *securityID,
++	    UInt32 type) APPLE_KEXT_OVERRIDE;
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientDied(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector,
++	    IOExternalMethodArguments *arguments,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++#define super IOService
++OSDefineMetaClassAndStructors(IOCoreSurfaceRoot, IOService);
++
++bool
++IOCoreSurfaceRoot::start(IOService *provider)
++{
++	uint32_t on = 1;
++
++	if (!super::start(provider)) {
++		return false;
++	}
++
++	if (PE_parse_boot_argn("iosurftrace", &on, sizeof(on))) {
++		iosurf_trace = (on != 0);
++	}
++
++	if (iosurf_lock == NULL) {
++		iosurf_lock = IOLockAlloc();
++		if (iosurf_lock == NULL) {
++			return false;
++		}
++	}
++
++	/*
++	 * The framework looks this up by name, not by class, so the name has
++	 * to be set rather than left to default.
++	 */
++	setName("IOCoreSurfaceRoot");
++	registerService();
++
++	IOLog("IOCoreSurfaceRoot: started\n");
++	return true;
++}
++
++IOReturn
++IOCoreSurfaceRoot::newUserClient(task_t owningTask, void *securityID,
++    UInt32 type, IOUserClient **handler)
++{
++	IOCoreSurfaceRootUserClient *client;
++
++	if (type != 0) {
++		IOLog("IOCoreSurfaceRoot: refused user client type %u\n",
++		    (unsigned)type);
++		return kIOReturnBadArgument;
++	}
++
++	client = new IOCoreSurfaceRootUserClient;
++	if (client == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (!client->initWithTask(owningTask, securityID, type) ||
++	    !client->attach(this) || !client->start(this)) {
++		client->detach(this);
++		client->release();
++		return kIOReturnError;
++	}
++
++	*handler = client;
++	return kIOReturnSuccess;
++}
++
++#undef super
++#define super IOUserClient
++OSDefineMetaClassAndStructors(IOCoreSurfaceRootUserClient, IOUserClient);
++
++bool
++IOCoreSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID,
++    UInt32 type)
++{
++	int i;
++
++	if (!super::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++
++	fTask = owningTask;
++	fOwner = NULL;
++	fSerial = (uint32_t)OSIncrementAtomic(&iosurf_client_count) + 1;
++	for (i = 0; i < kIOSurfaceMaxMaps; i++) {
++		fMapID[i] = 0;
++		fMap[i] = NULL;
++	}
++
++	if (iosurf_trace) {
++		IOLog("IOCoreSurfaceRoot: [%u] opened by pid %d\n",
++		    fSerial, proc_selfpid());
++	}
++	return true;
++}
++
++bool
++IOCoreSurfaceRootUserClient::start(IOService *provider)
++{
++	if (!super::start(provider)) {
++		return false;
++	}
++	fOwner = OSDynamicCast(IOCoreSurfaceRoot, provider);
++	return fOwner != NULL;
++}
++
++void
++IOCoreSurfaceRootUserClient::free(void)
++{
++	int i;
++
++	for (i = 0; i < kIOSurfaceMaxMaps; i++) {
++		if (fMap[i] != NULL) {
++			fMap[i]->release();
++			fMap[i] = NULL;
++			fMapID[i] = 0;
++		}
++	}
++	super::free();
++}
++
++IOReturn
++IOCoreSurfaceRootUserClient::clientClose(void)
++{
++	if (iosurf_trace) {
++		IOLog("IOCoreSurfaceRoot: [%u] closed\n", fSerial);
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOCoreSurfaceRootUserClient::clientDied(void)
++{
++	if (iosurf_trace) {
++		IOLog("IOCoreSurfaceRoot: [%u] client died\n", fSerial);
++	}
++	return super::clientDied();
++}
++
++/*
++ * The mapping this client has of a surface, made on first use. Returned
++ * without a reference: the client holds the only one and drops it in free.
++ */
++IOMemoryMap *
++IOCoreSurfaceRootUserClient::mapFor(struct iosurface_rec *rec)
++{
++	IOMemoryMap *map;
++	int i, slot = -1;
++
++	for (i = 0; i < kIOSurfaceMaxMaps; i++) {
++		if (fMap[i] != NULL && fMapID[i] == rec->id) {
++			return fMap[i];
++		}
++		if (fMap[i] == NULL && slot < 0) {
++			slot = i;
++		}
++	}
++	if (slot < 0) {
++		return NULL;
++	}
++
++	map = rec->md->createMappingInTask(fTask, 0, kIOMapAnywhere);
++	if (map == NULL) {
++		return NULL;
++	}
++
++	fMap[slot] = map;
++	fMapID[slot] = rec->id;
++	return map;
++}
++
++IOReturn
++IOCoreSurfaceRootUserClient::fillInfo(struct iosurface_rec *rec, void *out,
++    mach_vm_address_t addr)
++{
++	uint8_t *p = (uint8_t *)out;
++
++	bzero(p, kIOSurfaceInfoSize);
++
++	*(uint64_t *)(p + kIOSurfaceInfoBase)  = (uint64_t)addr;
++	*(uint64_t *)(p + kIOSurfaceInfoState) = (uint64_t)addr;
++	*(uint32_t *)(p + kIOSurfaceInfoID)    = rec->id;
++	*(uint32_t *)(p + kIOSurfaceInfoAllocSize) = rec->pixelBytes;
++	*(uint32_t *)(p + kIOSurfaceInfoWidth)  = rec->width;
++	*(uint32_t *)(p + kIOSurfaceInfoHeight) = rec->height;
++	*(uint32_t *)(p + kIOSurfaceInfoStride) = rec->stride;
++	*(uint32_t *)(p + kIOSurfaceInfoPlaneOff) = (uint32_t)PAGE_SIZE;
++	*(uint32_t *)(p + kIOSurfaceInfoFormat) = rec->format;
++	*(uint32_t *)(p + kIOSurfaceInfoPlanes) = 0;
++	*(uint16_t *)(p + kIOSurfaceInfoBPE)   = 4;
++	p[kIOSurfaceInfoElemW] = 1;
++	p[kIOSurfaceInfoElemH] = 1;
++
++	return kIOReturnSuccess;
++}
++
++/* A uint32 out of the serialized property dictionary, or a default. */
++static uint32_t
++iosurf_number(OSDictionary *props, const char *key, uint32_t dflt)
++{
++	OSNumber *n;
++
++	if (props == NULL) {
++		return dflt;
++	}
++	n = OSDynamicCast(OSNumber, props->getObject(key));
++	if (n == NULL) {
++		return dflt;
++	}
++	return n->unsigned32BitValue();
++}
++
++IOReturn
++IOCoreSurfaceRootUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch,
++    OSObject *target, void *reference)
++{
++	IOReturn ret = kIOReturnUnsupported;
++
++	switch (selector) {
++	case kIOSurfaceCreate: {
++		OSObject             *obj = NULL;
++		OSDictionary         *props = NULL;
++		struct iosurface_rec *rec = NULL;
++		IOBufferMemoryDescriptor *md;
++		IOMemoryMap          *map;
++		uint32_t              w, h, stride, format, bytes, total;
++		int                   i, slot = -1;
++
++		if (arguments->structureOutputSize < kIOSurfaceInfoSize) {
++			return kIOReturnBadArgument;
++		}
++
++		if (arguments->structureInput != NULL &&
++		    arguments->structureInputSize > 0) {
++			obj = OSUnserializeXML(
++				(const char *)arguments->structureInput,
++				arguments->structureInputSize, NULL);
++			props = OSDynamicCast(OSDictionary, obj);
++		}
++
++		w = iosurf_number(props, "IOSurfaceWidth", 0);
++		h = iosurf_number(props, "IOSurfaceHeight", 0);
++		stride = iosurf_number(props, "IOSurfaceBytesPerRow", 0);
++		format = iosurf_number(props, "IOSurfacePixelFormat", 0);
++
++		/*
++		 * A caller that gives a size but no stride means the obvious
++		 * one; a caller that gives neither is asking for something
++		 * this file cannot invent.
++		 */
++		if (stride == 0) {
++			stride = w * 4;
++		}
++		if (w == 0 || h == 0 || stride == 0) {
++			if (obj != NULL) {
++				obj->release();
++			}
++			IOLog("IOCoreSurfaceRoot: [%u] create without a size\n",
++			    fSerial);
++			return kIOReturnBadArgument;
++		}
++
++		bytes = iosurf_number(props, "IOSurfaceAllocSize", stride * h);
++		if (bytes < stride * h) {
++			bytes = stride * h;
++		}
++		total = (uint32_t)(PAGE_SIZE + round_page(bytes));
++
++		md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++			kIODirectionInOut | kIOMemoryKernelUserShared,
++			total, PAGE_SIZE);
++		if (md == NULL) {
++			if (obj != NULL) {
++				obj->release();
++			}
++			return kIOReturnNoMemory;
++		}
++		bzero(md->getBytesNoCopy(), total);
++
++		IOLockLock(iosurf_lock);
++		for (i = 0; i < kIOSurfaceMaxSurfaces; i++) {
++			if (iosurf_table[i].md == NULL) {
++				slot = i;
++				break;
++			}
++		}
++		if (slot >= 0) {
++			rec = &iosurf_table[slot];
++			rec->id = iosurf_next_id++;
++			rec->width = w;
++			rec->height = h;
++			rec->stride = stride;
++			rec->format = format;
++			rec->pixelBytes = bytes;
++			rec->md = md;
++		}
++		IOLockUnlock(iosurf_lock);
++
++		if (obj != NULL) {
++			obj->release();
++		}
++		if (rec == NULL) {
++			md->release();
++			IOLog("IOCoreSurfaceRoot: [%u] out of surface slots\n",
++			    fSerial);
++			return kIOReturnNoResources;
++		}
++
++		map = mapFor(rec);
++		if (map == NULL) {
++			IOLockLock(iosurf_lock);
++			rec->md = NULL;
++			IOLockUnlock(iosurf_lock);
++			md->release();
++			return kIOReturnNoMemory;
++		}
++
++		fillInfo(rec, arguments->structureOutput, map->getAddress());
++		arguments->structureOutputSize = kIOSurfaceInfoSize;
++
++		if (iosurf_trace) {
++			IOLog("IOCoreSurfaceRoot: [%u] created id %u "
++			    "%ux%u stride %u fmt 0x%x at 0x%llx\n",
++			    fSerial, rec->id, w, h, stride, format,
++			    (unsigned long long)map->getAddress());
++		}
++		return kIOReturnSuccess;
++	}
++
++	case kIOSurfaceLookup: {
++		struct iosurface_rec *rec;
++		IOMemoryMap *map;
++		uint32_t id;
++
++		if (arguments->scalarInputCount < 1 ||
++		    arguments->structureOutputSize < kIOSurfaceInfoSize) {
++			return kIOReturnBadArgument;
++		}
++		id = (uint32_t)arguments->scalarInput[0];
++
++		IOLockLock(iosurf_lock);
++		rec = iosurf_find(id);
++		IOLockUnlock(iosurf_lock);
++		if (rec == NULL) {
++			if (iosurf_trace) {
++				IOLog("IOCoreSurfaceRoot: [%u] lookup of "
++				    "unknown id %u\n", fSerial, id);
++			}
++			return kIOReturnNotFound;
++		}
++
++		map = mapFor(rec);
++		if (map == NULL) {
++			return kIOReturnNoMemory;
++		}
++
++		fillInfo(rec, arguments->structureOutput, map->getAddress());
++		arguments->structureOutputSize = kIOSurfaceInfoSize;
++
++		if (iosurf_trace) {
++			IOLog("IOCoreSurfaceRoot: [%u] looked up id %u\n",
++			    fSerial, id);
++		}
++		return kIOReturnSuccess;
++	}
++
++	case kIOSurfaceRelease: {
++		struct iosurface_rec *rec;
++		IOBufferMemoryDescriptor *md = NULL;
++		uint32_t id;
++		int i;
++
++		if (arguments->scalarInputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		id = (uint32_t)arguments->scalarInput[0];
++
++		for (i = 0; i < kIOSurfaceMaxMaps; i++) {
++			if (fMap[i] != NULL && fMapID[i] == id) {
++				fMap[i]->release();
++				fMap[i] = NULL;
++				fMapID[i] = 0;
++			}
++		}
++
++		IOLockLock(iosurf_lock);
++		rec = iosurf_find(id);
++		if (rec != NULL) {
++			md = rec->md;
++			rec->md = NULL;
++		}
++		IOLockUnlock(iosurf_lock);
++
++		if (md != NULL) {
++			md->release();
++		}
++		if (iosurf_trace) {
++			IOLog("IOCoreSurfaceRoot: [%u] released id %u%s\n",
++			    fSerial, id, md ? "" : " (unknown)");
++		}
++		return kIOReturnSuccess;
++	}
++
++	case kIOSurfaceLock:
++	case kIOSurfaceUnlock:
++		/*
++		 * Nothing here moves a surface or changes its caching, so
++		 * there is nothing to do between a lock and an unlock. The
++		 * call still has to succeed: the framework treats a failure
++		 * as the surface being gone.
++		 */
++		if (arguments->structureOutput != NULL &&
++		    arguments->structureOutputSize > 0) {
++			bzero(arguments->structureOutput,
++			    arguments->structureOutputSize);
++		}
++		return kIOReturnSuccess;
++
++	default:
++		/*
++		 * The same rule the display shim settled on: a selector that
++		 * asks for nothing back is accepted and dropped, one that
++		 * wants an answer is refused so that the refusal stops where
++		 * it happens.
++		 */
++		if (arguments->scalarOutputCount == 0 &&
++		    arguments->structureOutputSize == 0) {
++			if (iosurf_trace) {
++				IOLog("IOCoreSurfaceRoot: [%u] selector %u "
++				    "accepted and dropped\n",
++				    fSerial, selector);
++			}
++			return kIOReturnSuccess;
++		}
++		IOLog("IOCoreSurfaceRoot: [%u] unimplemented selector %u "
++		    "(in %u scalars/%u bytes, out %u scalars/%u bytes)\n",
++		    fSerial, selector,
++		    (unsigned)arguments->scalarInputCount,
++		    (unsigned)arguments->structureInputSize,
++		    (unsigned)arguments->scalarOutputCount,
++		    (unsigned)arguments->structureOutputSize);
++		break;
++	}
++
++	return ret;
++}
+diff -ruN a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp	2026-11-06 23:40:25.402387939 +0300
++++ b/iokit/KernelConfigTables.cpp	2026-11-06 23:40:25.482746671 +0300
+@@ -58,6 +58,18 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOMobileFramebuffer;"
+     "     'IOProbeScore'    = 1000:32;"
++    "   },"
++    /*
++     * The surface allocator, started the same way and for the same reason:
++     * no kext, so no personality of its own. IOResources again, and a match
++     * category of its own so that it and the framebuffer do not compete for
++     * the one driver IOKit starts per nub.
++     */
++    "   {"
++    "     'IOClass'         = IOCoreSurfaceRoot;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOCoreSurfaceRoot;"
++    "     'IOProbeScore'    = 1000:32;"
+     "   }"
+     ")";
+ 
+diff -ruN a/iokit/conf/files b/iokit/conf/files
+--- a/iokit/conf/files	2026-11-06 23:40:25.402263789 +0300
++++ b/iokit/conf/files	2026-11-06 23:40:25.482633513 +0300
+@@ -114,3 +114,4 @@
+ 
+ # Display
+ iokit/Kernel/IOMobileFramebufferShim.cpp		optional iokitcpp
++iokit/Kernel/IOSurfaceShim.cpp		optional iokitcpp
