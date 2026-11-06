@@ -88,9 +88,10 @@ argument form, given the owning task, sets the flag.
 With that fixed the display configures and then nothing happens at all, and
 nothing is the hardest thing to read: the kernel prints a line when a
 process dies and none when one lives, so a daemon that is up and waiting
-looks exactly like one that never started, and those two want opposite
-fixes. Boot-arg proclist=<seconds> prints the pid table once, that many
-seconds in, and then never again.
+looks exactly like one that never started. Boot-arg proclist=<seconds>
+prints the pid table, and repeats at a widening interval because a second
+on this device is not a second -- the first attempt asked for 600 and was
+answered while fsck was still running, three processes in.
 
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
@@ -223,22 +224,29 @@ seconds in, and then never again.
   * The one display. This is what GetID answers. It is not the number the
   * window server matches on -- that one is a counter inside QuartzCore,
   * handed out when the CAWindowServerDisplay is built and carried back to
-@@ -215,10 +290,29 @@
+@@ -215,10 +290,37 @@
  /* One number per user client, so the probes can be told from the keeper. */
  static volatile SInt32 iomfb_client_count;
  
 +/*
-+ * One-shot roll call, boot-arg proclist=<seconds>, 0 to leave it off.
++ * Repeating roll call, boot-arg proclist=<seconds>, 0 to leave it off.
 + *
 + * Everything below the window server is invisible from here: the kernel
 + * prints a line when a process dies and nothing at all when one lives, so
 + * a daemon that is up and quietly waiting looks exactly like a daemon that
-+ * was never started. Those two want opposite fixes. This prints the table
-+ * once, long enough after boot for the system to have settled, and then
-+ * never again.
++ * was never started. Those two want opposite fixes.
++ *
++ * It repeats rather than firing once because a second on this device is
++ * not a second. The timebase is wrong by a large and unmeasured factor --
++ * the first attempt at this asked for 600 and was answered while fsck was
++ * still running, three processes in -- so any single delay is a guess.
++ * A handful of passes at a widening interval lands one of them on the
++ * settled system whatever the factor turns out to be, and the gap between
++ * two passes measures the churn as a bonus.
 + */
 +static uint32_t iomfb_proclist;
 +#define kIOMFBProcListMaxPid    8192
++#define kIOMFBProcListPasses    6
 +
  class IOMobileFramebuffer : public IOService
  {
@@ -246,6 +254,7 @@ seconds in, and then never again.
  
 +	IOWorkLoop         *fProcLoop;
 +	IOTimerEventSource *fProcTimer;
++	uint32_t            fProcPass;
 +
 +	void        rollCall(void);
 +	static void rollCallAction(OSObject *owner, IOTimerEventSource *sender);
@@ -253,7 +262,7 @@ seconds in, and then never again.
  public:
  	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	virtual IOReturn newUserClient(task_t owningTask, void *securityID,
-@@ -234,18 +328,45 @@
+@@ -234,18 +336,45 @@
  	uint32_t                  fSerial;
  
  	/*
@@ -300,7 +309,7 @@ seconds in, and then never again.
  	IOReturn handleMethod(uint32_t selector,
  	    IOExternalMethodArguments *arguments,
  	    IOExternalMethodDispatch *dispatch, OSObject *target,
-@@ -354,6 +475,14 @@
+@@ -354,6 +483,14 @@
  	if (PE_parse_boot_argn("iomfbaccept", &on, sizeof(on))) {
  		iomfb_accept = (int)on;
  	}
@@ -310,12 +319,12 @@ seconds in, and then never again.
 +	}
 +	on = 0;
 +	if (PE_parse_boot_argn("proclist", &on, sizeof(on))) {
-+		iomfb_proclist = (on > 600) ? 600 : on;
++		iomfb_proclist = (on > 100000) ? 100000 : on;
 +	}
  
  	/*
  	 * Matched from gIOKernelConfigTables against IOResources, so there is
-@@ -368,9 +497,63 @@
+@@ -368,9 +505,75 @@
  	    iomfb_frameinfo ? "one field" : "none",
  	    iomfb_notify ? "accepted" : "refused",
  	    iomfb_accept ? "accepted" : "refused");
@@ -349,8 +358,8 @@ seconds in, and then never again.
 +	int pid;
 +	int found = 0;
 +
-+	IOLog("IOMobileFramebuffer: ---- roll call at %u s ----\n",
-+	    (unsigned)iomfb_proclist);
++	IOLog("IOMobileFramebuffer: ---- roll call %u/%u ----\n",
++	    (unsigned)fProcPass + 1, (unsigned)kIOMFBProcListPasses);
 +	for (pid = 1; pid < kIOMFBProcListMaxPid; pid++) {
 +		p = proc_find(pid);
 +		if (p == NULL) {
@@ -371,15 +380,27 @@ seconds in, and then never again.
 +{
 +	IOMobileFramebuffer *me = OSDynamicCast(IOMobileFramebuffer, owner);
 +
-+	if (me != NULL) {
-+		me->rollCall();
++	if (me == NULL) {
++		return;
++	}
++	me->rollCall();
++	me->fProcPass++;
++
++	/*
++	 * Each pass waits twice as long as the one before it, so six of them
++	 * span a factor of thirty-two. Whatever the clock is really doing,
++	 * one of those lands after the system has stopped moving.
++	 */
++	if (me->fProcPass < kIOMFBProcListPasses) {
++		sender->setTimeoutMS(iomfb_proclist * 1000 *
++		    (1U << me->fProcPass));
 +	}
 +}
 +
  IOReturn
  IOMobileFramebuffer::newUserClient(task_t owningTask, void *securityID,
      UInt32 type, IOUserClient **handler)
-@@ -425,6 +608,9 @@
+@@ -425,6 +628,9 @@
  	bzero(fNotifyRefCon, sizeof(fNotifyRefCon));
  	bzero(fNotifyCallback, sizeof(fNotifyCallback));
  	bzero(fNotifyContext, sizeof(fNotifyContext));
@@ -389,7 +410,7 @@ seconds in, and then never again.
  
  	/*
  	 * Numbered from one on the way in rather than on the way out, so that
-@@ -460,6 +646,8 @@
+@@ -460,6 +666,8 @@
  {
  	IOLog("IOMobileFramebuffer: [%u] closed\n", (unsigned)fSerial);
  
@@ -398,7 +419,7 @@ seconds in, and then never again.
  	if (!isInactive()) {
  		terminate();
  	}
-@@ -512,11 +700,142 @@
+@@ -512,11 +720,142 @@
  	return ret;
  }
  
@@ -541,7 +562,7 @@ seconds in, and then never again.
  	for (i = 0; i < kIOMFBNotifyTypes; i++) {
  		if (fNotifyPort[i] != MACH_PORT_NULL) {
  			releaseNotificationPort(fNotifyPort[i]);
-@@ -755,6 +1074,15 @@
+@@ -755,6 +1094,15 @@
  		    fNotifyCallback[type] ? "on" : "off",
  		    (unsigned long long)type);
  
@@ -557,7 +578,7 @@ seconds in, and then never again.
  		arguments->scalarOutputCount = 0;
  		return kIOReturnSuccess;
  	}
-@@ -859,6 +1187,104 @@
+@@ -859,6 +1207,104 @@
  		return kIOReturnSuccess;
  	}
  
