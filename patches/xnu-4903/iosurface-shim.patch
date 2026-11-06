@@ -37,19 +37,28 @@ owns and this driver owns none; a zero there would send a caller off with an
 id that resolves to nothing, which is the kind of wrong answer that travels.
 
 Boot with iosurftrace=0 for none of the new chatter.
+
+One more thing the first boot with this made obvious. The kernel console
+draws into the very framebuffer a swap copies into, so every IOLog repaints
+over the frame the window server just put there. With tccd and
+UserEventAgent respawning several times a second the console never stops
+drawing, and a frame that does land is gone before it can be seen. A real
+display driver takes the framebuffer away from the console when it comes
+up; SwapEnd now does that, on the first copy that actually found its
+surface, so a swap naming a surface we do not have still leaves the console
+up to carry the diagnostic. One line marks the handover and then the
+console is quiet.
+
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -112,5 +112,6 @@
- 
- iokit/bsddev/skywalk/IOSkywalkSupport.cpp		optional iokitcpp
+@@ -114,3 +114,4 @@
  
  # Display
  iokit/Kernel/IOMobileFramebufferShim.cpp		optional iokitcpp
 +iokit/Kernel/IOSurfaceShim.cpp		optional iokitcpp
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -57,7 +57,19 @@
-     "     'IOClass'         = IOMobileFramebuffer;"
+@@ -58,6 +58,18 @@
      "     'IOProviderClass' = IOResources;"
      "     'IOMatchCategory' = IOMobileFramebuffer;"
      "     'IOProbeScore'    = 1000:32;"
@@ -68,6 +77,188 @@ Boot with iosurftrace=0 for none of the new chatter.
      "   }"
      ")";
  
+--- a/iokit/Kernel/IOMobileFramebufferShim.cpp
++++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
+@@ -132,6 +132,26 @@
+ #include <sys/proc.h>          /* proc_selfpid, to name who opened a client */
+ 
+ /*
++ * From iokit/Kernel/IOSurfaceShim.cpp: the kernel-side address of a
++ * surface's pixels, by the id the swap request carries. Declared here
++ * rather than in a header because the two files are the only things in
++ * this tree that know about each other.
++ */
++extern "C" void *IOSurfaceShimBytes(uint32_t id, uint32_t *width,
++    uint32_t *height, uint32_t *stride);
++
++/*
++ * The kernel console draws into this same framebuffer. Until the display is
++ * claimed, every IOLog repaints over whatever the window server just swapped
++ * in, so the first frame that actually reaches the panel is immediately
++ * overwritten by the next line of boot spam. A real display driver takes the
++ * framebuffer away from the console when it comes up; this is that moment,
++ * deferred to the first good swap so a failing surface path still prints.
++ * Defined in bsd/dev/arm/km.c, read by conslog_putc/cnputc in printf.c.
++ */
++extern "C" int disableConsoleOutput;
++
++/*
+  * The selectors, named from the framework's own callers. Each was found by
+  * running with none of them implemented and reading the numbers the console
+  * printed back, then looking for the IOConnectCallScalarMethod that passes
+@@ -158,6 +178,33 @@
+ #define kIOMFBSupportedFrameInfo 74
+ 
+ /*
++ * The swap path, named the same way -- from the framework's own symbols.
++ * kern_SwapBegin takes nothing and answers one scalar, the swap id;
++ * kern_SwapEnd sends the whole request as a 0x278 byte structure;
++ * kern_SwapWait passes three scalars and wants nothing back.
++ *
++ * Selector 3, kern_GetLayerDefaultSurface, is deliberately not here. It
++ * hands back a surface the driver owns, and this one owns none; refusing
++ * it says so, where answering with a zero would send a caller off with a
++ * surface id that resolves to nothing.
++ */
++#define kIOMFBSwapBegin         4
++#define kIOMFBSwapEnd           5
++#define kIOMFBSwapWait          6
++
++/*
++ * Inside the 0x278 byte swap request, read out of kern_SwapBegin and
++ * kern_SwapSetLayer in the framework. SwapBegin zeroes the region and
++ * stores the id it was given at +0x40; SwapSetLayer reduces each
++ * IOSurfaceRef to IOSurfaceGetID(surface) and puts the three layers at
++ * +0x44, +0x48 and +0x4c, so the kernel only ever sees ids. Layer 0 is
++ * the one the window server draws the screen into.
++ */
++#define kIOMFBSwapRequestSize   0x278
++#define kIOMFBSwapReqID         0x40
++#define kIOMFBSwapReqLayer0     0x44
++
++/*
+  * Notification types, as the framework numbers them. 3 is frame info and 5
+  * is vsync; the rest are not used by anything seen so far. Eight is room
+  * for all of them and a bounds check that cannot be argued with.
+@@ -234,6 +281,13 @@
+ 	uint32_t                  fSerial;
+ 
+ 	/*
++	 * The id handed out by SwapBegin and quoted back in the request.
++	 * Nothing checks it yet; it is kept per client so that two clients
++	 * swapping at once cannot be confused for one.
++	 */
++	uint32_t                  fSwapID;
++
++	/*
+ 	 * What the framework asks us to remember about notifications. The port
+ 	 * is ours once registerNotificationPort has returned success and has
+ 	 * to be balanced with releaseNotificationPort; the callback and the
+@@ -859,6 +913,104 @@
+ 		return kIOReturnSuccess;
+ 	}
+ 
++	case kIOMFBSwapBegin:
++		/*
++		 * One scalar out, the id for the swap that is starting. The
++		 * framework stores it in the request it is about to build and
++		 * sends it back with SwapEnd.
++		 */
++		if (arguments->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		arguments->scalarOutput[0] = ++fSwapID;
++		arguments->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++
++	case kIOMFBSwapEnd: {
++		/*
++		 * The swap itself. There is no scanout to repoint here -- the
++		 * display controller was pointed at the console framebuffer by
++		 * the bootloader and nothing in this tree moves it -- so the
++		 * swap is a copy: the surface named by layer 0 goes to the
++		 * pixels the console is already showing.
++		 *
++		 * That makes every frame cost a full-screen memcpy on one
++		 * Cortex-A53, which is the price of having no GPU and no
++		 * second scanout buffer. It is also the thing that can be
++		 * replaced later without anything above noticing.
++		 */
++		const uint8_t *req = (const uint8_t *)arguments->structureInput;
++		PE_Video video;
++		uint32_t id, sw, sh, sstride;
++		const uint8_t *src;
++		uint8_t *dst;
++		uint32_t rows, cols, y;
++
++		if (req == NULL ||
++		    arguments->structureInputSize < kIOMFBSwapRequestSize) {
++			return kIOReturnBadArgument;
++		}
++
++		id = *(const uint32_t *)(req + kIOMFBSwapReqLayer0);
++		if (id == 0) {
++			/* A swap with no layer 0 has nothing to show. */
++			return kIOReturnSuccess;
++		}
++
++		src = (const uint8_t *)IOSurfaceShimBytes(id, &sw, &sh,
++			&sstride);
++		if (src == NULL) {
++			IOLog("IOMobileFramebuffer: [%u] swap names surface "
++			    "%u, which is not one of ours\n", fSerial, id);
++			return kIOReturnNotFound;
++		}
++
++		if (PE_current_console(&video) != 0 ||
++		    video.v_baseAddr == 0) {
++			return kIOReturnNotReady;
++		}
++
++		dst = (uint8_t *)video.v_baseAddr;
++		rows = (sh < video.v_height) ? sh : video.v_height;
++		cols = (sw < video.v_width) ? sw : video.v_width;
++
++		for (y = 0; y < rows; y++) {
++			memcpy(dst + (size_t)y * video.v_rowBytes,
++			    src + (size_t)y * sstride, (size_t)cols * 4);
++		}
++
++		/*
++		 * The window server has drawn a real frame, so the display now
++		 * belongs to it. Stop the kernel console from painting over it.
++		 * Done once, and only after a copy that found its surface, so a
++		 * swap that named a surface we do not have leaves the console up
++		 * to carry the diagnostic. One line marks the handover; it is
++		 * the last thing the console shows.
++		 */
++		if (rows > 0 && !disableConsoleOutput) {
++			IOLog("IOMobileFramebuffer: [%u] display claimed by "
++			    "window server, console output off\n", fSerial);
++			disableConsoleOutput = 1;
++		}
++
++		if (iomfb_trace) {
++			IOLog("IOMobileFramebuffer: [%u] swap %u surface %u "
++			    "%ux%u -> %ux%u\n", fSerial,
++			    *(const uint32_t *)(req + kIOMFBSwapReqID),
++			    id, sw, sh,
++			    (unsigned)video.v_width,
++			    (unsigned)video.v_height);
++		}
++		return kIOReturnSuccess;
++	}
++
++	case kIOMFBSwapWait:
++		/*
++		 * The copy above finished before SwapEnd returned, so there
++		 * is never anything to wait for.
++		 */
++		return kIOReturnSuccess;
++
+ 	default:
+ 		break;
+ 	}
 --- /dev/null
 +++ b/iokit/Kernel/IOSurfaceShim.cpp
 @@ -0,0 +1,709 @@
@@ -780,160 +971,3 @@ Boot with iosurftrace=0 for none of the new chatter.
 +
 +	return ret;
 +}
---- a/iokit/Kernel/IOMobileFramebufferShim.cpp
-+++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
-@@ -132,6 +132,15 @@
- #include <sys/proc.h>          /* proc_selfpid, to name who opened a client */
- 
- /*
-+ * From iokit/Kernel/IOSurfaceShim.cpp: the kernel-side address of a
-+ * surface's pixels, by the id the swap request carries. Declared here
-+ * rather than in a header because the two files are the only things in
-+ * this tree that know about each other.
-+ */
-+extern "C" void *IOSurfaceShimBytes(uint32_t id, uint32_t *width,
-+    uint32_t *height, uint32_t *stride);
-+
-+/*
-  * The selectors, named from the framework's own callers. Each was found by
-  * running with none of them implemented and reading the numbers the console
-  * printed back, then looking for the IOConnectCallScalarMethod that passes
-@@ -158,6 +167,33 @@
- #define kIOMFBSupportedFrameInfo 74
- 
- /*
-+ * The swap path, named the same way -- from the framework's own symbols.
-+ * kern_SwapBegin takes nothing and answers one scalar, the swap id;
-+ * kern_SwapEnd sends the whole request as a 0x278 byte structure;
-+ * kern_SwapWait passes three scalars and wants nothing back.
-+ *
-+ * Selector 3, kern_GetLayerDefaultSurface, is deliberately not here. It
-+ * hands back a surface the driver owns, and this one owns none; refusing
-+ * it says so, where answering with a zero would send a caller off with a
-+ * surface id that resolves to nothing.
-+ */
-+#define kIOMFBSwapBegin         4
-+#define kIOMFBSwapEnd           5
-+#define kIOMFBSwapWait          6
-+
-+/*
-+ * Inside the 0x278 byte swap request, read out of kern_SwapBegin and
-+ * kern_SwapSetLayer in the framework. SwapBegin zeroes the region and
-+ * stores the id it was given at +0x40; SwapSetLayer reduces each
-+ * IOSurfaceRef to IOSurfaceGetID(surface) and puts the three layers at
-+ * +0x44, +0x48 and +0x4c, so the kernel only ever sees ids. Layer 0 is
-+ * the one the window server draws the screen into.
-+ */
-+#define kIOMFBSwapRequestSize   0x278
-+#define kIOMFBSwapReqID         0x40
-+#define kIOMFBSwapReqLayer0     0x44
-+
-+/*
-  * Notification types, as the framework numbers them. 3 is frame info and 5
-  * is vsync; the rest are not used by anything seen so far. Eight is room
-  * for all of them and a bounds check that cannot be argued with.
-@@ -234,6 +270,13 @@
- 	uint32_t                  fSerial;
- 
- 	/*
-+	 * The id handed out by SwapBegin and quoted back in the request.
-+	 * Nothing checks it yet; it is kept per client so that two clients
-+	 * swapping at once cannot be confused for one.
-+	 */
-+	uint32_t                  fSwapID;
-+
-+	/*
- 	 * What the framework asks us to remember about notifications. The port
- 	 * is ours once registerNotificationPort has returned success and has
- 	 * to be balanced with releaseNotificationPort; the callback and the
-@@ -859,6 +902,90 @@
- 		return kIOReturnSuccess;
- 	}
- 
-+	case kIOMFBSwapBegin:
-+		/*
-+		 * One scalar out, the id for the swap that is starting. The
-+		 * framework stores it in the request it is about to build and
-+		 * sends it back with SwapEnd.
-+		 */
-+		if (arguments->scalarOutputCount < 1) {
-+			return kIOReturnBadArgument;
-+		}
-+		arguments->scalarOutput[0] = ++fSwapID;
-+		arguments->scalarOutputCount = 1;
-+		return kIOReturnSuccess;
-+
-+	case kIOMFBSwapEnd: {
-+		/*
-+		 * The swap itself. There is no scanout to repoint here -- the
-+		 * display controller was pointed at the console framebuffer by
-+		 * the bootloader and nothing in this tree moves it -- so the
-+		 * swap is a copy: the surface named by layer 0 goes to the
-+		 * pixels the console is already showing.
-+		 *
-+		 * That makes every frame cost a full-screen memcpy on one
-+		 * Cortex-A53, which is the price of having no GPU and no
-+		 * second scanout buffer. It is also the thing that can be
-+		 * replaced later without anything above noticing.
-+		 */
-+		const uint8_t *req = (const uint8_t *)arguments->structureInput;
-+		PE_Video video;
-+		uint32_t id, sw, sh, sstride;
-+		const uint8_t *src;
-+		uint8_t *dst;
-+		uint32_t rows, cols, y;
-+
-+		if (req == NULL ||
-+		    arguments->structureInputSize < kIOMFBSwapRequestSize) {
-+			return kIOReturnBadArgument;
-+		}
-+
-+		id = *(const uint32_t *)(req + kIOMFBSwapReqLayer0);
-+		if (id == 0) {
-+			/* A swap with no layer 0 has nothing to show. */
-+			return kIOReturnSuccess;
-+		}
-+
-+		src = (const uint8_t *)IOSurfaceShimBytes(id, &sw, &sh,
-+			&sstride);
-+		if (src == NULL) {
-+			IOLog("IOMobileFramebuffer: [%u] swap names surface "
-+			    "%u, which is not one of ours\n", fSerial, id);
-+			return kIOReturnNotFound;
-+		}
-+
-+		if (PE_current_console(&video) != 0 ||
-+		    video.v_baseAddr == 0) {
-+			return kIOReturnNotReady;
-+		}
-+
-+		dst = (uint8_t *)video.v_baseAddr;
-+		rows = (sh < video.v_height) ? sh : video.v_height;
-+		cols = (sw < video.v_width) ? sw : video.v_width;
-+
-+		for (y = 0; y < rows; y++) {
-+			memcpy(dst + (size_t)y * video.v_rowBytes,
-+			    src + (size_t)y * sstride, (size_t)cols * 4);
-+		}
-+
-+		if (iomfb_trace) {
-+			IOLog("IOMobileFramebuffer: [%u] swap %u surface %u "
-+			    "%ux%u -> %ux%u\n", fSerial,
-+			    *(const uint32_t *)(req + kIOMFBSwapReqID),
-+			    id, sw, sh,
-+			    (unsigned)video.v_width,
-+			    (unsigned)video.v_height);
-+		}
-+		return kIOReturnSuccess;
-+	}
-+
-+	case kIOMFBSwapWait:
-+		/*
-+		 * The copy above finished before SwapEnd returned, so there
-+		 * is never anything to wait for.
-+		 */
-+		return kIOReturnSuccess;
-+
- 	default:
- 		break;
- 	}
