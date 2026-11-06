@@ -38,16 +38,45 @@ id that resolves to nothing, which is the kind of wrong answer that travels.
 
 Boot with iosurftrace=0 for none of the new chatter.
 
-One more thing the first boot with this made obvious. The kernel console
-draws into the very framebuffer a swap copies into, so every IOLog repaints
-over the frame the window server just put there. With tccd and
-UserEventAgent respawning several times a second the console never stops
-drawing, and a frame that does land is gone before it can be seen. A real
-display driver takes the framebuffer away from the console when it comes
-up; SwapEnd now does that, on the first copy that actually found its
+Two things the first boot with this made plain.
+
+The kernel console draws into the very framebuffer a swap copies into, so
+every IOLog repaints over the frame the window server just put there. A
+real display driver takes the framebuffer away from the console when it
+comes up; SwapEnd now does that, on the first copy that actually found its
 surface, so a swap naming a surface we do not have still leaves the console
-up to carry the diagnostic. One line marks the handover and then the
-console is quiet.
+up to carry the diagnostic.
+
+The other is why no swap ever arrived. The trace stopped dead after
+
+    IOMobileFramebuffer: [2] registerNotificationPort type 3 refCon 0
+    IOMobileFramebuffer: [2] notifications on for type 3
+    IOMobileFramebuffer: [2] selector 72 ... 73
+
+and the reason is in this file: the port and the callback were remembered
+and nothing was ever sent to them. The window server adds the run loop
+source that port feeds and then waits on it. Reading QuartzCore out of the
+device image, what hangs off that wait is the whole of display bring-up --
+IOMFBServer::frame_info_callback reaches IOMFBDisplay::initialize_timings,
+and vsync itself only ever starts from IOMFBServer::did_set_mode or
+set_enabled, which are
+
+    remove_vsync_source -> initialize_timings -> add_vsync_source
+
+so with no first callback there is no timing, no mode, no frame clock, no
+composite and no swap. The EAGLServer constructor's own add_vsync_source is
+not a second chance: it is gated on IOMFBDisplay::framebuffer_id(), which
+reads a field at +0x240 that nothing in QuartzCore ever writes.
+
+So this gives the driver the clock it was pretending to have. A timer on
+the user client sends the frame-info notification, and the vsync one once
+anything arms it, through setAsyncReference64 and sendAsyncResult64 with
+the port, callback and context the framework already handed over. The
+shapes are the framework's: FrameInfoNotifyFunc drops anything with fewer
+than two arguments and says so, reading args[0] as a 64-bit swap id and
+args[1] as a 32-bit count; the vsync callback takes three times. There is
+no real vblank to follow, so the rate is made up -- 60 Hz, boot-arg
+iomfbtickhz, 0 to stop it.
 
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
@@ -79,7 +108,15 @@ console is quiet.
  
 --- a/iokit/Kernel/IOMobileFramebufferShim.cpp
 +++ b/iokit/Kernel/IOMobileFramebufferShim.cpp
-@@ -132,6 +132,26 @@
+@@ -127,11 +127,34 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <mach/mach_time.h>    /* mach_absolute_time, for the vsync stamps */
+ #include <libkern/OSAtomic.h>
+ #include <pexpert/pexpert.h>
  #include <sys/proc.h>          /* proc_selfpid, to name who opened a client */
  
  /*
@@ -106,7 +143,7 @@ console is quiet.
   * The selectors, named from the framework's own callers. Each was found by
   * running with none of them implemented and reading the numbers the console
   * printed back, then looking for the IOConnectCallScalarMethod that passes
-@@ -158,6 +178,33 @@
+@@ -158,6 +181,33 @@
  #define kIOMFBSupportedFrameInfo 74
  
  /*
@@ -140,7 +177,38 @@ console is quiet.
   * Notification types, as the framework numbers them. 3 is frame info and 5
   * is vsync; the rest are not used by anything seen so far. Eight is room
   * for all of them and a bounds check that cannot be argued with.
-@@ -234,6 +281,13 @@
+@@ -165,6 +215,30 @@
+ #define kIOMFBNotifyTypes       8
+ 
+ /*
++ * The two that matter, by the index the framework's own NotifyCallbackFuncs
++ * table gives them: 3 reaches FrameInfoNotifyFunc and 5 reaches
++ * IOMobileFramebufferVsyncNotifyFunc.
++ *
++ * FrameInfoNotifyFunc drops anything with fewer than two arguments -- it
++ * says so, "dropped notification, numArgs is %u, expected %u" -- and reads
++ * args[0] as a 64-bit swap id and args[1] as a 32-bit count, which it then
++ * turns into the CFDictionary that IOMFBServer::frame_info_callback takes.
++ * The vsync callback takes three, all of them times.
++ */
++#define kIOMFBNotifyFrameInfo   3
++#define kIOMFBNotifyVsync       5
++
++/*
++ * How often the panel is told to have finished a frame. There is no real
++ * vblank to follow here: the controller was pointed at the framebuffer by
++ * the bootloader and nothing in this tree drives it, so the clock has to be
++ * made rather than observed. 60 is the panel's rate; boot-arg iomfbtickhz
++ * changes it, and 0 stops the clock entirely.
++ */
++#define kIOMFBTickHzDefault     60
++static uint32_t iomfb_tick_hz = kIOMFBTickHzDefault;
++
++/*
+  * The one display. This is what GetID answers. It is not the number the
+  * window server matches on -- that one is a counter inside QuartzCore,
+  * handed out when the CAWindowServerDisplay is built and carried back to
+@@ -234,18 +308,45 @@
  	uint32_t                  fSerial;
  
  	/*
@@ -154,7 +222,218 @@ console is quiet.
  	 * What the framework asks us to remember about notifications. The port
  	 * is ours once registerNotificationPort has returned success and has
  	 * to be balanced with releaseNotificationPort; the callback and the
-@@ -859,6 +913,104 @@
+ 	 * context are the two values selector 72 hands over, which a real
+ 	 * driver puts in the mach message it sends when the event happens.
+-	 * Nothing is sent yet -- this is the remembering, not the telling.
++	 * Remembering these is only half of it. The window server adds the
++	 * run loop source this port feeds and then waits on it, so a driver
++	 * that registers the port and never sends anything leaves the whole
++	 * display bring-up folded up behind a callback that never arrives:
++	 * no frame info, so no initialize_timings, so no mode set, so no
++	 * add_vsync_source, so no frame clock and nothing ever drawn.
+ 	 */
+ 	mach_port_t               fNotifyPort[kIOMFBNotifyTypes];
+ 	io_user_reference_t       fNotifyRefCon[kIOMFBNotifyTypes];
+ 	uint64_t                  fNotifyCallback[kIOMFBNotifyTypes];
+ 	uint64_t                  fNotifyContext[kIOMFBNotifyTypes];
+ 
++	/*
++	 * The made-up frame clock that sends them. Started the moment a type
++	 * is armed and stopped when the client goes away.
++	 */
++	IOWorkLoop               *fTickLoop;
++	IOTimerEventSource       *fTick;
++	uint64_t                  fFrameSeq;
++
++	void     startTicking(void);
++	void     stopTicking(void);
++	void     deliverNotify(uint32_t type, io_user_reference_t *args,
++	    uint32_t numArgs);
++	void     tick(void);
++	static void tickAction(OSObject *owner, IOTimerEventSource *sender);
++
+ 	IOReturn handleMethod(uint32_t selector,
+ 	    IOExternalMethodArguments *arguments,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target,
+@@ -354,6 +455,10 @@
+ 	if (PE_parse_boot_argn("iomfbaccept", &on, sizeof(on))) {
+ 		iomfb_accept = (int)on;
+ 	}
++	on = kIOMFBTickHzDefault;
++	if (PE_parse_boot_argn("iomfbtickhz", &on, sizeof(on))) {
++		iomfb_tick_hz = (on > 240) ? 240 : on;
++	}
+ 
+ 	/*
+ 	 * Matched from gIOKernelConfigTables against IOResources, so there is
+@@ -425,6 +530,9 @@
+ 	bzero(fNotifyRefCon, sizeof(fNotifyRefCon));
+ 	bzero(fNotifyCallback, sizeof(fNotifyCallback));
+ 	bzero(fNotifyContext, sizeof(fNotifyContext));
++	fTickLoop = NULL;
++	fTick = NULL;
++	fFrameSeq = 0;
+ 
+ 	/*
+ 	 * Numbered from one on the way in rather than on the way out, so that
+@@ -460,6 +568,8 @@
+ {
+ 	IOLog("IOMobileFramebuffer: [%u] closed\n", (unsigned)fSerial);
+ 
++	stopTicking();
++
+ 	if (!isInactive()) {
+ 		terminate();
+ 	}
+@@ -512,11 +622,131 @@
+ 	return ret;
+ }
+ 
++/*
++ * Send one notification to whoever armed that type.
++ *
++ * IOConnectSetNotificationPort left the port here and selector 72 left the
++ * callback and the context, which is exactly the three things an async
++ * reference is built out of. setAsyncReference64 and sendAsyncResult64 are
++ * protected statics on IOUserClient, so a subclass may call them; what
++ * arrives on the other side is the framework's NotifyCallbackFuncs entry
++ * for the type, called as (refcon, result, args, numArgs).
++ */
++void
++IOMobileFramebufferUserClient::deliverNotify(uint32_t type,
++    io_user_reference_t *args, uint32_t numArgs)
++{
++	OSAsyncReference64 ref;
++
++	if (type >= kIOMFBNotifyTypes ||
++	    fNotifyPort[type] == MACH_PORT_NULL ||
++	    fNotifyCallback[type] == 0) {
++		return;
++	}
++
++	bzero(ref, sizeof(ref));
++	IOUserClient::setAsyncReference64(ref, fNotifyPort[type],
++	    (mach_vm_address_t)fNotifyCallback[type],
++	    (io_user_reference_t)fNotifyContext[type]);
++
++	sendAsyncResult64(ref, kIOReturnSuccess, args, numArgs);
++}
++
++void
++IOMobileFramebufferUserClient::tick(void)
++{
++	io_user_reference_t args[3];
++
++	fFrameSeq++;
++
++	/*
++	 * Frame info first, because that is the one the window server is
++	 * waiting on before it will set a mode. args[0] is the swap id the
++	 * framework reads as 64 bits, args[1] the count it reads as 32.
++	 */
++	args[0] = (io_user_reference_t)fFrameSeq;
++	args[1] = 0;
++	deliverNotify(kIOMFBNotifyFrameInfo, args, 2);
++
++	/*
++	 * Then vsync, which nothing arms until add_vsync_source has run, so
++	 * this is quiet until the chain above it has opened. Its three
++	 * arguments are times; there is no real vblank to timestamp, so the
++	 * clock that made this tick is the honest answer.
++	 */
++	args[0] = (io_user_reference_t)mach_absolute_time();
++	args[1] = args[0];
++	args[2] = (io_user_reference_t)fFrameSeq;
++	deliverNotify(kIOMFBNotifyVsync, args, 3);
++}
++
++void
++IOMobileFramebufferUserClient::tickAction(OSObject *owner,
++    IOTimerEventSource *sender)
++{
++	IOMobileFramebufferUserClient *me =
++	    OSDynamicCast(IOMobileFramebufferUserClient, owner);
++
++	if (me == NULL) {
++		return;
++	}
++	me->tick();
++	if (iomfb_tick_hz != 0) {
++		sender->setTimeoutMS(1000 / iomfb_tick_hz);
++	}
++}
++
++void
++IOMobileFramebufferUserClient::startTicking(void)
++{
++	if (fTick != NULL || iomfb_tick_hz == 0) {
++		return;
++	}
++
++	fTickLoop = IOWorkLoop::workLoop();
++	if (fTickLoop == NULL) {
++		return;
++	}
++	fTick = IOTimerEventSource::timerEventSource(this, &tickAction);
++	if (fTick == NULL ||
++	    fTickLoop->addEventSource(fTick) != kIOReturnSuccess) {
++		if (fTick != NULL) {
++			fTick->release();
++			fTick = NULL;
++		}
++		fTickLoop->release();
++		fTickLoop = NULL;
++		return;
++	}
++
++	IOLog("IOMobileFramebuffer: [%u] frame clock started at %u Hz\n",
++	    (unsigned)fSerial, (unsigned)iomfb_tick_hz);
++	fTick->setTimeoutMS(1000 / iomfb_tick_hz);
++}
++
++void
++IOMobileFramebufferUserClient::stopTicking(void)
++{
++	if (fTick != NULL) {
++		fTick->cancelTimeout();
++		if (fTickLoop != NULL) {
++			fTickLoop->removeEventSource(fTick);
++		}
++		fTick->release();
++		fTick = NULL;
++	}
++	if (fTickLoop != NULL) {
++		fTickLoop->release();
++		fTickLoop = NULL;
++	}
++}
++
+ void
+ IOMobileFramebufferUserClient::free(void)
+ {
+ 	uint32_t i;
+ 
++	stopTicking();
+ 	for (i = 0; i < kIOMFBNotifyTypes; i++) {
+ 		if (fNotifyPort[i] != MACH_PORT_NULL) {
+ 			releaseNotificationPort(fNotifyPort[i]);
+@@ -755,6 +985,15 @@
+ 		    fNotifyCallback[type] ? "on" : "off",
+ 		    (unsigned long long)type);
+ 
++		/*
++		 * Armed, so start sending. Nothing downstream moves until the
++		 * first one arrives, and this is the earliest honest moment to
++		 * send it: the caller has just said where to send it to.
++		 */
++		if (fNotifyCallback[type] != 0) {
++			startTicking();
++		}
++
+ 		arguments->scalarOutputCount = 0;
+ 		return kIOReturnSuccess;
+ 	}
+@@ -859,6 +1098,104 @@
  		return kIOReturnSuccess;
  	}
  
