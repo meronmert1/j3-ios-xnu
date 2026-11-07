@@ -445,10 +445,34 @@ diff -ruN a/iokit/Kernel/IOMobileFramebufferShim.cpp b/iokit/Kernel/IOMobileFram
  
  	/*
  	 * Matched from gIOKernelConfigTables against IOResources, so there is
-@@ -368,9 +563,83 @@
+@@ -368,9 +563,107 @@
  	    iomfb_frameinfo ? "one field" : "none",
  	    iomfb_notify ? "accepted" : "refused",
  	    iomfb_accept ? "accepted" : "refused");
++
++	/*
++	 * What this build believes about time, reported from the one place
++	 * whose output is certain to reach the console. The timebase is set
++	 * in pexpert, where kprintf has nowhere to go on a board without a
++	 * UART, so the first attempt to correct it gave no sign either way
++	 * and had to be judged from the clock in a syslog timestamp. Three
++	 * numbers settle it: the rate the kernel chose, the architected
++	 * register it was meant to come from, and how long the kernel thinks
++	 * it has been running -- the last being the only one of the three
++	 * that can be checked against a wristwatch.
++	 */
++	{
++		uint64_t cntfrq = 0;
++		uint64_t ticks;
++		unsigned long hz = gPEClockFrequencyInfo.timebase_frequency_hz;
++
++		__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (cntfrq));
++		ticks = mach_absolute_time();
++		IOLog("iomfb: timebase %lu Hz, CNTFRQ_EL0 %llu Hz, "
++		    "uptime %llu ms\n", hz,
++		    (unsigned long long)cntfrq,
++		    hz ? (ticks * 1000ULL / (uint64_t)hz) : 0ULL);
++	}
 +
 +	if (iomfb_proclist != 0) {
 +		fProcLoop = IOWorkLoop::workLoop();

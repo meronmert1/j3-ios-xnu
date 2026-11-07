@@ -1,0 +1,109 @@
+Give the kernel this board's counter rate instead of the Raspberry Pi's.
+
+pe_identify_machine.c picks the clock rates by SoC name, and this board
+answers to "bcm2837-io" because that is the machine configuration the kernel
+is built with. The branch is the Raspberry Pi 3's:
+
+    } else if (!strcmp(gPESoCDeviceType, "bcm2837-io")) {
+            mclk = 1200000000;
+            hclk = mclk / 4;
+            pclk = hclk / 2;
+            tclk = 1000000;
+    } else {
+            use_dt = 1;
+    }
+
+Matching a name means use_dt stays clear, so the device tree's
+timebase-frequency is never read: there is no way to correct this from the
+ADT, only from here.
+
+The Exynos 7570's architected counter does not run at 1 MHz. Samsung's own
+device tree, the one description of this board that is known to be correct
+because Android boots from it, says what it runs at:
+
+    /timer
+        compatible         "arm,armv8-timer"
+        clock-frequency    26000000
+
+Four board revisions ship in the stock boot image and all four agree. So the
+kernel believes twenty-six seconds have passed for every real one. Nothing
+announces itself; everything that measures a duration is simply wrong by that
+factor, and the damage surfaces as unrelated-looking faults -- a wake rate
+monitor counting wakes per unit time against a clock running twenty-six times
+fast, and above it every timeout in userland short by the same factor, which
+is a poor foundation for a startup that is a sequence of handshakes.
+
+Three sources, in order. The boot argument tbfreq= wins, so a wrong value
+here can be corrected from the command line without another build.
+CNTFRQ_EL0 comes next: it is the architected answer to this question, and
+where firmware has programmed it, it is better than anything written down.
+The device tree's 26 MHz is the floor, which is the part that matters,
+because an earlier version of this patch trusted CNTFRQ_EL0 alone and changed
+nothing at all -- Samsung's EL3 firmware appears to leave the register at
+zero for the non-secure world, which is exactly why Linux carries the
+frequency in the device tree in the first place.
+
+Each candidate is taken only if it is a believable counter rate, at least
+1 MHz and at most 1 GHz, so a typo in tbfreq= cannot make things worse than
+they were.
+
+Nothing here can be seen. kprintf in pexpert has nowhere to go on a board
+without a UART, which is how the first attempt at this came to be judged from
+the clock in a syslog timestamp. The companion report lives in the
+IOMobileFramebuffer shim's start(), which does reach the console: it prints
+the rate that was chosen, CNTFRQ_EL0 as it actually reads, and the kernel's
+own idea of how long it has been running, which can be held against a
+wristwatch.
+
+It was already known. The prose of iokit-secure-root-no-platform-kext.patch
+records it as a separate problem, noted there because it explained why a
+thirty second wait looked instant. This is that separate problem.
+diff -ruN a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
+--- a/pexpert/arm/pe_identify_machine.c	2026-11-07 20:22:50.534595459 +0300
++++ b/pexpert/arm/pe_identify_machine.c	2026-11-07 20:22:50.536209715 +0300
+@@ -101,6 +101,45 @@
+ 		hclk = mclk / 4;
+ 		pclk = hclk / 2;
+ 		tclk = 1000000;
++#if defined(__arm64__)
++		/*
++		 * The 1 MHz above is the Raspberry Pi 3's. This board only
++		 * borrows the BCM2837 machine configuration; its architected
++		 * counter runs at its own rate, and because the SoC name
++		 * matches here the device tree's timebase-frequency is never
++		 * consulted -- use_dt stays clear.
++		 *
++		 * Getting it wrong is not a small error. Every duration the
++		 * kernel computes is scaled by the ratio, so on a counter that
++		 * ticks at 26 MHz a deadline arrives twenty-six times too
++		 * early and every timeout in userland is short by the same
++		 * factor.
++		 *
++		 * 26 MHz is what Samsung's device tree says this SoC's timer
++		 * runs at, and it is the floor because CNTFRQ_EL0 reads zero
++		 * here: the EL3 firmware does not program it for the
++		 * non-secure world. Where firmware does program it, it is the
++		 * architected answer and wins over the written-down one; a
++		 * tbfreq= boot argument wins over both, so a wrong value can
++		 * be corrected without another build. Each candidate is taken
++		 * only if it is a believable counter rate.
++		 */
++		{
++			uint32_t tbarg = 0;
++			uint64_t cntfrq = 0;
++
++			tclk = 26000000;
++
++			__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (cntfrq));
++			if (cntfrq >= 1000000ULL && cntfrq <= 1000000000ULL) {
++				tclk = (uint32_t)cntfrq;
++			}
++			if (PE_parse_boot_argn("tbfreq", &tbarg, sizeof(tbarg)) &&
++			    tbarg >= 1000000 && tbarg <= 1000000000) {
++				tclk = tbarg;
++			}
++		}
++#endif /* __arm64__ */
+ 	} else {
+ 		use_dt = 1;
+ 	}
