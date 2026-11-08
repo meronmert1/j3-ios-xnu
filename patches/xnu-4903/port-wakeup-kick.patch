@@ -1,0 +1,326 @@
+Wake the ports the kernel is not waking, and say which ones are being watched.
+
+The port report added last round answered the question it was built for, and
+the answer was the one that needed the most work. With every daemon running
+again, lsd finally has mail -- one message queued on one of its ports -- and
+lsd is asleep in its run loop with three worker threads parked in
+__workq_kernreturn. The message is there, somebody is listening for it, and
+nobody was told.
+
+That is a lost wakeup, and it is not lsd's lost wakeup in particular. Every
+XPC server takes its requests through a dispatch source on a mach port, so
+every synchronous XPC call in this system has the same shape: the sender
+blocks in _dispatch_mach_send_and_wait_for_reply, which cannot fail -- its
+default branch is "cbnz w0, brk #1" -- and the receiver never runs. It is why
+SpringBoard has hung in the same instruction on every boot for weeks, and why
+a ten second timeout, when it was tried, fired in syslogd, misd, installd,
+backboardd, routined, timed, awdd and lsd within half a minute.
+
+Two things go in.
+
+The report gains one word per port: WATCHED when a kqueue has a knote on it,
+unwatched otherwise. That separates "nobody is listening" from "somebody is
+listening and was never told", which are the same line of output today and
+want opposite repairs.
+
+ipc_mqueue_kick_all() walks every task's receive rights and re-fires the
+knote on each port that is holding mail, under exactly the conditions
+ipc_mqueue_post checks before it wakes one: an active port, a receiver name,
+a live receiving space, a usable klist, and somebody on it. The shim calls it
+on a timer, every kickms milliseconds, and kickms defaults to zero so nothing
+changes unless it is asked for.
+
+It is a workaround and not a fix: the latency it leaves is the interval, and
+the real defect -- whatever is swallowing the edge between ipc_mqueue_post
+and the workqueue thread request -- is still there. But a system that answers
+late answers. The point of this round is to learn whether the missing wakeup
+is the whole story, and if it is, to see the screen while the cause is still
+being looked for.
+diff -ruN a/iokit/Kernel/IOMobileFramebufferShim.cpp b/iokit/Kernel/IOMobileFramebufferShim.cpp
+--- a/iokit/Kernel/IOMobileFramebufferShim.cpp	2026-11-08 19:49:32.279252916 +0300
++++ b/iokit/Kernel/IOMobileFramebufferShim.cpp	2026-11-08 19:50:43.685282902 +0300
+@@ -319,6 +319,25 @@
+ #define kIOMFBProcListPasses    6
+ 
+ /*
++ * kickms: how often, in milliseconds, to deliver the wakeups the kernel is
++ * not delivering. Zero, the default, leaves everything alone.
++ *
++ * A message arriving on a port that a kqueue is watching should wake that
++ * kqueue, and on this board it does not: lsd sits in its run loop with three
++ * worker threads parked and a message queued on one of its ports, and the
++ * caller of that message waits for a reply nobody is composing. Every
++ * synchronous XPC call has that shape, because every XPC server takes its
++ * requests through a dispatch source on a port.
++ *
++ * ipc_mqueue_kick_all() re-fires those knotes, under the same conditions
++ * ipc_mqueue_post checks before it wakes one. It is a workaround and the
++ * latency it leaves is the interval below; it is here to find out whether
++ * the missing wakeup is the whole story.
++ */
++static uint32_t iomfb_kickms;
++extern "C" unsigned int ipc_mqueue_kick_all(void);
++
++/*
+  * btname: which processes the roll call backtraces as it names them.
+  *
+  * A comma separated list of name prefixes, matched against p_comm, which
+@@ -375,8 +394,12 @@
+ 	IOTimerEventSource *fProcTimer;
+ 	uint32_t            fProcPass;
+ 
++	IOTimerEventSource *fKickTimer;
++	uint64_t            fKicked;
++
+ 	void        rollCall(void);
+ 	static void rollCallAction(OSObject *owner, IOTimerEventSource *sender);
++	static void kickAction(OSObject *owner, IOTimerEventSource *sender);
+ 
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -549,6 +572,10 @@
+ 		iomfb_proclist = (on > 100000) ? 100000 : on;
+ 	}
+ 	PE_parse_boot_argn("btname", iomfb_bt_names, sizeof(iomfb_bt_names));
++	on = 0;
++	if (PE_parse_boot_argn("kickms", &on, sizeof(on))) {
++		iomfb_kickms = (on < 50) ? 50 : on;
++	}
+ 
+ 	/*
+ 	 * Matched from gIOKernelConfigTables against IOResources, so there is
+@@ -588,16 +615,27 @@
+ 		    hz ? (ticks * 1000ULL / (uint64_t)hz) : 0ULL);
+ 	}
+ 
+-	if (iomfb_proclist != 0) {
++	if (iomfb_proclist != 0 || iomfb_kickms != 0) {
+ 		fProcLoop = IOWorkLoop::workLoop();
+-		if (fProcLoop != NULL) {
+-			fProcTimer = IOTimerEventSource::timerEventSource(this,
+-			    &rollCallAction);
+-			if (fProcTimer != NULL &&
+-			    fProcLoop->addEventSource(fProcTimer) ==
+-			    kIOReturnSuccess) {
+-				fProcTimer->setTimeoutMS(iomfb_proclist * 1000);
+-			}
++	}
++	if (fProcLoop != NULL && iomfb_proclist != 0) {
++		fProcTimer = IOTimerEventSource::timerEventSource(this,
++		    &rollCallAction);
++		if (fProcTimer != NULL &&
++		    fProcLoop->addEventSource(fProcTimer) ==
++		    kIOReturnSuccess) {
++			fProcTimer->setTimeoutMS(iomfb_proclist * 1000);
++		}
++	}
++	if (fProcLoop != NULL && iomfb_kickms != 0) {
++		fKickTimer = IOTimerEventSource::timerEventSource(this,
++		    &kickAction);
++		if (fKickTimer != NULL &&
++		    fProcLoop->addEventSource(fKickTimer) ==
++		    kIOReturnSuccess) {
++			IOLog("iomfb: waking stalled ports every %u ms\n",
++			    iomfb_kickms);
++			fKickTimer->setTimeoutMS(iomfb_kickms);
+ 		}
+ 	}
+ 	return true;
+@@ -664,6 +702,33 @@
+ 	}
+ }
+ 
++/*
++ * Deliver the wakeups that did not arrive, and say so the first time and
++ * then rarely: a line per tick would bury everything else, and the number
++ * that matters is whether it is zero or not.
++ */
++void
++IOMobileFramebuffer::kickAction(OSObject *owner, IOTimerEventSource *sender)
++{
++	IOMobileFramebuffer *me = OSDynamicCast(IOMobileFramebuffer, owner);
++	unsigned int n;
++
++	if (me == NULL) {
++		return;
++	}
++	n = ipc_mqueue_kick_all();
++	if (n != 0) {
++		uint64_t before = me->fKicked;
++		me->fKicked += n;
++		if (before == 0 || (before / 500) != (me->fKicked / 500)) {
++			IOLog("iomfb: woke %u stalled port%s (%llu so far)\n",
++			    n, (n == 1) ? "" : "s",
++			    (unsigned long long)me->fKicked);
++		}
++	}
++	sender->setTimeoutMS(iomfb_kickms);
++}
++
+ IOReturn
+ IOMobileFramebuffer::newUserClient(task_t owningTask, void *securityID,
+     UInt32 type, IOUserClient **handler)
+diff -ruN a/osfmk/ipc/ipc_mqueue.c b/osfmk/ipc/ipc_mqueue.c
+--- a/osfmk/ipc/ipc_mqueue.c	2026-10-24 11:54:21.776011903 +0300
++++ b/osfmk/ipc/ipc_mqueue.c	2026-11-08 19:50:03.370302955 +0300
+@@ -1837,3 +1837,132 @@
+ 	*mqueuep = mqueue;
+ 	return MACH_MSG_SUCCESS;
+ }
++
++#include <kern/processor.h>     /* tasks, tasks_threads_lock */
++#include <ipc/ipc_entry.h>
++
++/*
++ *	Routine:	ipc_mqueue_has_watcher
++ *	Purpose:
++ *		Whether a kqueue is watching this port for arrivals.
++ *
++ *		A daemon that has checked in for a service and is waiting on a
++ *		dispatch queue is watching its port this way, and that is the
++ *		difference between "nobody is listening" and "somebody is
++ *		listening and was never told". A port with mail and a watcher
++ *		is the second: a wakeup that did not happen.
++ *	Conditions:
++ *		Nothing locked. Takes the port's queue lock.
++ */
++boolean_t ipc_mqueue_has_watcher(void *port_arg);
++
++boolean_t
++ipc_mqueue_has_watcher(void *port_arg)
++{
++	ipc_port_t   port = (ipc_port_t)port_arg;
++	ipc_mqueue_t mqueue;
++	boolean_t    watched;
++
++	if (port == IP_NULL) {
++		return FALSE;
++	}
++	mqueue = &port->ip_messages;
++
++	imq_lock(mqueue);
++	watched = (!imq_is_set(mqueue) && IMQ_KLIST_VALID(mqueue) &&
++	    !SLIST_EMPTY(&mqueue->imq_klist));
++	imq_unlock(mqueue);
++
++	return watched;
++}
++
++/*
++ *	Routine:	ipc_mqueue_kick_all
++ *	Purpose:
++ *		Re-fire the knote on every port that is holding mail and has a
++ *		watcher, across every task.
++ *
++ *		This is a workaround, and it is worth being plain about what it
++ *		works around. A message arriving on a port that a kqueue is
++ *		watching is supposed to wake that kqueue from ipc_mqueue_post,
++ *		which is where the KNOTE below is copied from, conditions and
++ *		all. On this port that wakeup is not reaching the daemons: lsd
++ *		sits in its run loop with three idle worker threads parked in
++ *		__workq_kernreturn and a message queued on one of its ports,
++ *		and the caller waits for a reply that is never going to be
++ *		composed. Every synchronous XPC call in the system is that
++ *		shape, because every XPC server takes its requests this way.
++ *
++ *		Until the lost wakeup itself is found, this delivers the
++ *		missing edge on a timer. It is wasteful and it is not a fix,
++ *		but a system that answers late answers, and one that never
++ *		wakes does not.
++ *	Conditions:
++ *		Nothing locked. Called from a timer on a workloop.
++ */
++unsigned int ipc_mqueue_kick_all(void);
++
++unsigned int
++ipc_mqueue_kick_all(void)
++{
++	task_t       task;
++	unsigned int kicked = 0;
++
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, task, task_t, tasks) {
++		ipc_space_t     space;
++		ipc_entry_num_t index;
++
++		if (task == kernel_task) {
++			continue;
++		}
++		space = task->itk_space;
++		if (space == IS_NULL) {
++			continue;
++		}
++
++		is_read_lock(space);
++		if (!is_active(space) || space->is_table == NULL) {
++			is_read_unlock(space);
++			continue;
++		}
++
++		for (index = 0; index < space->is_table_size; index++) {
++			ipc_entry_t  entry = &space->is_table[index];
++			ipc_port_t   port;
++			ipc_mqueue_t mqueue;
++
++			if ((entry->ie_bits & MACH_PORT_TYPE_RECEIVE) == 0) {
++				continue;
++			}
++			if (entry->ie_object == IO_NULL) {
++				continue;
++			}
++			/* Cast through void * so this needs no alignment pragma. */
++			port = (ipc_port_t)(void *) entry->ie_object;
++			mqueue = &port->ip_messages;
++
++			imq_lock(mqueue);
++			/*
++			 * The same conditions ipc_mqueue_post checks before it
++			 * wakes a knote, and nothing more: an active port with
++			 * a receiver, a usable klist, and somebody on it.
++			 */
++			if (!imq_is_set(mqueue) &&
++			    mqueue->imq_msgcount != 0 &&
++			    ip_active(port) &&
++			    port->ip_receiver_name != MACH_PORT_NULL &&
++			    is_active(port->ip_receiver) &&
++			    IMQ_KLIST_VALID(mqueue) &&
++			    !SLIST_EMPTY(&mqueue->imq_klist)) {
++				KNOTE(&mqueue->imq_klist, 0);
++				kicked++;
++			}
++			imq_unlock(mqueue);
++		}
++		is_read_unlock(space);
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++
++	return kicked;
++}
+diff -ruN a/osfmk/ipc/ipc_port.c b/osfmk/ipc/ipc_port.c
+--- a/osfmk/ipc/ipc_port.c	2026-11-08 19:49:32.282065729 +0300
++++ b/osfmk/ipc/ipc_port.c	2026-11-08 19:50:03.407213739 +0300
+@@ -2717,6 +2717,9 @@
+  *	Conditions:
+  *		Nothing locked. Takes the space's read lock.
+  */
++/* osfmk/ipc/ipc_mqueue.c: is a kqueue watching this port? */
++extern boolean_t ipc_mqueue_has_watcher(void *port);
++
+ void ipc_port_report(void *task_arg, const char *name, int pid);
+ 
+ void
+@@ -2762,12 +2765,13 @@
+ 			continue;
+ 		}
+ 		waiting++;
+-		printf("  port 0x%x %u msg%s %u sender%s%s\n",
++		printf("  port 0x%x %u msg%s %u sender%s%s%s\n",
+ 		    (unsigned int)MACH_PORT_MAKE(index,
+ 		    IE_BITS_GEN(entry->ie_bits)),
+ 		    count, (count == 1) ? "" : "s",
+ 		    (unsigned int)port->ip_srights,
+ 		    (port->ip_srights == 1) ? "" : "s",
++		    ipc_mqueue_has_watcher(port) ? " WATCHED" : " unwatched",
+ 		    ip_active(port) ? "" : " (dead)");
+ 	}
+ 	is_read_unlock(space);
