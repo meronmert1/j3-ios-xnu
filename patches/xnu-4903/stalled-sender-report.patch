@@ -27,7 +27,7 @@ one. The previous round's "unwatched" may have been exactly that mistake.
 With a line like that, one boot settles which of the two it is.
 diff -ruN a/osfmk/ipc/ipc_mqueue.c b/osfmk/ipc/ipc_mqueue.c
 --- a/osfmk/ipc/ipc_mqueue.c	2026-11-08 20:19:19.617794212 +0300
-+++ b/osfmk/ipc/ipc_mqueue.c	2026-11-08 20:19:20.237161570 +0300
++++ b/osfmk/ipc/ipc_mqueue.c	2026-11-08 20:33:20.982193255 +0300
 @@ -1877,6 +1877,92 @@
  }
  
@@ -92,7 +92,7 @@ diff -ruN a/osfmk/ipc/ipc_mqueue.c b/osfmk/ipc/ipc_mqueue.c
 +	    !SLIST_EMPTY(&mqueue->imq_klist));
 +
 +	first = ipc_kmsg_queue_first(&mqueue->imq_messages);
-+	if (first != IKM_NULL && first->ikm_header != MACH_MSG_HEADER_NULL) {
++	if (first != IKM_NULL && first->ikm_header != NULL) {
 +		mach_msg_size_t size = first->ikm_header->msgh_size;
 +
 +		*msgid_out = (unsigned int)first->ikm_header->msgh_id;
@@ -103,8 +103,8 @@ diff -ruN a/osfmk/ipc/ipc_mqueue.c b/osfmk/ipc/ipc_mqueue.c
 +		 * state nobody designed for.
 +		 */
 +		if (size >= sizeof(mach_msg_header_t) &&
-+		    round_msg(size) + sizeof(mach_msg_max_trailer_t) <=
-+		    first->ikm_size) {
++		    (size_t)round_msg(size) +
++		    sizeof(mach_msg_max_trailer_t) <= (size_t)first->ikm_size) {
 +			mach_msg_max_trailer_t *tr = (mach_msg_max_trailer_t *)
 +			    ((vm_offset_t)first->ikm_header + round_msg(size));
 +
