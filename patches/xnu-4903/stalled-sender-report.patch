@@ -1,0 +1,171 @@
+Say who sent the message that nobody is reading.
+
+The WATCHED flag answered its question and raised a better one. lsd holds a
+message on port 0xf03 with no knote on it, and lsdiconservice holds one on
+port 0xc03 the same way, so the ports that are stuck are not ports anybody
+is listening to. That rules out the lost wakeup the previous round was built
+around -- there is no wakeup to lose -- but it leaves two readings that call
+for completely different work, and the output cannot tell them apart.
+
+Either the message came from the process that is blocked waiting for its
+answer, in which case the receiver has the right and simply is not listening
+on it, and the fault is in how the listener is armed. Or it came from
+somewhere else entirely, in which case this mail is unrelated and the
+blocked caller's message is sitting somewhere this report has not looked.
+
+The answer is already in the message. The trailer is filled at copyin with
+the sending task's audit token, and its sixth word is the sender's pid, so a
+queued message names the process that is waiting on it without any
+bookkeeping of ours. Alongside it goes msgh_id, which identifies the routine
+being asked for, and whether the port belongs to a port set -- a port
+received on through a set carries no knote of its own, and without that
+distinction an ordinary run-loop port is indistinguishable from an abandoned
+one. The previous round's "unwatched" may have been exactly that mistake.
+
+    port 0xf03 1 msg 3 senders unwatched from pid 57 id 0x1b5d
+
+With a line like that, one boot settles which of the two it is.
+diff -ruN a/osfmk/ipc/ipc_mqueue.c b/osfmk/ipc/ipc_mqueue.c
+--- a/osfmk/ipc/ipc_mqueue.c	2026-11-08 20:19:19.617794212 +0300
++++ b/osfmk/ipc/ipc_mqueue.c	2026-11-08 20:19:20.237161570 +0300
+@@ -1877,6 +1877,92 @@
+ }
+ 
+ /*
++ *	Routine:	ipc_mqueue_mail_info
++ *	Purpose:
++ *		Say who is waiting on the first message in a port's queue, and
++ *		how the port is being listened to.
++ *
++ *		"A port with mail and no knote" is two very different faults
++ *		depending on who sent the message. If it came from the process
++ *		that is blocked waiting for the answer, the receiver is simply
++ *		not listening where it should be. If it came from somewhere
++ *		else, the mail is unrelated and the blocked caller's message
++ *		went somewhere this report has not looked yet.
++ *
++ *		The sender's identity is already in the message: the trailer is
++ *		filled at copyin with the sending task's audit token, whose
++ *		sixth word is its pid. Reading it needs no bookkeeping of our
++ *		own, only the queue lock.
++ *
++ *		Membership of a port set matters too, because a port in a set
++ *		is received on through the set and carries no knote of its own.
++ *		Without that distinction an ordinary run-loop port looks
++ *		exactly like an abandoned one.
++ *	Conditions:
++ *		Nothing locked. Takes the port's queue lock.
++ */
++boolean_t ipc_mqueue_mail_info(void *port_arg, int *pid_out,
++    unsigned int *msgid_out, boolean_t *watched_out, boolean_t *in_set_out);
++
++boolean_t
++ipc_mqueue_mail_info(
++	void         *port_arg,
++	int          *pid_out,
++	unsigned int *msgid_out,
++	boolean_t    *watched_out,
++	boolean_t    *in_set_out)
++{
++	ipc_port_t   port = (ipc_port_t)port_arg;
++	ipc_mqueue_t mqueue;
++	ipc_kmsg_t   first;
++	boolean_t    got = FALSE;
++
++	*pid_out = -1;
++	*msgid_out = 0;
++	*watched_out = FALSE;
++	*in_set_out = FALSE;
++
++	if (port == IP_NULL) {
++		return FALSE;
++	}
++	mqueue = &port->ip_messages;
++
++	imq_lock(mqueue);
++	if (imq_is_set(mqueue)) {
++		imq_unlock(mqueue);
++		return FALSE;
++	}
++	*in_set_out = (port->ip_in_pset != 0);
++	*watched_out = (IMQ_KLIST_VALID(mqueue) &&
++	    !SLIST_EMPTY(&mqueue->imq_klist));
++
++	first = ipc_kmsg_queue_first(&mqueue->imq_messages);
++	if (first != IKM_NULL && first->ikm_header != MACH_MSG_HEADER_NULL) {
++		mach_msg_size_t size = first->ikm_header->msgh_size;
++
++		*msgid_out = (unsigned int)first->ikm_header->msgh_id;
++		/*
++		 * The trailer sits immediately after the rounded message, and
++		 * every kmsg is allocated with room for the largest one. Check
++		 * the size anyway: this runs on a queue that is already in a
++		 * state nobody designed for.
++		 */
++		if (size >= sizeof(mach_msg_header_t) &&
++		    round_msg(size) + sizeof(mach_msg_max_trailer_t) <=
++		    first->ikm_size) {
++			mach_msg_max_trailer_t *tr = (mach_msg_max_trailer_t *)
++			    ((vm_offset_t)first->ikm_header + round_msg(size));
++
++			*pid_out = (int)tr->msgh_audit.val[5];
++		}
++		got = TRUE;
++	}
++	imq_unlock(mqueue);
++
++	return got;
++}
++
++/*
+  *	Routine:	ipc_mqueue_kick_all
+  *	Purpose:
+  *		Re-fire the knote on every port that is holding mail and has a
+diff -ruN a/osfmk/ipc/ipc_port.c b/osfmk/ipc/ipc_port.c
+--- a/osfmk/ipc/ipc_port.c	2026-11-08 20:19:19.618006100 +0300
++++ b/osfmk/ipc/ipc_port.c	2026-11-08 20:19:20.251403288 +0300
+@@ -2720,6 +2720,10 @@
+ /* osfmk/ipc/ipc_mqueue.c: is a kqueue watching this port? */
+ extern boolean_t ipc_mqueue_has_watcher(void *port);
+ 
++/* osfmk/ipc/ipc_mqueue.c: who sent the message that is sitting there. */
++extern boolean_t ipc_mqueue_mail_info(void *port, int *pid,
++    unsigned int *msgid, boolean_t *watched, boolean_t *in_set);
++
+ void ipc_port_report(void *task_arg, const char *name, int pid);
+ 
+ void
+@@ -2765,14 +2769,25 @@
+ 			continue;
+ 		}
+ 		waiting++;
+-		printf("  port 0x%x %u msg%s %u sender%s%s%s\n",
+-		    (unsigned int)MACH_PORT_MAKE(index,
+-		    IE_BITS_GEN(entry->ie_bits)),
+-		    count, (count == 1) ? "" : "s",
+-		    (unsigned int)port->ip_srights,
+-		    (port->ip_srights == 1) ? "" : "s",
+-		    ipc_mqueue_has_watcher(port) ? " WATCHED" : " unwatched",
+-		    ip_active(port) ? "" : " (dead)");
++		{
++			int          from = -1;
++			unsigned int msgid = 0;
++			boolean_t    watched = FALSE, in_set = FALSE;
++
++			(void)ipc_mqueue_mail_info(port, &from, &msgid,
++			    &watched, &in_set);
++			printf("  port 0x%x %u msg%s %u sender%s %s%s"
++			    " from pid %d id 0x%x%s\n",
++			    (unsigned int)MACH_PORT_MAKE(index,
++			    IE_BITS_GEN(entry->ie_bits)),
++			    count, (count == 1) ? "" : "s",
++			    (unsigned int)port->ip_srights,
++			    (port->ip_srights == 1) ? "" : "s",
++			    watched ? "WATCHED" : "unwatched",
++			    in_set ? "+set" : "",
++			    from, msgid,
++			    ip_active(port) ? "" : " (dead)");
++		}
+ 	}
+ 	is_read_unlock(space);
+ 
