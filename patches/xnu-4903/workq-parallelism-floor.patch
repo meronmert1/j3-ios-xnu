@@ -1,0 +1,101 @@
+Give the workqueue admission gate a floor, so one core is not a deadlock.
+
+notifyd is the clearest case and every other one has the same shape. Twelve
+threads, all of them parked in __workq_kernreturn with no work. One of its
+ports holding six messages, with a kqueue watching it, sent by SpringBoard.
+The message arrived, somebody is listening for it, workers are standing
+idle, and the kernel never hands one the job. SpringBoard waits for the
+answer with a synchronous wait that has no failure path, which is why this
+board has spent weeks looking like "synchronous XPC does not work".
+
+The gate is workq_constrained_allowance():
+
+    count = wq_max_parallelism[_wq_bucket(at_qos)];
+    if (count > thactive_count + busycount) {
+            count -= thactive_count + busycount;
+            return MIN(count, max_count);
+    }
+    return 0;
+
+wq_max_parallelism is filled in workq_open() from qos_max_parallelism(),
+which is the online logical CPU count. This port boots with cpus=1, so the
+whole expression reduces to "admit a thread only while no other constrained
+worker is active or busy" -- and busycount counts threads that blocked
+recently and have not yet been confirmed idle. On a single Cortex-A53
+carrying an entire iOS userland, that condition is almost never clear. The
+counter Apple wrote to keep cores from being oversubscribed becomes a lock,
+and it closes on the one path that every XPC server in the system takes.
+
+Nobody hits this on a shipping device, because no shipping device runs this
+userland on one core.
+
+So the parallelism gets a floor of four, independent of how many cores are
+online, with wqpar= to change it and wqpar=0 to restore the stock behaviour.
+Oversubscribing one core costs context switches; refusing to schedule at all
+costs the system. The line printed at the same point reports the CPU count,
+the value the gate would have used and the value it will use, so the next
+boot says plainly whether this was the number that was wrong.
+diff -ruN a/bsd/pthread/pthread_workqueue.c b/bsd/pthread/pthread_workqueue.c
+--- a/bsd/pthread/pthread_workqueue.c	2026-10-24 11:54:21.438377264 +0300
++++ b/bsd/pthread/pthread_workqueue.c	2026-11-08 22:09:51.736547545 +0300
+@@ -57,6 +57,7 @@
+ #include <mach/vm_statistics.h>
+ #include <machine/atomic.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>   /* PE_parse_boot_argn, for the wqpar floor */
+ #include <vm/vm_map.h>
+ #include <vm/vm_protos.h>
+ 
+@@ -1578,6 +1579,52 @@
+ 			    qos_max_parallelism(qos, QOS_PARALLELISM_COUNT_LOGICAL);
+ 		}
+ 
++		{
++			/*
++			 * Give the admission gate a floor that does not depend on
++			 * how many cores happen to be online.
++			 *
++			 * wq_max_parallelism is how many constrained worker threads
++			 * workq_constrained_allowance() will let run at once, and it
++			 * is the online logical CPU count. The test it guards is
++			 *
++			 *     if (count > thactive_count + busycount) { ...admit... }
++			 *     return 0;
++			 *
++			 * so with one core the gate admits a thread only while no
++			 * other constrained worker is active or busy -- and busycount
++			 * includes threads that blocked recently and have not yet
++			 * been confirmed idle. On a single Cortex-A53 running a whole
++			 * iOS userland that condition is almost never clear, and the
++			 * counter Apple wrote to stop cores being oversubscribed
++			 * turns into a deadlock: notifyd sits with twelve workers
++			 * parked in __workq_kernreturn and six messages queued on a
++			 * port a kqueue is watching, and every process waiting for an
++			 * answer from it waits for the rest of the boot.
++			 *
++			 * Oversubscribing one core costs context switches. Refusing
++			 * to schedule at all costs the system, so the floor wins.
++			 * wqpar=0 restores the stock behaviour.
++			 */
++			uint32_t floor = 4;
++			uint32_t was = wq_max_parallelism[_wq_bucket(WORKQ_THREAD_QOS_MIN)];
++
++			PE_parse_boot_argn("wqpar", &floor, sizeof(floor));
++			if (floor > 64) {
++				floor = 64;
++			}
++			for (thread_qos_t qos = WORKQ_THREAD_QOS_MIN;
++			    qos <= WORKQ_THREAD_QOS_MAX; qos++) {
++				if (wq_max_parallelism[_wq_bucket(qos)] < floor) {
++					wq_max_parallelism[_wq_bucket(qos)] = floor;
++				}
++			}
++			printf("workq: cpus %u, parallelism %u -> %u, constrained max %u\n",
++			    num_cpus, was,
++			    wq_max_parallelism[_wq_bucket(WORKQ_THREAD_QOS_MIN)],
++			    wq_max_constrained_threads);
++		}
++
+ 		wq_init_constrained_limit = 0;
+ 	}
+ 
