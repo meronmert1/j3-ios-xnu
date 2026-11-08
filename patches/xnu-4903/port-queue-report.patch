@@ -1,0 +1,170 @@
+Report the queue depth of the ports a stuck system's daemons can receive on.
+
+A thread parked in mach_msg while the daemon it is waiting for sits idle in
+its run loop is the shape every hang on this board has taken. SpringBoard is
+in _dispatch_mach_send_and_wait_for_reply under libxpc, under
+NSXPCConnection, under a LaunchServices call; lsd, the service it is calling,
+is in CFRunLoopServiceMachPort with nothing to do. Both of those are true at
+the same moment, and on their own they do not say which side is broken.
+
+There are only two ways that happens and they call for opposite repairs.
+Either a message is sitting in a queue nobody is taking it off -- a lost
+wakeup, or a service whose receive right never reached the daemon meant to
+check in for it, in which case launchd is still holding the port and the
+sender is waiting on a question the daemon was never asked -- or nothing was
+ever queued anywhere, the send went to a port with nothing behind it, and the
+fault is in the lookup.
+
+Queue depth separates them, and it is the one number userland cannot produce:
+the only process that could ask is the one that is stuck. So it is printed
+from the kernel, beside the backtrace that raises the question, for the same
+processes btname= already names.
+
+    bt: SpringBoard[57] 8 thread(s)
+      t0 0x1a916c0f4 0x1a8fd0884 ...
+    ports: SpringBoard[57] 31 receive rights, 0 with mail
+    bt: lsd[94] 2 thread(s)
+      t0 0x1912a00f4 0x1916a0914 ...
+      port 0x1703 1 msg 2 senders
+    ports: lsd[94] 42 receive rights, 1 with mail
+
+Mail on one of lsd's ports is a lost wakeup. No mail anywhere, with lsd
+holding plenty of receive rights, means the message never arrived. Few or no
+receive rights at all on a daemon that is running means it never checked in,
+and then the port to look at is launchd's -- which is why btname= should name
+launchd as well.
+
+Only non-empty queues are listed, because a healthy idle daemon has none, so
+one line of output is already most of the answer. The counters are read under
+the space's read lock but without the port lock: this runs from a timer on a
+workloop in the middle of a system that is already wedged, a diagnostic is
+not worth a lock ordering hazard, and a count that is off by one message does
+not change which of the two answers it is.
+
+The walk lives in osfmk/ipc/ipc_port.c, where the ipc headers already are,
+and kern_proc.c calls it through a void * so that the BSD side needs none of
+them.
+diff -ruN a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+--- a/bsd/kern/kern_proc.c	2026-11-08 15:52:44.960610835 +0300
++++ b/bsd/kern/kern_proc.c	2026-11-08 15:53:18.259688735 +0300
+@@ -179,6 +179,12 @@
+ #if PROC_REF_DEBUG
+ #include <kern/backtrace.h>
+ #include <kern/thread.h>      /* thread_reference, for proc_user_backtrace */
++
++/*
++ * osfmk/ipc/ipc_port.c: the queue depth of the ports a task can receive
++ * on. Taken as void * so this file needs none of the ipc headers.
++ */
++extern void ipc_port_report(void *task, const char *name, int pid);
+ #endif
+ 
+ typedef uint64_t unaligned_u64 __attribute__((aligned(1)));
+@@ -1008,6 +1014,8 @@
+ 		thread_deallocate(threads[i]);
+ 	}
+ 
++	ipc_port_report(p->task, &p->p_comm[0], pid);
++
+ 	proc_rele(p);
+ }
+ 
+diff -ruN a/osfmk/ipc/ipc_port.c b/osfmk/ipc/ipc_port.c
+--- a/osfmk/ipc/ipc_port.c	2026-10-24 11:54:21.776011903 +0300
++++ b/osfmk/ipc/ipc_port.c	2026-11-08 15:53:47.806929862 +0300
+@@ -2683,3 +2683,95 @@
+ 
+ 
+ #endif  /* MACH_ASSERT */
++
++#include <kern/task.h>
++
++/*
++ *	Routine:	ipc_port_report
++ *	Purpose:
++ *		Print the ports a task can receive on that have mail waiting.
++ *
++ *		A thread parked in mach_msg while the peer it is waiting for
++ *		sits idle has two possible explanations, and they call for
++ *		opposite repairs. Either a message is queued on a port nobody
++ *		is taking it off -- a lost wakeup, or a service whose receive
++ *		right never reached the daemon that was meant to check in for
++ *		it -- or no message was queued anywhere at all, and the send
++ *		went to a port with nothing behind it.
++ *
++ *		Queue depth is what separates the two, and it cannot be seen
++ *		from userland: the only process that could report it is the
++ *		one that is stuck. So it is reported from here, beside the
++ *		backtrace that raises the question.
++ *
++ *		Only non-empty queues are listed, because a healthy idle
++ *		daemon has none; the count of receive rights is printed either
++ *		way, since a daemon holding none of them never checked in for
++ *		its service and that is an answer too.
++ *
++ *		The counters are read without the port lock. This runs from a
++ *		timer on a workloop, in the middle of a system that is already
++ *		wedged, and a diagnostic is not worth a lock ordering hazard;
++ *		a count that is off by one message does not change which of
++ *		the two answers it is.
++ *	Conditions:
++ *		Nothing locked. Takes the space's read lock.
++ */
++void ipc_port_report(void *task_arg, const char *name, int pid);
++
++void
++ipc_port_report(void *task_arg, const char *name, int pid)
++{
++	task_t          space_task = (task_t)task_arg;
++	ipc_space_t     space;
++	ipc_entry_num_t index;
++	unsigned int    rights = 0;
++	unsigned int    waiting = 0;
++
++	if (space_task == TASK_NULL) {
++		return;
++	}
++	space = space_task->itk_space;
++	if (space == IS_NULL) {
++		return;
++	}
++
++	is_read_lock(space);
++	if (!is_active(space) || space->is_table == NULL) {
++		is_read_unlock(space);
++		return;
++	}
++
++	for (index = 0; index < space->is_table_size; index++) {
++		ipc_entry_t entry = &space->is_table[index];
++		ipc_port_t  port;
++		unsigned int count;
++
++		if ((entry->ie_bits & MACH_PORT_TYPE_RECEIVE) == 0) {
++			continue;
++		}
++		if (entry->ie_object == IO_NULL) {
++			continue;
++		}
++		rights++;
++
++		/* Cast through void * so this needs no alignment pragma. */
++		port = (ipc_port_t)(void *) entry->ie_object;
++		count = (unsigned int)port->ip_messages.imq_msgcount;
++		if (count == 0) {
++			continue;
++		}
++		waiting++;
++		printf("  port 0x%x %u msg%s %u sender%s%s\n",
++		    (unsigned int)MACH_PORT_MAKE(index,
++		    IE_BITS_GEN(entry->ie_bits)),
++		    count, (count == 1) ? "" : "s",
++		    (unsigned int)port->ip_srights,
++		    (port->ip_srights == 1) ? "" : "s",
++		    ip_active(port) ? "" : " (dead)");
++	}
++	is_read_unlock(space);
++
++	printf("ports: %s[%d] %u receive right%s, %u with mail\n",
++	    name, pid, rights, (rights == 1) ? "" : "s", waiting);
++}
