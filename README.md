@@ -70,3 +70,10 @@ XNU For Galaxy J3 2017
   hang for anything that asks it something.
 - `CNTFRQ_EL0` reads 0 on this board: Samsung's EL3 firmware does not program it
   for the non-secure world. The timebase has to come from the device tree.
+
+
+## Thanks to
+
+Claude (for port and coding)
+ios-sweet (for patches)
+and other iOS ports created for Android
